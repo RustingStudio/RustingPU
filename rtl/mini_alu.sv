@@ -20,6 +20,7 @@ module mini_alu (
 
     assign and_answer = a & b;
 
+
     mux_2to1 my_mux (
         .d0(add_answer),
         .d1(and_answer),

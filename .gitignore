@@ -1,1 +1,7 @@
 hvenv
+/target
+
+*_sim
+*.vcd
+dump.vcd
+vvp
