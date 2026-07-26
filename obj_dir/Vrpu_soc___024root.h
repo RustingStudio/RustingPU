@@ -21,12 +21,13 @@ class alignas(VL_CACHE_LINE_BYTES) Vrpu_soc___024root final {
     VL_IN8(cpu_wdata_a,7,0);
     VL_IN8(cpu_wdata_b,7,0);
     VL_IN8(dma_start,0,0);
-    VL_OUT8(c00,7,0);
-    VL_OUT8(c01,7,0);
-    VL_OUT8(c10,7,0);
-    VL_OUT8(c11,7,0);
+    VL_OUT8(cpu_rdata,7,0);
     CData/*3:0*/ rpu_soc__DOT__dma_addr;
     CData/*3:0*/ rpu_soc__DOT__active_addr;
+    CData/*7:0*/ rpu_soc__DOT__c00;
+    CData/*7:0*/ rpu_soc__DOT__c01;
+    CData/*7:0*/ rpu_soc__DOT__c10;
+    CData/*7:0*/ rpu_soc__DOT__c11;
     CData/*3:0*/ rpu_soc__DOT____Vcellinp__math_core__b0_flat;
     CData/*3:0*/ rpu_soc__DOT____Vcellinp__math_core__a0_flat;
     CData/*3:0*/ rpu_soc__DOT__math_core__DOT__a1_skewed;

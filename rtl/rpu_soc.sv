@@ -6,7 +6,7 @@ module rpu_soc (
     input logic [7:0] cpu_wdata_a,
     input logic [7:0] cpu_wdata_b,
     input logic dma_start,
-    output logic [7:0] c00, c01, c10, c11
+    output logic [7:0] cpu_rdata
 );
 
     logic [3:0] dma_addr;
@@ -30,11 +30,23 @@ module rpu_soc (
         .sram_addr(dma_addr), .rpu_valid()
     );
 
+    logic [7:0] c00, c01, c10, c11;
+
     rpu_orchestrator math_core (
         .clk(clk), .reset(reset),
         .a1_flat(sram_a_out[7:4]), .a0_flat(sram_a_out[3:0]),
         .b1_flat(sram_b_out[7:4]), .b0_flat(sram_b_out[3:0]),
         .c00(c00), .c01(c01), .c10(c10), .c11(c11)
     );
+
+    always_comb begin
+        case (cpu_addr)
+            4'd4: cpu_rdata = c00;
+            4'd5: cpu_rdata = c01;
+            4'd6: cpu_rdata = c10;
+            4'd7: cpu_rdata = c11;
+            default: cpu_rdata = 8'd0;
+        endcase
+    end
 
 endmodule

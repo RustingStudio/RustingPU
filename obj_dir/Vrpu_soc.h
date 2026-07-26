@@ -35,10 +35,7 @@ class alignas(VL_CACHE_LINE_BYTES) Vrpu_soc VL_NOT_FINAL : public VerilatedModel
     VL_IN8(&cpu_wdata_a,7,0);
     VL_IN8(&cpu_wdata_b,7,0);
     VL_IN8(&dma_start,0,0);
-    VL_OUT8(&c00,7,0);
-    VL_OUT8(&c01,7,0);
-    VL_OUT8(&c10,7,0);
-    VL_OUT8(&c11,7,0);
+    VL_OUT8(&cpu_rdata,7,0);
 
     // CELLS
     // Public to allow access to /* verilator public */ items.

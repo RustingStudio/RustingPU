@@ -150,7 +150,21 @@ VL_ATTR_COLD bool Vrpu_soc___024root___eval_phase__stl(Vrpu_soc___024root* vlSel
             // Inlined CFunc: _eval_stl
             if ((1ULL & vlSelfRef.__VstlTriggered[0U])) {
                 {
-                    // Inlined CFunc: _ico_comb__TOP__0
+                    // Inlined CFunc: _stl_sequent__TOP__0
+                    vlSelfRef.cpu_rdata = (((2U & (IData)(vlSelfRef.cpu_addr))
+                                             ? ((1U 
+                                                 & (IData)(vlSelfRef.cpu_addr))
+                                                 ? (IData)(vlSelfRef.rpu_soc__DOT__c11)
+                                                 : (IData)(vlSelfRef.rpu_soc__DOT__c10))
+                                             : ((1U 
+                                                 & (IData)(vlSelfRef.cpu_addr))
+                                                 ? (IData)(vlSelfRef.rpu_soc__DOT__c01)
+                                                 : (IData)(vlSelfRef.rpu_soc__DOT__c00))) 
+                                           & (- (IData)((IData)(
+                                                                (4U 
+                                                                 == 
+                                                                 (0x0cU 
+                                                                  & (IData)(vlSelfRef.cpu_addr)))))));
                     vlSelfRef.rpu_soc__DOT__active_addr 
                         = ((IData)(vlSelfRef.cpu_we)
                             ? (IData)(vlSelfRef.cpu_addr)
@@ -235,12 +249,13 @@ VL_ATTR_COLD void Vrpu_soc___024root___ctor_var_reset(Vrpu_soc___024root* vlSelf
     vlSelf->cpu_wdata_a = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 12555262791147970248ull);
     vlSelf->cpu_wdata_b = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 5793466770236682779ull);
     vlSelf->dma_start = VL_SCOPED_RAND_RESET_I(1, __VscopeHash, 4393136156052734320ull);
-    vlSelf->c00 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 7022235423855613906ull);
-    vlSelf->c01 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 7362001346921410948ull);
-    vlSelf->c10 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 5112652809076934103ull);
-    vlSelf->c11 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 4085026105499164931ull);
+    vlSelf->cpu_rdata = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 2874117005747311920ull);
     vlSelf->rpu_soc__DOT__dma_addr = VL_SCOPED_RAND_RESET_I(4, __VscopeHash, 14516890165193960727ull);
     vlSelf->rpu_soc__DOT__active_addr = VL_SCOPED_RAND_RESET_I(4, __VscopeHash, 14261587849595760180ull);
+    vlSelf->rpu_soc__DOT__c00 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 16903730047476466964ull);
+    vlSelf->rpu_soc__DOT__c01 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 18003154697326548229ull);
+    vlSelf->rpu_soc__DOT__c10 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 14483137718078201503ull);
+    vlSelf->rpu_soc__DOT__c11 = VL_SCOPED_RAND_RESET_I(8, __VscopeHash, 15274472401237275331ull);
     vlSelf->rpu_soc__DOT____Vcellinp__math_core__b0_flat = 0;
     vlSelf->rpu_soc__DOT____Vcellinp__math_core__a0_flat = 0;
     vlSelf->rpu_soc__DOT__math_core__DOT__a1_skewed = VL_SCOPED_RAND_RESET_I(4, __VscopeHash, 10402164560037963767ull);

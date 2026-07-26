@@ -88,6 +88,25 @@ bool Vrpu_soc___024root___eval_phase__ico(Vrpu_soc___024root* vlSelf) {
     if (__VicoExecute) {
         {
             // Inlined CFunc: _eval_ico
+            if ((8ULL & vlSelfRef.__VicoTriggered[0U])) {
+                {
+                    // Inlined CFunc: _ico_sequent__TOP__0
+                    vlSelfRef.cpu_rdata = (((2U & (IData)(vlSelfRef.cpu_addr))
+                                             ? ((1U 
+                                                 & (IData)(vlSelfRef.cpu_addr))
+                                                 ? (IData)(vlSelfRef.rpu_soc__DOT__c11)
+                                                 : (IData)(vlSelfRef.rpu_soc__DOT__c10))
+                                             : ((1U 
+                                                 & (IData)(vlSelfRef.cpu_addr))
+                                                 ? (IData)(vlSelfRef.rpu_soc__DOT__c01)
+                                                 : (IData)(vlSelfRef.rpu_soc__DOT__c00))) 
+                                           & (- (IData)((IData)(
+                                                                (4U 
+                                                                 == 
+                                                                 (0x0cU 
+                                                                  & (IData)(vlSelfRef.cpu_addr)))))));
+                }
+            }
             if ((0x000000000000000cULL & vlSelfRef.__VicoTriggered[0U])) {
                 {
                     // Inlined CFunc: _ico_comb__TOP__0
@@ -148,11 +167,11 @@ void Vrpu_soc___024root___eval_nba(Vrpu_soc___024root* vlSelf) {
             __Vinline_0__nba_sequent__TOP__0___VdlySet__rpu_soc__DOT__memory_b__DOT__memory__v0 = 0U;
             __Vinline_0__nba_sequent__TOP__0___VdlySet__rpu_soc__DOT__memory_a__DOT__memory__v0 = 0U;
             if (vlSelfRef.reset) {
-                vlSelfRef.c00 = 0U;
                 vlSelfRef.rpu_soc__DOT__dma__DOT__state = 0U;
-                vlSelfRef.c10 = 0U;
-                vlSelfRef.c01 = 0U;
-                vlSelfRef.c11 = 0U;
+                vlSelfRef.rpu_soc__DOT__c00 = 0U;
+                vlSelfRef.rpu_soc__DOT__c10 = 0U;
+                vlSelfRef.rpu_soc__DOT__c01 = 0U;
+                vlSelfRef.rpu_soc__DOT__c11 = 0U;
                 vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_b_00_to_10 = 0U;
                 vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_a_00_to_01 = 0U;
                 vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_a_10_to_11 = 0U;
@@ -160,23 +179,27 @@ void Vrpu_soc___024root___eval_nba(Vrpu_soc___024root* vlSelf) {
                 vlSelfRef.rpu_soc__DOT__math_core__DOT__a1_skewed = 0U;
                 vlSelfRef.rpu_soc__DOT__math_core__DOT__b1_skewed = 0U;
             } else {
-                vlSelfRef.c00 = (0x000000ffU & (((IData)(vlSelfRef.rpu_soc__DOT____Vcellinp__math_core__a0_flat) 
-                                                 * (IData)(vlSelfRef.rpu_soc__DOT____Vcellinp__math_core__b0_flat)) 
-                                                + (IData)(vlSelfRef.c00)));
                 vlSelfRef.rpu_soc__DOT__dma__DOT__state 
                     = Vrpu_soc__ConstPool__TABLE_h3455db76_0
                     [(((IData)(vlSelfRef.rpu_soc__DOT__dma_addr) 
                        << 3U) | (((IData)(vlSelfRef.dma_start) 
                                   << 2U) | (IData)(vlSelfRef.rpu_soc__DOT__dma__DOT__state)))];
-                vlSelfRef.c10 = (0x000000ffU & (((IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__a1_skewed) 
-                                                 * (IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_b_00_to_10)) 
-                                                + (IData)(vlSelfRef.c10)));
-                vlSelfRef.c01 = (0x000000ffU & (((IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_a_00_to_01) 
-                                                 * (IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__b1_skewed)) 
-                                                + (IData)(vlSelfRef.c01)));
-                vlSelfRef.c11 = (0x000000ffU & (((IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_a_10_to_11) 
-                                                 * (IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_b_01_to_11)) 
-                                                + (IData)(vlSelfRef.c11)));
+                vlSelfRef.rpu_soc__DOT__c00 = (0x000000ffU 
+                                               & (((IData)(vlSelfRef.rpu_soc__DOT____Vcellinp__math_core__a0_flat) 
+                                                   * (IData)(vlSelfRef.rpu_soc__DOT____Vcellinp__math_core__b0_flat)) 
+                                                  + (IData)(vlSelfRef.rpu_soc__DOT__c00)));
+                vlSelfRef.rpu_soc__DOT__c10 = (0x000000ffU 
+                                               & (((IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__a1_skewed) 
+                                                   * (IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_b_00_to_10)) 
+                                                  + (IData)(vlSelfRef.rpu_soc__DOT__c10)));
+                vlSelfRef.rpu_soc__DOT__c01 = (0x000000ffU 
+                                               & (((IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_a_00_to_01) 
+                                                   * (IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__b1_skewed)) 
+                                                  + (IData)(vlSelfRef.rpu_soc__DOT__c01)));
+                vlSelfRef.rpu_soc__DOT__c11 = (0x000000ffU 
+                                               & (((IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_a_10_to_11) 
+                                                   * (IData)(vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_b_01_to_11)) 
+                                                  + (IData)(vlSelfRef.rpu_soc__DOT__c11)));
                 vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_b_00_to_10 
                     = vlSelfRef.rpu_soc__DOT____Vcellinp__math_core__b0_flat;
                 vlSelfRef.rpu_soc__DOT__math_core__DOT__core__DOT__wire_a_00_to_01 
@@ -206,6 +229,18 @@ void Vrpu_soc___024root___eval_nba(Vrpu_soc___024root* vlSelf) {
                     = vlSelfRef.rpu_soc__DOT__active_addr;
                 __Vinline_0__nba_sequent__TOP__0___VdlySet__rpu_soc__DOT__memory_a__DOT__memory__v0 = 1U;
             }
+            vlSelfRef.cpu_rdata = (((2U & (IData)(vlSelfRef.cpu_addr))
+                                     ? ((1U & (IData)(vlSelfRef.cpu_addr))
+                                         ? (IData)(vlSelfRef.rpu_soc__DOT__c11)
+                                         : (IData)(vlSelfRef.rpu_soc__DOT__c10))
+                                     : ((1U & (IData)(vlSelfRef.cpu_addr))
+                                         ? (IData)(vlSelfRef.rpu_soc__DOT__c01)
+                                         : (IData)(vlSelfRef.rpu_soc__DOT__c00))) 
+                                   & (- (IData)((IData)(
+                                                        (4U 
+                                                         == 
+                                                         (0x0cU 
+                                                          & (IData)(vlSelfRef.cpu_addr)))))));
             if (__Vinline_0__nba_sequent__TOP__0___VdlySet__rpu_soc__DOT__memory_a__DOT__memory__v0) {
                 vlSelfRef.rpu_soc__DOT__memory_a__DOT__memory[__Vinline_0__nba_sequent__TOP__0___VdlyDim0__rpu_soc__DOT__memory_a__DOT__memory__v0] 
                     = __Vinline_0__nba_sequent__TOP__0___VdlyVal__rpu_soc__DOT__memory_a__DOT__memory__v0;

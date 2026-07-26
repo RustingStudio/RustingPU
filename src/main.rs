@@ -12,10 +12,7 @@ mod sys {
         pub fn rpu_set_wdata_a(r: *mut Rpu, v: u8);
         pub fn rpu_set_wdata_b(r: *mut Rpu, v: u8);
         pub fn rpu_set_dma_start(r: *mut Rpu, v: u8);
-        pub fn rpu_get_c00(r: *mut Rpu) -> u8;
-        pub fn rpu_get_c01(r: *mut Rpu) -> u8;
-        pub fn rpu_get_c10(r: *mut Rpu) -> u8;
-        pub fn rpu_get_c11(r: *mut Rpu) -> u8;
+        pub fn rpu_get_cpu_rdata(r: *mut Rpu) -> u8;
         pub fn rpu_tick(r: *mut Rpu);
     }
 }
@@ -49,20 +46,26 @@ fn main() {
             sys::rpu_tick(rpu);
         }
 
-        let c00 = sys::rpu_get_c00(rpu);
-        let c01 = sys::rpu_get_c01(rpu);
-        let c10 = sys::rpu_get_c10(rpu);
-        let c11 = sys::rpu_get_c11(rpu);
+        let read_cpu = |addr: u8| -> u8 {
+            sys::rpu_set_cpu_addr(rpu, addr);
+            sys::rpu_tick(rpu);
+            sys::rpu_get_cpu_rdata(rpu)
+        };
+
+        let c00 = read_cpu(4);
+        let c01 = read_cpu(5);
+        let c10 = read_cpu(6);
+        let c11 = read_cpu(7);
 
         println!("[ {:>3}  {:>3} ]", c00, c01);
         println!("[ {:>3}  {:>3} ]", c10, c11);
 
-        assert_eq!(c00, 19, "c00 mismatch");
-        assert_eq!(c01, 22, "c01 mismatch");
-        assert_eq!(c10, 43, "c10 mismatch");
-        assert_eq!(c11, 50, "c11 mismatch");
+        assert_eq!(c00, 19);
+        assert_eq!(c01, 22);
+        assert_eq!(c10, 43);
+        assert_eq!(c11, 50);
 
-        println!("Correct!");
+        println!("Correct");
         sys::rpu_free(rpu);
     }
 }

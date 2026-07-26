@@ -20,10 +20,7 @@ void rpu_set_wdata_a   (rpu_t* r, uint8_t v);
 void rpu_set_wdata_b   (rpu_t* r, uint8_t v);
 void rpu_set_dma_start (rpu_t* r, uint8_t v);
 
-uint8_t rpu_get_c00(rpu_t* r);
-uint8_t rpu_get_c01(rpu_t* r);
-uint8_t rpu_get_c10(rpu_t* r);
-uint8_t rpu_get_c11(rpu_t* r);
+uint8_t rpu_get_cpu_rdata(rpu_t* r);
 
 void rpu_eval(rpu_t* r);
 void rpu_tick(rpu_t* r);
