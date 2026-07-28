@@ -5,3 +5,5 @@ hvenv
 *.vcd
 dump.vcd
 vvp
+
+Hint.md

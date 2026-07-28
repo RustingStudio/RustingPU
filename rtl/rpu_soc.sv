@@ -1,4 +1,7 @@
-module rpu_soc (
+module rpu_soc #(
+    parameter N = 4;
+    parameter WORD_WIDTH = N * 4;
+)(
     input logic clk,
     input logic reset,
     input logic cpu_we,
@@ -15,15 +18,21 @@ module rpu_soc (
 
     assign active_addr = cpu_we ? cpu_addr : dma_addr;
 
-    sram memory_a (
+    sram #(
+        .DEPTH(64),
+        .WIDTH(WORD_WIDTH)
+    ) memory_a (
         .clk(clk), .we(cpu_we), .addr(active_addr),
         .wdata(cpu_wdata_a), .rdata(sram_a_out)
     );
 
-    sram memory_b (
-        .clk(clk), .we(cpu_we), .addr(active_addr),
-        .wdata(cpu_wdata_b), .rdata(sram_b_out)
-    );
+    sram #(
+            .DEPTH(64),
+            .WIDTH(WORD_WIDTH)
+        ) memory_b (
+            .clk(clk), .we(cpu_we), .addr(active_addr),
+            .wdata(cpu_wdata_b), .rdata(sram_b_out)
+        );
 
     dma_streamer dma (
         .clk(clk), .reset(reset), .start(dma_start),
