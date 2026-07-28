@@ -1,8 +1,20 @@
+pub const TILE: usize = 8;
+pub const DIM: usize = TILE;
+pub type Matrix = [[f32; TILE]; TILE];
+pub type Bf16Matrix = [[BFloat16; TILE]; TILE];
+pub type Bf16Tile = [BFloat16; TILE * TILE];
+
 use std::fmt;
 use std::ptr::NonNull;
 
-pub type Matrix2 = [[f32; 2]; 2];
-pub type Bf16Matrix2 = [[BFloat16; 2]; 2];
+const REG_CONTROL: u16 = 0x0000;
+const REG_STATUS: u16 = 0x0001;
+const REG_A_BASE: u16 = 0x0002;
+const REG_B_BASE: u16 = 0x0003;
+const REG_C_BASE: u16 = 0x0004;
+
+const EXT_BASE: u16 = 0x1000;
+const TILE_WORDS: u16 = (TILE * TILE) as u16;
 
 mod sys {
     #[repr(C)]
@@ -14,12 +26,10 @@ mod sys {
         pub fn rpu_reset(r: *mut Rpu);
         pub fn rpu_tick(r: *mut Rpu);
         pub fn rpu_cycles(r: *mut Rpu) -> u32;
-        pub fn rpu_set_a(r: *mut Rpu, row: u8, col: u8, value: u16);
-        pub fn rpu_set_b(r: *mut Rpu, row: u8, col: u8, value: u16);
-        pub fn rpu_start(r: *mut Rpu);
+        pub fn rpu_write(r: *mut Rpu, addr: u16, value: u16);
+        pub fn rpu_read(r: *mut Rpu, addr: u16) -> u16;
         pub fn rpu_busy(r: *mut Rpu) -> u8;
         pub fn rpu_done(r: *mut Rpu) -> u8;
-        pub fn rpu_get_c(r: *mut Rpu, row: u8, col: u8) -> u16;
     }
 }
 
@@ -73,10 +83,12 @@ impl fmt::Display for RpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AllocationFailed => write!(f, "failed to allocate RPU model"),
-            Self::NonFiniteInput(value) => write!(
-                f,
-                "RPU BF16 model does not support non-finite input {value}"
-            ),
+            Self::NonFiniteInput(value) => {
+                write!(
+                    f,
+                    "RPU BF16 model does not support non-finite input {value}"
+                )
+            }
             Self::UnsupportedSubnormal(value) => {
                 write!(f, "RPU BF16 model does not support subnormal input {value}")
             }
@@ -94,7 +106,7 @@ pub struct Rpu {
 }
 
 impl Rpu {
-    const MAX_WAIT_CYCLES: usize = 64;
+    const MAX_WAIT_CYCLES: usize = 512;
 
     pub fn new() -> Result<Self, RpuError> {
         let inner = NonNull::new(unsafe { sys::rpu_new() }).ok_or(RpuError::AllocationFailed)?;
@@ -111,40 +123,57 @@ impl Rpu {
         unsafe { sys::rpu_cycles(self.inner.as_ptr()) }
     }
 
-    pub fn multiply(&mut self, a: Matrix2, b: Matrix2) -> Result<Matrix2, RpuError> {
+    pub fn multiply(&mut self, a: Matrix, b: Matrix) -> Result<Matrix, RpuError> {
         let a = Self::encode_matrix(a)?;
         let b = Self::encode_matrix(b)?;
         let c = self.multiply_bf16(a, b)?;
         Ok(Self::decode_matrix(c))
     }
 
-    pub fn multiply_bf16(
-        &mut self,
-        a: Bf16Matrix2,
-        b: Bf16Matrix2,
-    ) -> Result<Bf16Matrix2, RpuError> {
-        for row in 0..2 {
-            for col in 0..2 {
-                unsafe {
-                    sys::rpu_set_a(
-                        self.inner.as_ptr(),
-                        row as u8,
-                        col as u8,
-                        a[row][col].to_bits(),
-                    );
-                    sys::rpu_set_b(
-                        self.inner.as_ptr(),
-                        row as u8,
-                        col as u8,
-                        b[row][col].to_bits(),
-                    );
-                }
+    pub fn multiply_bf16(&mut self, a: Bf16Matrix, b: Bf16Matrix) -> Result<Bf16Matrix, RpuError> {
+        let a_tile = Self::flatten_tile(a);
+        let b_tile = Self::flatten_tile(b);
+        let c_tile = self.run_tile(a_tile, b_tile)?;
+        Ok(Self::unflatten_tile(c_tile))
+    }
+
+    pub fn run_tile(&mut self, a: Bf16Tile, b: Bf16Tile) -> Result<Bf16Tile, RpuError> {
+        let a_base = 0;
+        let b_base = TILE_WORDS;
+        let c_base = 2 * TILE_WORDS;
+
+        for i in 0..TILE_WORDS {
+            unsafe {
+                sys::rpu_write(
+                    self.inner.as_ptr(),
+                    EXT_BASE + a_base + i,
+                    a[usize::from(i)].to_bits(),
+                );
+                sys::rpu_write(
+                    self.inner.as_ptr(),
+                    EXT_BASE + b_base + i,
+                    b[usize::from(i)].to_bits(),
+                );
             }
         }
 
-        unsafe { sys::rpu_start(self.inner.as_ptr()) };
+        unsafe {
+            sys::rpu_write(self.inner.as_ptr(), REG_A_BASE, a_base);
+            sys::rpu_write(self.inner.as_ptr(), REG_B_BASE, b_base);
+            sys::rpu_write(self.inner.as_ptr(), REG_C_BASE, c_base);
+            sys::rpu_write(self.inner.as_ptr(), REG_CONTROL, 1);
+            sys::rpu_tick(self.inner.as_ptr());
+        }
+
         self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
-        Ok(self.read_bf16())
+
+        let mut out = [BFloat16::ZERO; TILE * TILE];
+        for i in 0..TILE_WORDS {
+            let bits = unsafe { sys::rpu_read(self.inner.as_ptr(), EXT_BASE + c_base + i) };
+            out[usize::from(i)] = BFloat16::from_bits(bits);
+        }
+
+        Ok(out)
     }
 
     pub fn busy(&self) -> bool {
@@ -153,6 +182,10 @@ impl Rpu {
 
     pub fn done(&self) -> bool {
         unsafe { sys::rpu_done(self.inner.as_ptr()) != 0 }
+    }
+
+    pub fn status(&self) -> u16 {
+        unsafe { sys::rpu_read(self.inner.as_ptr(), REG_STATUS) }
     }
 
     fn wait_until_done(&mut self, max_cycles: usize) -> Result<(), RpuError> {
@@ -166,35 +199,44 @@ impl Rpu {
         Err(RpuError::Timeout { max_cycles })
     }
 
-    fn read_bf16(&self) -> Bf16Matrix2 {
-        let mut c = [[BFloat16::ZERO; 2]; 2];
-        for row in 0..2 {
-            for col in 0..2 {
-                let bits = unsafe { sys::rpu_get_c(self.inner.as_ptr(), row as u8, col as u8) };
-                c[row][col] = BFloat16::from_bits(bits);
-            }
-        }
-        c
-    }
-
-    fn encode_matrix(matrix: Matrix2) -> Result<Bf16Matrix2, RpuError> {
-        let mut encoded = [[BFloat16::ZERO; 2]; 2];
-        for row in 0..2 {
-            for col in 0..2 {
+    fn encode_matrix(matrix: Matrix) -> Result<Bf16Matrix, RpuError> {
+        let mut encoded = [[BFloat16::ZERO; TILE]; TILE];
+        for row in 0..TILE {
+            for col in 0..TILE {
                 encoded[row][col] = BFloat16::from_f32(matrix[row][col])?;
             }
         }
         Ok(encoded)
     }
 
-    fn decode_matrix(matrix: Bf16Matrix2) -> Matrix2 {
-        let mut decoded = [[0.0; 2]; 2];
-        for row in 0..2 {
-            for col in 0..2 {
+    fn decode_matrix(matrix: Bf16Matrix) -> Matrix {
+        let mut decoded = [[0.0; TILE]; TILE];
+        for row in 0..TILE {
+            for col in 0..TILE {
                 decoded[row][col] = matrix[row][col].to_f32();
             }
         }
         decoded
+    }
+
+    fn flatten_tile(matrix: Bf16Matrix) -> Bf16Tile {
+        let mut tile = [BFloat16::ZERO; TILE * TILE];
+        for row in 0..TILE {
+            for col in 0..TILE {
+                tile[row * TILE + col] = matrix[row][col];
+            }
+        }
+        tile
+    }
+
+    fn unflatten_tile(tile: Bf16Tile) -> Bf16Matrix {
+        let mut matrix = [[BFloat16::ZERO; TILE]; TILE];
+        for row in 0..TILE {
+            for col in 0..TILE {
+                matrix[row][col] = tile[row * TILE + col];
+            }
+        }
+        matrix
     }
 }
 
@@ -209,20 +251,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn multiplies_2x2_bf16_matrices() {
+    fn multiplies_8x8_bf16_matrices() {
         let mut rpu = Rpu::new().unwrap();
-        let c = rpu
-            .multiply([[1.5, 2.0], [0.0, 1.0]], [[2.0, 0.0], [0.0, 3.0]])
-            .unwrap();
+        let a = [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+        ];
+        let b = [
+            [2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0, 0.0],
+            [6.0, 7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 0.0],
+            [10.0, 11.0, 12.0, 13.0, 0.0, 0.0, 0.0, 0.0],
+            [14.0, 15.0, 16.0, 17.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+        ];
 
-        assert_eq!(c, [[3.0, 6.0], [0.0, 3.0]]);
+        let c = rpu.multiply(a, b).unwrap();
+        let a_bf16 = Rpu::encode_matrix(a).unwrap();
+        let b_bf16 = Rpu::encode_matrix(b).unwrap();
+        let expected_bf16 = mat_mul(&a_bf16, &b_bf16);
+        let expected = Rpu::decode_matrix(expected_bf16);
+        assert_eq!(c, expected);
     }
 
     #[test]
-    fn cycles() {
+    fn cycles_are_reported() {
         let mut rpu = Rpu::new().unwrap();
-        rpu.multiply([[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]])
-            .unwrap();
-        assert_eq!(7, rpu.cycles());
+        let zero = [[0.0; TILE]; TILE];
+        rpu.multiply(zero, zero).unwrap();
+        assert!(rpu.cycles() > 0);
+        assert_eq!(rpu.status() & 0b10, 0b10);
     }
+}
+
+pub trait MatrixElement: Copy {
+    const ZERO: Self;
+
+    fn mul(self, rhs: Self) -> Self;
+    fn add(self, rhs: Self) -> Self;
+
+    fn is_zero(self) -> bool;
+}
+
+impl MatrixElement for f32 {
+    const ZERO: Self = 0.0;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        self * rhs
+    }
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+
+    #[inline]
+    fn is_zero(self) -> bool {
+        self == 0.0
+    }
+}
+
+impl MatrixElement for BFloat16 {
+    const ZERO: Self = BFloat16::ZERO;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        BFloat16::from_f32(self.to_f32() * rhs.to_f32()).unwrap()
+    }
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        BFloat16::from_f32(self.to_f32() + rhs.to_f32()).unwrap()
+    }
+
+    #[inline]
+    fn is_zero(self) -> bool {
+        self == BFloat16::ZERO
+    }
+}
+
+pub fn mat_mul<T: MatrixElement>(
+    a: &[[T; TILE]; TILE],
+    b: &[[T; TILE]; TILE],
+) -> [[T; TILE]; TILE] {
+    let mut out = [[T::ZERO; TILE]; TILE];
+
+    for i in 0..TILE {
+        for k in 0..TILE {
+            let aik = a[i][k];
+
+            if aik.is_zero() {
+                continue;
+            }
+
+            for j in 0..TILE {
+                out[i][j] = out[i][j].add(aik.mul(b[k][j]));
+            }
+        }
+    }
+
+    out
 }

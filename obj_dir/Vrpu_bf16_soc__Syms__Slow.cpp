@@ -11,7 +11,7 @@ Vrpu_bf16_soc__Syms::Vrpu_bf16_soc__Syms(VerilatedContext* contextp, const char*
     , TOP{this, namep}
 {
     // Check resources
-    Verilated::stackCheck(720);
+    Verilated::stackCheck(7278);
     // Setup sub module instances
     // Configure time unit / time precision
     _vm_contextp__->timeunit(-12);

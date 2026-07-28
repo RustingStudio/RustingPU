@@ -12,20 +12,12 @@ Vrpu_bf16_soc::Vrpu_bf16_soc(VerilatedContext* _vcontextp__, const char* _vcname
     , clk{vlSymsp->TOP.clk}
     , reset{vlSymsp->TOP.reset}
     , start{vlSymsp->TOP.start}
+    , mem_we{vlSymsp->TOP.mem_we}
     , busy{vlSymsp->TOP.busy}
     , done{vlSymsp->TOP.done}
-    , a00{vlSymsp->TOP.a00}
-    , a01{vlSymsp->TOP.a01}
-    , a10{vlSymsp->TOP.a10}
-    , a11{vlSymsp->TOP.a11}
-    , b00{vlSymsp->TOP.b00}
-    , b01{vlSymsp->TOP.b01}
-    , b10{vlSymsp->TOP.b10}
-    , b11{vlSymsp->TOP.b11}
-    , c00{vlSymsp->TOP.c00}
-    , c01{vlSymsp->TOP.c01}
-    , c10{vlSymsp->TOP.c10}
-    , c11{vlSymsp->TOP.c11}
+    , mem_addr{vlSymsp->TOP.mem_addr}
+    , mem_wdata{vlSymsp->TOP.mem_wdata}
+    , mem_rdata{vlSymsp->TOP.mem_rdata}
     , cycles{vlSymsp->TOP.cycles}
     , rootp{&(vlSymsp->TOP)}
 {

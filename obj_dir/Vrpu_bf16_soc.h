@@ -31,20 +31,12 @@ class alignas(VL_CACHE_LINE_BYTES) Vrpu_bf16_soc VL_NOT_FINAL : public Verilated
     VL_IN8(&clk,0,0);
     VL_IN8(&reset,0,0);
     VL_IN8(&start,0,0);
+    VL_IN8(&mem_we,0,0);
     VL_OUT8(&busy,0,0);
     VL_OUT8(&done,0,0);
-    VL_IN16(&a00,15,0);
-    VL_IN16(&a01,15,0);
-    VL_IN16(&a10,15,0);
-    VL_IN16(&a11,15,0);
-    VL_IN16(&b00,15,0);
-    VL_IN16(&b01,15,0);
-    VL_IN16(&b10,15,0);
-    VL_IN16(&b11,15,0);
-    VL_OUT16(&c00,15,0);
-    VL_OUT16(&c01,15,0);
-    VL_OUT16(&c10,15,0);
-    VL_OUT16(&c11,15,0);
+    VL_IN16(&mem_addr,15,0);
+    VL_IN16(&mem_wdata,15,0);
+    VL_OUT16(&mem_rdata,15,0);
     VL_OUT(&cycles,31,0);
 
     // CELLS

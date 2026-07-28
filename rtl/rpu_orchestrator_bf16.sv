@@ -1,7 +1,8 @@
 module rpu_orchestrator_bf16 #(
     parameter N = 2
 )(
-    input  logic clk, reset,
+    input  logic clk,
+    input  logic reset,
     input  logic [15:0] a_flat [0:N-1],
     input  logic [15:0] b_flat [0:N-1],
     output logic [15:0] c [0:N-1][0:N-1]
