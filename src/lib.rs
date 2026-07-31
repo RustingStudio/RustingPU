@@ -105,6 +105,25 @@ pub struct Rpu {
     inner: NonNull<sys::Rpu>,
 }
 
+pub struct DynMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub data: Vec<f32>,
+}
+
+impl fmt::Display for DynMatrix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for r in 0..self.rows {
+            write!(f, "[ ")?;
+            for c in 0..self.cols {
+                write!(f, "{:>8.3} ", self.data[r * self.cols + c])?;
+            }
+            writeln!(f, "]")?;
+        }
+        Ok(())
+    }
+}
+
 impl Rpu {
     const MAX_WAIT_CYCLES: usize = 512;
 
@@ -137,6 +156,73 @@ impl Rpu {
         Ok(Self::unflatten_tile(c_tile))
     }
 
+    pub fn multiply_dyn(&mut self, a: &DynMatrix, b: &DynMatrix) -> Result<DynMatrix, RpuError> {
+        assert_eq!(a.cols, b.rows, "A.cols must equal B.rows");
+
+        let m_tiles = (a.rows + TILE - 1) / TILE;
+        let k_tiles = (a.cols + TILE - 1) / TILE;
+        let n_tiles = (b.cols + TILE - 1) / TILE;
+
+        let mut c_data = vec![0.0_f32; m_tiles * TILE * n_tiles * TILE];
+        let mut a_tile_bf16 = [BFloat16::ZERO; TILE * TILE];
+        let mut b_tile_bf16 = [BFloat16::ZERO; TILE * TILE];
+
+        for ti in 0..m_tiles {
+            for tk in 0..k_tiles {
+                Self::fill_tile(&a.data, a.rows, a.cols, ti, tk, &mut a_tile_bf16);
+
+                for tj in 0..n_tiles {
+                    Self::fill_tile(&b.data, b.rows, b.cols, tk, tj, &mut b_tile_bf16);
+
+                    let result_tile = self.run_tile(a_tile_bf16, b_tile_bf16)?;
+
+                    for r in 0..TILE {
+                        for c in 0..TILE {
+                            let idx = (ti * TILE + r) * (n_tiles * TILE) + (tj * TILE + c);
+                            if (ti * TILE + r) < a.rows && (tj * TILE + c) < b.cols {
+                                c_data[idx] += result_tile[r * TILE + c].to_f32();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut result = vec![0.0_f32; a.rows * b.cols];
+        for r in 0..a.rows {
+            for c in 0..b.cols {
+                result[r * b.cols + c] = c_data[r * (n_tiles * TILE) + c];
+            }
+        }
+
+        Ok(DynMatrix {
+            rows: a.rows,
+            cols: b.cols,
+            data: result,
+        })
+    }
+
+    fn fill_tile(
+        src: &[f32],
+        src_rows: usize,
+        src_cols: usize,
+        tile_row: usize,
+        tile_col: usize,
+        out: &mut [BFloat16; TILE * TILE],
+    ) {
+        for r in 0..TILE {
+            for c in 0..TILE {
+                let global_r = tile_row * TILE + r;
+                let global_c = tile_col * TILE + c;
+                if global_r < src_rows && global_c < src_cols {
+                    let val = BFloat16::from_f32(src[global_r * src_cols + global_c]).unwrap();
+                    out[r * TILE + c] = val;
+                } else {
+                    out[r * TILE + c] = BFloat16::ZERO;
+                }
+            }
+        }
+    }
     pub fn run_tile(&mut self, a: Bf16Tile, b: Bf16Tile) -> Result<Bf16Tile, RpuError> {
         let a_base = 0;
         let b_base = TILE_WORDS;
@@ -280,6 +366,81 @@ mod tests {
         let expected_bf16 = mat_mul(&a_bf16, &b_bf16);
         let expected = Rpu::decode_matrix(expected_bf16);
         assert_eq!(c, expected);
+    }
+
+    fn bf16_mat_mul_dyn(
+        a: &[BFloat16],
+        a_rows: usize,
+        a_cols: usize,
+        b: &[BFloat16],
+        b_cols: usize,
+    ) -> Vec<f32> {
+        let mut c = vec![0.0_f32; a_rows * b_cols];
+        for i in 0..a_rows {
+            for k in 0..a_cols {
+                let aik = a[i * a_cols + k];
+                if aik == BFloat16::ZERO {
+                    continue;
+                }
+                for j in 0..b_cols {
+                    let product = aik.to_f32() * b[k * b_cols + j].to_f32();
+                    let product_bf16 = BFloat16::from_f32(product).unwrap();
+                    c[i * b_cols + j] += product_bf16.to_f32();
+                }
+            }
+        }
+        c
+    }
+
+    fn test_dyn(rpu: &mut Rpu, m: usize, k: usize, n: usize) {
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i + 1) % 7) as f32).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 3 + 2) % 11) as f32).collect();
+
+        let a = DynMatrix {
+            rows: m,
+            cols: k,
+            data: a_data.clone(),
+        };
+        let b = DynMatrix {
+            rows: k,
+            cols: n,
+            data: b_data.clone(),
+        };
+
+        let c = rpu.multiply_dyn(&a, &b).unwrap();
+
+        let a_bf16: Vec<BFloat16> = a_data
+            .iter()
+            .map(|&v| BFloat16::from_f32(v).unwrap())
+            .collect();
+        let b_bf16: Vec<BFloat16> = b_data
+            .iter()
+            .map(|&v| BFloat16::from_f32(v).unwrap())
+            .collect();
+        let expected = bf16_mat_mul_dyn(&a_bf16, m, k, &b_bf16, n);
+
+        for i in 0..m {
+            for j in 0..n {
+                let got = c.data[i * n + j];
+                let exp = expected[i * n + j];
+                assert!(
+                    (got - exp).abs() < 0.1,
+                    "Mismatch at [{i}][{j}]: got {got}, expected {exp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multiply_dyn_matches_reference() {
+        let mut rpu = Rpu::new().unwrap();
+
+        test_dyn(&mut rpu, 3, 3, 3);
+        test_dyn(&mut rpu, 8, 8, 8);
+        test_dyn(&mut rpu, 16, 16, 16);
+        test_dyn(&mut rpu, 9, 5, 7);
+        test_dyn(&mut rpu, 1, 8, 1);
+        test_dyn(&mut rpu, 12, 3, 15);
     }
 
     #[test]

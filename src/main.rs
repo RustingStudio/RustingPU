@@ -1,52 +1,21 @@
-use hardware_dev::mat_mul;
-use hardware_dev::Rpu;
-use std::hint::black_box;
-use std::time;
+use hardware_dev::{DynMatrix, Rpu};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpu = Rpu::new()?;
 
-    let a = [
-        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-    ];
-    let b = [
-        [2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0, 0.0],
-        [6.0, 7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 0.0],
-        [10.0, 11.0, 12.0, 13.0, 0.0, 0.0, 0.0, 0.0],
-        [14.0, 15.0, 16.0, 17.0, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-        [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
-    ];
+    let a = DynMatrix {
+        rows: 3,
+        cols: 5,
+        data: (0..15).map(|i| i as f32).collect(),
+    };
+    let b = DynMatrix {
+        rows: 5,
+        cols: 4,
+        data: (0..20).map(|i| (20 - i) as f32).collect(),
+    };
 
-    let mut start = time::Instant::now();
-    for _ in 0..100000 {
-        rpu.multiply(a, b)?;
-    }
-    println!("RPU Digital {:?}", time::Instant::now() - start);
-
-    start = time::Instant::now();
-
-    for _ in 0..100_000 {
-        let result = mat_mul(black_box(&a), black_box(&b));
-        black_box(result);
-    }
-    println!("CPU {:?}", time::Instant::now() - start);
-
-    // for row in c {
-    //     println!(
-    //         "[ {:>6.2} {:>6.2} {:>6.2} {:>6.2} ]",
-    //         row[0], row[1], row[2], row[3]
-    //     );
-    // }
+    let c = rpu.multiply_dyn(&a, &b)?;
+    println!("Matrix {}", c);
 
     Ok(())
 }
