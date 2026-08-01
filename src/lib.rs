@@ -13,8 +13,15 @@ const REG_A_BASE: u16 = 0x0002;
 const REG_B_BASE: u16 = 0x0003;
 const REG_C_BASE: u16 = 0x0004;
 
-const EXT_BASE: u16 = 0x1000;
+const EXT_BASE_BANK0: u16 = 0x1000;
+const EXT_BASE_BANK1: u16 = 0x2000;
+
 const TILE_WORDS: u16 = (TILE * TILE) as u16;
+const CONTROL_START: u16 = 0b0001;
+const CONTROL_BANK1: u16 = 0b0010;
+const CONTROL_PRELOAD: u16 = 0b0100;
+const STATUS_LOAD_BUSY: u16 = 0b0100;
+const STATUS_COMPUTE_BUSY: u16 = 0b1000;
 
 mod sys {
     #[repr(C)]
@@ -111,6 +118,13 @@ pub struct DynMatrix {
     pub data: Vec<f32>,
 }
 
+struct TileJob {
+    tile_row: usize,
+    tile_col: usize,
+    a: Bf16Tile,
+    b: Bf16Tile,
+}
+
 impl fmt::Display for DynMatrix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for r in 0..self.rows {
@@ -125,7 +139,7 @@ impl fmt::Display for DynMatrix {
 }
 
 impl Rpu {
-    const MAX_WAIT_CYCLES: usize = 512;
+    const MAX_WAIT_CYCLES: usize = 4096;
 
     pub fn new() -> Result<Self, RpuError> {
         let inner = NonNull::new(unsafe { sys::rpu_new() }).ok_or(RpuError::AllocationFailed)?;
@@ -163,30 +177,29 @@ impl Rpu {
         let k_tiles = (a.cols + TILE - 1) / TILE;
         let n_tiles = (b.cols + TILE - 1) / TILE;
 
-        let mut c_data = vec![0.0_f32; m_tiles * TILE * n_tiles * TILE];
-        let mut a_tile_bf16 = [BFloat16::ZERO; TILE * TILE];
-        let mut b_tile_bf16 = [BFloat16::ZERO; TILE * TILE];
+        let c_stride = n_tiles * TILE;
+        let mut c_data = vec![0.0_f32; m_tiles * TILE * c_stride];
+        let mut jobs = Vec::new();
 
         for ti in 0..m_tiles {
             for tk in 0..k_tiles {
+                let mut a_tile_bf16 = [BFloat16::ZERO; TILE * TILE];
                 Self::fill_tile(&a.data, a.rows, a.cols, ti, tk, &mut a_tile_bf16);
 
                 for tj in 0..n_tiles {
+                    let mut b_tile_bf16 = [BFloat16::ZERO; TILE * TILE];
                     Self::fill_tile(&b.data, b.rows, b.cols, tk, tj, &mut b_tile_bf16);
-
-                    let result_tile = self.run_tile(a_tile_bf16, b_tile_bf16)?;
-
-                    for r in 0..TILE {
-                        for c in 0..TILE {
-                            let idx = (ti * TILE + r) * (n_tiles * TILE) + (tj * TILE + c);
-                            if (ti * TILE + r) < a.rows && (tj * TILE + c) < b.cols {
-                                c_data[idx] += result_tile[r * TILE + c].to_f32();
-                            }
-                        }
-                    }
+                    jobs.push(TileJob {
+                        tile_row: ti,
+                        tile_col: tj,
+                        a: a_tile_bf16,
+                        b: b_tile_bf16,
+                    });
                 }
             }
         }
+
+        self.run_tile_jobs_pipelined(&jobs, &mut c_data, c_stride, a.rows, b.cols)?;
 
         let mut result = vec![0.0_f32; a.rows * b.cols];
         for r in 0..a.rows {
@@ -224,42 +237,176 @@ impl Rpu {
         }
     }
     pub fn run_tile(&mut self, a: Bf16Tile, b: Bf16Tile) -> Result<Bf16Tile, RpuError> {
+        let c_base = 2 * TILE_WORDS;
+
+        self.preload_tile(0, a, b)?;
+        self.start_preloaded_tile(0, c_base);
+        self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
+        Ok(self.read_tile_output(0, c_base))
+    }
+
+    pub fn preload_tile(&mut self, bank: usize, a: Bf16Tile, b: Bf16Tile) -> Result<(), RpuError> {
         let a_base = 0;
         let b_base = TILE_WORDS;
         let c_base = 2 * TILE_WORDS;
 
+        self.write_tile_inputs(bank, a_base, b_base, &a, &b);
+        self.configure_bases(a_base, b_base, c_base);
+        self.write_control(bank, CONTROL_PRELOAD);
+        self.tick();
+        self.wait_until_load_idle(Self::MAX_WAIT_CYCLES)
+    }
+
+    fn start_preloaded_tile(&mut self, bank: usize, c_base: u16) {
+        let a_base = 0;
+        let b_base = TILE_WORDS;
+
+        self.configure_bases(a_base, b_base, c_base);
+        self.write_control(bank, CONTROL_START);
+        self.tick();
+    }
+
+    fn run_tile_jobs_pipelined(
+        &mut self,
+        jobs: &[TileJob],
+        c_data: &mut [f32],
+        c_stride: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), RpuError> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+
+        let c_base = 2 * TILE_WORDS;
+        let mut active_bank = 0;
+        let mut active_job = 0;
+
+        self.preload_tile(active_bank, jobs[active_job].a, jobs[active_job].b)?;
+        self.start_preloaded_tile(active_bank, c_base);
+
+        for next_job in 1..jobs.len() {
+            let next_bank = 1 - active_bank;
+            self.preload_tile(next_bank, jobs[next_job].a, jobs[next_job].b)?;
+            self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
+            let result_tile = self.read_tile_output(active_bank, c_base);
+            Self::accumulate_tile(
+                &jobs[active_job],
+                &result_tile,
+                c_data,
+                c_stride,
+                rows,
+                cols,
+            );
+
+            active_bank = next_bank;
+            active_job = next_job;
+            self.start_preloaded_tile(active_bank, c_base);
+        }
+
+        self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
+        let result_tile = self.read_tile_output(active_bank, c_base);
+        Self::accumulate_tile(
+            &jobs[active_job],
+            &result_tile,
+            c_data,
+            c_stride,
+            rows,
+            cols,
+        );
+
+        Ok(())
+    }
+
+    fn accumulate_tile(
+        job: &TileJob,
+        result_tile: &Bf16Tile,
+        c_data: &mut [f32],
+        c_stride: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        for r in 0..TILE {
+            for c in 0..TILE {
+                let global_r = job.tile_row * TILE + r;
+                let global_c = job.tile_col * TILE + c;
+
+                if global_r < rows && global_c < cols {
+                    let idx = global_r * c_stride + global_c;
+                    c_data[idx] += result_tile[r * TILE + c].to_f32();
+                }
+            }
+        }
+    }
+
+    pub fn load_busy(&self) -> bool {
+        self.status() & STATUS_LOAD_BUSY != 0
+    }
+
+    pub fn compute_busy(&self) -> bool {
+        self.status() & STATUS_COMPUTE_BUSY != 0
+    }
+
+    fn write_tile_inputs(
+        &mut self,
+        bank: usize,
+        a_base: u16,
+        b_base: u16,
+        a: &Bf16Tile,
+        b: &Bf16Tile,
+    ) {
+        let ext_base = Self::ext_base(bank);
         for i in 0..TILE_WORDS {
             unsafe {
                 sys::rpu_write(
                     self.inner.as_ptr(),
-                    EXT_BASE + a_base + i,
+                    ext_base + a_base + i,
                     a[usize::from(i)].to_bits(),
                 );
                 sys::rpu_write(
                     self.inner.as_ptr(),
-                    EXT_BASE + b_base + i,
+                    ext_base + b_base + i,
                     b[usize::from(i)].to_bits(),
                 );
             }
         }
+    }
 
+    fn configure_bases(&mut self, a_base: u16, b_base: u16, c_base: u16) {
         unsafe {
             sys::rpu_write(self.inner.as_ptr(), REG_A_BASE, a_base);
             sys::rpu_write(self.inner.as_ptr(), REG_B_BASE, b_base);
             sys::rpu_write(self.inner.as_ptr(), REG_C_BASE, c_base);
-            sys::rpu_write(self.inner.as_ptr(), REG_CONTROL, 1);
-            sys::rpu_tick(self.inner.as_ptr());
         }
+    }
 
-        self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
+    fn write_control(&mut self, bank: usize, flags: u16) {
+        let bank_flag = if bank == 0 { 0 } else { CONTROL_BANK1 };
+        unsafe {
+            sys::rpu_write(self.inner.as_ptr(), REG_CONTROL, flags | bank_flag);
+        }
+    }
 
+    fn read_tile_output(&self, bank: usize, c_base: u16) -> Bf16Tile {
+        let ext_base = Self::ext_base(bank);
         let mut out = [BFloat16::ZERO; TILE * TILE];
         for i in 0..TILE_WORDS {
-            let bits = unsafe { sys::rpu_read(self.inner.as_ptr(), EXT_BASE + c_base + i) };
+            let bits = unsafe { sys::rpu_read(self.inner.as_ptr(), ext_base + c_base + i) };
             out[usize::from(i)] = BFloat16::from_bits(bits);
         }
+        out
+    }
 
-        Ok(out)
+    fn ext_base(bank: usize) -> u16 {
+        match bank {
+            0 => EXT_BASE_BANK0,
+            1 => EXT_BASE_BANK1,
+            _ => panic!("RPU only has two external memory banks"),
+        }
+    }
+
+    fn tick(&mut self) {
+        unsafe { sys::rpu_tick(self.inner.as_ptr()) };
     }
 
     pub fn busy(&self) -> bool {
@@ -279,7 +426,18 @@ impl Rpu {
             if self.done() {
                 return Ok(());
             }
-            unsafe { sys::rpu_tick(self.inner.as_ptr()) };
+            self.tick();
+        }
+
+        Err(RpuError::Timeout { max_cycles })
+    }
+
+    fn wait_until_load_idle(&mut self, max_cycles: usize) -> Result<(), RpuError> {
+        for _ in 0..max_cycles {
+            if !self.load_busy() {
+                return Ok(());
+            }
+            self.tick();
         }
 
         Err(RpuError::Timeout { max_cycles })
@@ -441,6 +599,47 @@ mod tests {
         test_dyn(&mut rpu, 9, 5, 7);
         test_dyn(&mut rpu, 1, 8, 1);
         test_dyn(&mut rpu, 12, 3, 15);
+    }
+
+    #[test]
+    fn preload_overlaps_active_compute() {
+        let mut rpu = Rpu::new().unwrap();
+        let a0 = Rpu::flatten_tile(Rpu::encode_matrix([[1.0; TILE]; TILE]).unwrap());
+        let b0 = Rpu::flatten_tile(Rpu::encode_matrix([[2.0; TILE]; TILE]).unwrap());
+        let a1 = Rpu::flatten_tile(Rpu::encode_matrix([[3.0; TILE]; TILE]).unwrap());
+        let b1 = Rpu::flatten_tile(Rpu::encode_matrix([[4.0; TILE]; TILE]).unwrap());
+        let a_base = 0;
+        let b_base = TILE_WORDS;
+        let c_base = 2 * TILE_WORDS;
+
+        rpu.write_tile_inputs(0, a_base, b_base, &a0, &b0);
+        rpu.write_tile_inputs(1, a_base, b_base, &a1, &b1);
+
+        rpu.preload_tile(0, a0, b0).unwrap();
+
+        rpu.configure_bases(a_base, b_base, c_base);
+        rpu.write_control(0, CONTROL_START);
+        rpu.tick();
+        assert!(rpu.compute_busy());
+
+        rpu.configure_bases(a_base, b_base, c_base);
+        rpu.write_control(1, CONTROL_PRELOAD);
+        rpu.tick();
+
+        assert!(rpu.compute_busy());
+        assert!(rpu.load_busy());
+
+        rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
+        let c0 = rpu.read_tile_output(0, c_base);
+        assert_eq!(c0[0].to_f32(), 16.0);
+
+        rpu.wait_until_load_idle(Rpu::MAX_WAIT_CYCLES).unwrap();
+        rpu.configure_bases(a_base, b_base, c_base);
+        rpu.write_control(1, CONTROL_START);
+        rpu.tick();
+        rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
+        let c1 = rpu.read_tile_output(1, c_base);
+        assert_eq!(c1[0].to_f32(), 96.0);
     }
 
     #[test]

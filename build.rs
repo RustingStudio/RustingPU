@@ -9,6 +9,7 @@ fn main() {
         "rtl/bf16_adder.sv",
         "rtl/bf16_systolic_cell.sv",
         "rtl/rpu_orchestrator_bf16.sv",
+        "rtl/rpu_sim_memory.sv",
         "rtl/rpu_bf16_soc.sv",
     ];
 
