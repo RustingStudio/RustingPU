@@ -11,6 +11,13 @@ const _: () = assert!(
     TILE.is_multiple_of(LOAD_BEATS),
     "RPU_LOAD_BEATS must divide RPU_N"
 );
+/// Store cycles per requantized C row, set at build time with `RPU_QUANT_PARTS` (1 to 4,
+/// default 4). Each cycle requantizes ceil(N / QUANT_PARTS) columns.
+pub const QUANT_PARTS: usize = parse_usize(env!("RPU_QUANT_PARTS"));
+const _: () = assert!(
+    QUANT_PARTS >= 1 && QUANT_PARTS <= 4,
+    "RPU_QUANT_PARTS must be 1 to 4"
+);
 /// Longest K of one panel job. Must match `KMAX` of `rtl/rpu_top.sv`.
 pub const KMAX: usize = 1024;
 /// Size of the RPU memory. Must match `MEM_BYTES` of `rtl/rpu_top.sv`.
@@ -62,9 +69,9 @@ const CONTROL_GEMM: u64 = 0b100_0000;
 const CONTROL_QUANT: u64 = 0b1000_0000;
 /// Host address of requantization parameter word 0.
 const QPARAM_BASE: u32 = 0x0800_0000;
-/// Columns that one store cycle requantizes (4 cycles per C row), and the width of the
-/// lane field in a parameter address.
-const QP_LANES: usize = TILE.div_ceil(4);
+/// Columns that one store cycle requantizes (QUANT_PARTS cycles per C row), and the width
+/// of the lane field in a parameter address.
+const QP_LANES: usize = TILE.div_ceil(QUANT_PARTS);
 const QP_LANE_W: u32 = if QP_LANES > 1 {
     (QP_LANES - 1).ilog2() + 1
 } else {
@@ -335,7 +342,7 @@ impl Rpu {
         for (col, q) in params.iter().enumerate() {
             assert!(q.shift <= 48, "shift must be at most 48");
             let (j, w) = (col / TILE, col % TILE);
-            let lane = (((j * 4 + w / QP_LANES) << QP_LANE_W) + w % QP_LANES) as u32;
+            let lane = (((j * QUANT_PARTS + w / QP_LANES) << QP_LANE_W) + w % QP_LANES) as u32;
             let word = u64::from(q.bias as u32)
                 | u64::from(q.mult) << 32
                 | u64::from(q.shift) << 48
@@ -801,6 +808,31 @@ mod tests {
             let c = rpu.gemm_i32(&ah, &bh, out.end()).unwrap();
             assert_eq!(c, quant::matmul_nt_i8(&a, &b, m, n, k));
         }
+    }
+
+    /// A requantized tile stores in QUANT_PARTS cycles per row, an int32 one in 4.
+    #[test]
+    fn requantized_store_takes_quant_parts_cycles_per_row() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x9e_0a07_0000_0018);
+        let (m, n, k) = (TILE, TILE, 40);
+        let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+        let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
+        let params: Vec<Requant> = (0..n).map(|_| random_requant(&mut rng)).collect();
+        let bh = rpu.upload_b(0, &b, n, k);
+        let ah = rpu.upload_a(bh.end(), &a, m, k);
+        let busy = rpu.busy_cycles();
+        rpu.gemm_i32(&ah, &bh, ah.end()).unwrap();
+        let int32 = rpu.busy_cycles() - busy;
+        let busy = rpu.busy_cycles();
+        rpu.gemm_requant(&ah, &bh, &params, ah.end()).unwrap();
+        let quant = rpu.busy_cycles() - busy;
+        // The same tile, then QUANT_PARTS N store cycles and the 5 requantization stages
+        // instead of 4N.
+        assert_eq!(
+            quant as usize + 4 * TILE,
+            int32 as usize + QUANT_PARTS * TILE + 5
+        );
     }
 
     /// An int32 GEMM stores, of each C row of its last B tile, only the beats that hold

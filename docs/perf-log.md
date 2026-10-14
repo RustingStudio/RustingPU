@@ -52,6 +52,8 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 17 store only the C beats that hold outputs | 12 | 97.25% | 851.5 | 96.41% | 152.6 / 8.0 | 5.5 s |
 | 17 store only the C beats that hold outputs, LOAD_BEATS 2 | 32 | 97.25% | 109.7 | 93.09% | 103.7 / 8.0 | 7.8 s |
 | 17 store only the C beats that hold outputs, LOAD_BEATS 2 | 64 | 97.25% | 40.3 | 66.12% | 108.2 / 8.0 | 23.1 s |
+| 18 QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 108.2 | 94.39% | 103.7 / 8.0 | 7.9 s |
+| 18 QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 37.3 | 71.47% | 108.2 / 8.0 | 23.5 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -387,9 +389,32 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Load: `uptime` 3.3 to 4.4 (tests, MNIST and synthesis in parallel).
 - Commit: `bab1fd6`.
 
+## Item 18: requantized rows in fewer store cycles. Done, 2026-10-15
+- Before: a requantized C row took 4 store cycles, each requantizing L = ceil(N/4) columns, so a QUANT tile stored in 4N cycles like an int32 one. The store of the last layer 1 tile of each GEMM is exposed: 256 cycles at N = 64, against a tile stream of 784.
+- Fix: parameter `QUANT_PARTS` (`RPU_QUANT_PARTS`, 1 to 4, default 4): store cycles per requantized row, with L = ceil(N / QUANT_PARTS) lanes. The parameter memory of each lane holds QUANT_PARTS * ceil(KMAX/N) words, column j*N + part*L + lane at host word ((j * QUANT_PARTS + part) << LANE_W) + lane. The board keeps 4; RTL function and size at 4 do not change.
+- MNIST, cycles per image, RPU equal to host int8 for every image, 97.25%, host words unchanged:
+
+  | N | LOAD_BEATS | Batch | QUANT_PARTS 4 (item 17) | 2 | 1 |
+  |---|---|---|---:|---:|---:|
+  | 64 | 2 | 64 | 40.3 | 38.3 (-5.0%) | 37.3 (-7.4%) |
+  | 64 | 2 | 256 | 32.4 | 31.9 (-1.5%) | 31.6 (-2.5%) |
+  | 32 | 2 | 64 | 109.7 | 108.7 (-0.9%) | 108.2 (-1.4%) |
+  | 32 | 2 | 256 | 104.7 | 104.4 | 104.3 (-0.4%) |
+  | 16 | 1 | 64 | 420.6 | 420.1 | 419.9 (-0.2%) |
+
+  At N = 64, batch 64, QUANT_PARTS 1 saves 3N = 192 cycles per layer 1 call, 3.0 per image, as predicted. Board config (N = 8, 12, 16 at QUANT_PARTS 4) remeasured: 1625.5, 851.5, 420.6, unchanged.
+- Synthesis, `rpu_top`:
+  - QUANT_PARTS 4 against item 17: gw5a N = 8 31,237 LUT, 3,982 ALU, 7,982 DFF; gw5a N = 16 87,772 LUT, 28,482 DFF; gw2a N = 8 12,635 LUT; gw2a N = 16 29,092 LUT, 256 MULT9X9; xcup N = 8 7,392 LUT. DFF, MULT, DSP and RAM equal; LUT and ALU within abc noise.
+  - xcup N = 64, LOAD_BEATS 2, QUANT_PARTS 4 / 2 / 1: 302,551 / 313,216 / 320,466 LUT, 438,242 / 442,210 / 450,146 FF, 4,129 / 4,161 / 4,225 DSP. QUANT_PARTS 1 costs +5.9% LUT, +2.7% FF, +96 DSP (+2.3%): 48 more lanes of two DSPs each.
+  - xcup N = 32, LOAD_BEATS 2, QUANT_PARTS 1: 87,132 LUT (79,581, +9.5%), 117,365 FF (+5.8%), 1,089 DSP (+48). The 8 RAMB36E2 of the 8 parameter memories (128 words each) become 128 more LUT RAM cells (32 memories of 32 words).
+- Tests: new `requantized_store_takes_quant_parts_cycles_per_row` checks that a QUANT tile is busy QUANT_PARTS N + 5 cycles where the same int32 tile is busy 4N (5 requantization stages). All tests pass at QUANT_PARTS 1, 2 and 3 at N = 4, 8 (LOAD_BEATS 2), 12, 16, and 1 and 2 at N = 32 and 64 (LOAD_BEATS 2), READ_LATENCY 1 and 10, with the brain feature; QUANT_PARTS 4 passes the full check. Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2, at QUANT_PARTS 4 and 1, clean. Mutations at N = 8, QUANT_PARTS 1, each caught: row written at part 3 instead of the last part (3 tests), the store still 4 parts per row (the new test), the parameter address j*4 + part in the RTL (2) and in the driver (2), L = ceil(N/4) in the RTL (2), the driver lane count ceil(N/4) (2).
+- Load: `uptime` 3.7 to 4.3 (tests, MNIST and synthesis in parallel).
+- Commit: pending.
+
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
 2. Milestone 2 at N = 16: the two B banks use 4,224 RAM16SDP4 (LUT RAM). Moving them to BSRAM would need 128 SDPX9B with the A banks, more than the 118 that the GW5AT-LV60 has. Keep N = 8 for the first bitstream, or keep B in LUT RAM at N = 16?
 3. DSP counts on the gw5a are not known: yosys maps the multipliers to LUTs on that family. Gowin EDA would give the real numbers, but the loop rules forbid installing it.
 4. Milestone 3 (DDR3): the early launch of item 12 assumes a memory that never stalls a read. A DDR controller needs a stall-aware launch check. Plan it for milestone 3?
 5. A larger batch (for example 256) would amortize the first load of each GEMM (about -2.7% cycles at N = 16), but it changes the activation scale per batch, so the predictions can change. Allowed? Answered 2026-10-14: configurable, batch 64 stays the baseline, log both (item 15).
+6. Big configs (item 18): QUANT_PARTS 1 gives -7.4% cycles at N = 64, batch 64, for +96 DSP and +5.9% LUT. Keep 4 as the default for every N, or make 1 the default above N = 16?

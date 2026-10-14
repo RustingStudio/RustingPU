@@ -71,9 +71,10 @@ Build-time parameters are environment variables read by `build.rs`:
 RPU_N=16 cargo test --release            # array size (default 8)
 RPU_READ_LATENCY=10 cargo test --release # memory read latency in cycles (default 1)
 RPU_LOAD_BEATS=2 cargo test --release    # beats per load request (default 1, must divide N)
+RPU_QUANT_PARTS=1 cargo test --release   # store cycles per requantized C row (1 to 4, default 4)
 ```
 
-They become `-GN` / `-GREAD_LATENCY` / `-GLOAD_BEATS` for Verilator and are re-exported to Rust, so `TILE` always equals the RTL `N`. `build.rs` clears the Verilator `obj_dir` before each run; stale generated files from another N do not compile.
+They become `-GN` / `-GREAD_LATENCY` / `-GLOAD_BEATS` / `-GQUANT_PARTS` for Verilator and are re-exported to Rust, so `TILE` always equals the RTL `N`. `build.rs` clears the Verilator `obj_dir` before each run; stale generated files from another N do not compile.
 
 Icarus smoke test of the array alone (N = 4):
 
@@ -129,7 +130,7 @@ bit 7 QUANT    store each C row requantized to int8 (section 6) as one beat;
                with GEMM, in the A panel layout of the next GEMM
 ```
 
-QPARAM holds one 64-bit word per output column: bias in bits 31:0 (int32, in the accumulator domain), mult in bits 47:32 (u16), shift in bits 53:48 (at most 48), relu in bit 54. The words of B tile j are in L = ceil(N/4) lanes; column `j*N + part*L + lane` (part 0..3) is at `0x0800_0000 + ((j*4 + part) << LANE_W) + lane`, LANE_W = clog2(L) (1 when L = 1). The parameters live in LUT RAM, 4 * ceil(KMAX/N) words per lane. Columns past n keep stale parameters; that is harmless (see the memory layout).
+QPARAM holds one 64-bit word per output column: bias in bits 31:0 (int32, in the accumulator domain), mult in bits 47:32 (u16), shift in bits 53:48 (at most 48), relu in bit 54. The words of B tile j are in L = ceil(N/P) lanes, P = QUANT_PARTS; column `j*N + part*L + lane` (part 0..P-1) is at `0x0800_0000 + ((j*P + part) << LANE_W) + lane`, LANE_W = clog2(L) (1 when L = 1). The parameters live in LUT RAM, P * ceil(KMAX/N) words per lane. The board keeps P = 4; P = 1 stores a requantized row in one cycle with N lanes (`docs/perf-log.md`, item 18). Columns past n keep stale parameters; that is harmless (see the memory layout).
 
 During a GEMM the sequencer drives START and PRELOAD itself and moves A_BASE, B_BASE and C_BASE as it goes. **Do not write registers until DONE**: BUSY stays high and DONE low until the last tile is stored.
 
@@ -190,8 +191,8 @@ drain (separate, starts when a STREAM ends):
 
 store (separate, starts when SHIFT ends):
   4N beats, one per cycle; the memory never stalls a write. The last B tile of
-  a GEMM stores 4 - TILES[33:32] beats per row, so (4 - skip)N cycles. With QUANT, 4
-  cycles per row: each cycle reads the parameters of L columns and requantizes
+  a GEMM stores 4 - TILES[33:32] beats per row, so (4 - skip)N cycles. With QUANT,
+  QUANT_PARTS cycles per row: each cycle reads the parameters of L columns and requantizes
   them in five register stages (read; bias add and multiply; rounding add;
   shift; clamp), then one beat per row is written
 ```

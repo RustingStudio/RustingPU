@@ -47,7 +47,7 @@ Needs Rust, Verilator (5.052 tested) and a C++ compiler. Icarus and yosys are op
 cargo test --release                   # bit-exact tests against the host int8 reference
 cargo test --release --features brain  # plus the RustingBrain MLP test
 RPU_N=16 cargo test --release          # another array size
-RPU_N=64 RPU_LOAD_BEATS=2 cargo test --release  # a big array with a 2-beat read port
+RPU_N=64 RPU_LOAD_BEATS=2 RPU_QUANT_PARTS=1 cargo test --release  # a big array: 2-beat read port, 1-cycle requantized rows
 ```
 
 The MNIST example reads the four unpacked IDX files from `data/mnist/` (not in the repository; download them from any MNIST mirror). The first run trains the network (about 20 s) and saves it there.

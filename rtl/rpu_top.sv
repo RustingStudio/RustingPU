@@ -30,6 +30,9 @@ module rpu_top #(
     // Beats per load request: 1 for the board, 2 or more for a wider read port. Must
     // divide N.
     parameter int LOAD_BEATS = 1,
+    // Store cycles per requantized C row, 1 to 4: 4 for the board; fewer cycles take
+    // more requantization lanes, ceil(N / QUANT_PARTS).
+    parameter int QUANT_PARTS = 4,
     // 64K beats from N = 16 on, so a bigger array gets a bigger memory.
     parameter int MEM_BYTES = (1 << 20) * ((N > 16) ? N / 16 : 1)
 ) (
@@ -85,14 +88,15 @@ module rpu_top #(
     localparam int unsigned REG_PANEL_ADDR = 8;
     localparam int unsigned REG_TILES_ADDR = 9;
     localparam int unsigned MEM_BASE_ADDR = 32'h1000_0000;  // in 64-bit words
-    // Requantization: each store cycle (4 per C row) takes L columns of the row.
-    localparam int L = (N + 3) / 4;
+    // Requantization: each store cycle (QUANT_PARTS per C row) takes L columns of the row.
+    localparam int L = (N + QUANT_PARTS - 1) / QUANT_PARTS;
     localparam int LANE_W = (L > 1) ? $clog2(L) : 1;
-    localparam int QP_DEPTH = 4 * ROW_BEATS;  // (tile column, store part) per lane
+    localparam int QP_DEPTH = QUANT_PARTS * ROW_BEATS;  // (tile column, store part) per lane
+    localparam logic [1:0] QUANT_PART_LAST = 2'(QUANT_PARTS - 1);
     localparam int QP_AW = $clog2(QP_DEPTH);
     // Parameter word: bias [31:0] (int32), mult [47:32], shift [53:48], relu [54].
     localparam int QP_W = 55;
-    // Host word QPARAM_BASE + ((j * 4 + part) << LANE_W) + lane holds column
+    // Host word QPARAM_BASE + ((j * QUANT_PARTS + part) << LANE_W) + lane holds column
     // j * N + part * L + lane.
     localparam int unsigned QPARAM_BASE_ADDR = 32'h0800_0000;
     localparam int unsigned QPARAM_WORDS = QP_DEPTH << LANE_W;
@@ -343,7 +347,7 @@ module rpu_top #(
     assign dma_wr_data = q_wr_valid ? q_wr_data : c_store_row[int'(store_part)*BEAT_W +: BEAT_W];
 
     // Requantization parameters: one memory per lane, one read port each.
-    assign qp_read_addr = QP_AW'({store_j, store_part});
+    assign qp_read_addr = QP_AW'(int'(store_j) * QUANT_PARTS + int'(store_part));
     generate
         for (i = 0; i < L; i++) begin : qparam_lane
             logic [QP_W-1:0] qp_mem [0:QP_DEPTH-1];
@@ -748,7 +752,7 @@ module rpu_top #(
                         store_busy <= 1'b1;
                         store_c_base <= drain_c_base;
                         store_quant <= drain_quant;
-                        store_part_last <= C_ROW_LAST - drain_skip;
+                        store_part_last <= drain_quant ? QUANT_PART_LAST : C_ROW_LAST - drain_skip;
                         store_j <= drain_j;
                         store_row <= '0;
                         store_part <= '0;
@@ -818,7 +822,7 @@ module rpu_top #(
             q_wr_valid <= 1'b0;
             if (q4_valid) begin
                 q_bytes <= q_next;
-                if (q4_part == C_ROW_LAST) begin
+                if (q4_part == QUANT_PART_LAST) begin
                     q_wr_valid <= 1'b1;
                     q_wr_addr <= q4_addr;
                     q_wr_data <= q_next;
