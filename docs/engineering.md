@@ -33,12 +33,15 @@ let c = rpu.matmul_nt_i8(&a, &b, m, n, k)?; // A m x k, B n x k, C m x n, all ro
 Lower-level methods:
 
 ```text
+upload_b(base, b, n, k)           write B once; returns a ResidentB handle
+matmul_resident(a, m, &b, scratch) GEMM against a resident B; A and C go from `scratch`
 run_tile_i8(a, b)                 one N x N x N tile
 run_panel_i8(a, b, k)             one N x k x N panel job
 preload_panel_i8(bank, a, b, k)   load A and B into a local bank, return when loaded
 start(bank) / read_c(bank)
 cycles()                          busy cycles since the last START
 active_cycles() / busy_cycles()   free-running counters since reset
+host_words_written() / _read()    host bus traffic since new (reads: memory only)
 busy() / done() / load_busy() / compute_busy() / status()
 ```
 
@@ -130,7 +133,7 @@ Memory moves 8*N-bit beats (N int8 values; N/8 host words, lowest word first). B
 - A and B panels: N rows one after the other. Each row is padded to `ceil(K/N)` beats, with k = 0 in the lowest byte.
 - C tile: row-major int32, 4 beats per row (two int32 per host word, low half first).
 
-Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layout (A, B, C of each bank). `matmul_nt_i8` writes all A blocks, then all B tiles, then a C area with one tile per output tile.
+Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layout (A, B, C of each bank). `matmul_nt_i8` writes B (all its tiles) from beat 0, then calls `matmul_resident` with the scratch area right after B: all A blocks, then a C area with one tile per output tile. `RpuMlp` uploads each layer's weights once, back to back from beat 0, and puts the scratch area after the last layer; each batch writes only its activations. A `ResidentB` remembers which `Rpu` it was uploaded to, and `matmul_resident` panics if the scratch area overlaps B.
 
 ### State machines
 
@@ -194,7 +197,7 @@ When Verilator reports width warnings after a change, size the counter and its t
 `matmul_nt_i8` keeps the array streaming:
 
 ```text
-write A blocks, B tiles and the C area into memory (host writes are slow: do them first)
+write A blocks into memory (B is already resident; host writes are slow: do them first)
 for each block of N rows of A:
   START tile 0 on bank 0              (loads A + B0, then computes)
   for each output tile j:

@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let f32_correct = correct(&network.predict_batch(&test.inputs)?);
-    let mlp = RpuMlp::from_network(&network);
+    let mut mlp = RpuMlp::from_network(&network);
     let mut rpu = Rpu::new()?;
     let (mut host, mut on_rpu) = (Vec::with_capacity(count), Vec::with_capacity(count));
     let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());

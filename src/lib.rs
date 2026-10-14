@@ -12,6 +12,9 @@ const MEM_BYTES: usize = 1 << 20;
 use std::cell::Cell;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 const REG_CONTROL: u32 = 0;
 const REG_STATUS: u32 = 1;
@@ -86,6 +89,24 @@ pub struct Rpu {
     inner: NonNull<sys::Rpu>,
     words_written: u64,
     words_read: Cell<u64>,
+    /// Unique per model, so a [`ResidentB`] cannot be used with another RPU.
+    id: u64,
+}
+
+/// B (`n x k`) in RPU memory, written by [`Rpu::upload_b`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentB {
+    id: u64,
+    base: u32,
+    n: usize,
+    k: usize,
+}
+
+impl ResidentB {
+    /// First memory beat after this B.
+    pub fn end(&self) -> u32 {
+        self.base + self.n.div_ceil(TILE) as u32 * panel_beats(self.k)
+    }
 }
 
 impl Rpu {
@@ -97,6 +118,7 @@ impl Rpu {
             inner,
             words_written: 0,
             words_read: Cell::new(0),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         };
         rpu.reset();
         Ok(rpu)
@@ -146,9 +168,8 @@ impl Rpu {
     }
 
     /// Int8 NT GEMM `C[i][j] = sum_k A[i][k] * B[j][k]`: A is `m x k`, B is `n x k`, C is
-    /// `m x n`, all row-major. All operands go into external memory first. For each block
-    /// of TILE rows of A, A is loaded once; the B tiles alternate between the two local
-    /// banks, so the load of the next B overlaps the compute of the current one.
+    /// `m x n`, all row-major. B goes to the start of RPU memory, A and C after it. To reuse
+    /// B across calls, use [`Rpu::upload_b`] and [`Rpu::matmul_resident`].
     pub fn matmul_nt_i8(
         &mut self,
         a: &[i8],
@@ -157,27 +178,58 @@ impl Rpu {
         n: usize,
         k: usize,
     ) -> Result<Vec<i32>, RpuError> {
+        let b = self.upload_b(0, b, n, k);
+        self.matmul_resident(a, m, &b, b.end())
+    }
+
+    /// Writes B (`n x k`, row-major) into RPU memory from beat `base`, padded to whole tiles.
+    /// The returned handle stays valid until something else overwrites that memory.
+    pub fn upload_b(&mut self, base: u32, b: &[i8], n: usize, k: usize) -> ResidentB {
         assert!((1..=KMAX).contains(&k), "k must be in 1..={KMAX}");
-        assert_eq!(a.len(), m * k, "A must be m x k");
         assert_eq!(b.len(), n * k, "B must be n x k");
+        let handle = ResidentB {
+            id: self.id,
+            base,
+            n,
+            k,
+        };
+        assert!(
+            (handle.end() * BEAT_WORDS) as usize * 8 <= MEM_BYTES,
+            "B does not fit in RPU memory"
+        );
+        self.write_words(base, &pack_rows(&pad_rows(b, n, k), k));
+        handle
+    }
+
+    /// The GEMM of [`Rpu::matmul_nt_i8`] with B already in RPU memory. A and the C tiles go
+    /// to memory from beat `scratch`, which must not overlap B. For each block of TILE rows
+    /// of A, A is loaded once; the B tiles alternate between the two local banks, so the
+    /// load of the next B overlaps the compute of the current one.
+    pub fn matmul_resident(
+        &mut self,
+        a: &[i8],
+        m: usize,
+        b: &ResidentB,
+        scratch: u32,
+    ) -> Result<Vec<i32>, RpuError> {
+        assert_eq!(b.id, self.id, "B was uploaded to another RPU");
+        let (n, k) = (b.n, b.k);
+        assert_eq!(a.len(), m * k, "A must be m x k");
         let (mt, nt) = (m.div_ceil(TILE), n.div_ceil(TILE));
-        let panel = (TILE * k.div_ceil(TILE)) as u32;
-        let (a_base, b_base) = (0, mt as u32 * panel);
-        let c_base = b_base + nt as u32 * panel;
+        let panel = panel_beats(k);
+        let (a_base, b_base) = (scratch, b.base);
+        let c_base = a_base + mt as u32 * panel;
         let c_tile = |r: usize, j: usize| c_base + (r * nt + j) as u32 * C_BEATS;
         assert!(
             (c_tile(mt, 0) * BEAT_WORDS) as usize * 8 <= MEM_BYTES,
             "GEMM does not fit in RPU memory"
         );
-        let pad = |x: &[i8], rows: usize| {
-            let mut v = x.to_vec();
-            v.resize(rows * TILE * k, 0);
-            v
-        };
-        self.write_words(a_base, &pack_rows(&pad(a, mt), k));
-        self.write_words(b_base, &pack_rows(&pad(b, nt), k));
+        assert!(
+            c_tile(mt, 0) <= b.base || b.end() <= a_base,
+            "scratch overlaps B"
+        );
+        self.write_words(a_base, &pack_rows(&pad_rows(a, m, k), k));
         self.write_reg(REG_K_LEN, k as u64);
-
         for r in 0..mt {
             // Tile 0 has no preloaded bank: START loads A and B first.
             self.write_reg(REG_A_BASE, (a_base + r as u32 * panel).into());
@@ -375,6 +427,18 @@ const fn parse_usize(s: &str) -> usize {
     value
 }
 
+/// Beats of one panel: TILE rows of `k` int8, each padded to whole beats.
+fn panel_beats(k: usize) -> u32 {
+    (TILE * k.div_ceil(TILE)) as u32
+}
+
+/// `rows x k` padded with zero rows to whole tiles.
+fn pad_rows(x: &[i8], rows: usize, k: usize) -> Vec<i8> {
+    let mut v = x.to_vec();
+    v.resize(rows.div_ceil(TILE) * TILE * k, 0);
+    v
+}
+
 /// Packs `k`-long rows into 64-bit host words, each row zero-padded to whole beats.
 /// Value 0 of a word is its low byte.
 fn pack_rows(m: &[i8], k: usize) -> Vec<u64> {
@@ -439,6 +503,32 @@ mod tests {
         rpu.start(1);
         rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
         assert_eq!(rpu.read_c(1), vec![-4 * TILE as i32; N2]);
+    }
+
+    #[test]
+    fn resident_b_serves_many_a_and_any_placement() {
+        let mut rpu = Rpu::new().expect("RPU model");
+        let mut rng = quant::XorShift(0x0e51_de47_b000_0001);
+        let (n, k) = (3 * TILE + 5, 200);
+        let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
+        // B after the scratch area, then B before it.
+        for (b_base, scratch) in [(20_000, Some(0)), (0, None)] {
+            let handle = rpu.upload_b(b_base, &b, n, k);
+            let scratch = scratch.unwrap_or(handle.end());
+            for m in [1, TILE, 2 * TILE + 3] {
+                let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+                let got = rpu.matmul_resident(&a, m, &handle, scratch).unwrap();
+                assert_eq!(got, quant::matmul_nt_i8(&a, &b, m, n, k), "m = {m}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch overlaps B")]
+    fn resident_b_rejects_overlapping_scratch() {
+        let mut rpu = Rpu::new().expect("RPU model");
+        let handle = rpu.upload_b(0, &[1; TILE * 16], TILE, 16);
+        let _ = rpu.matmul_resident(&[1; TILE * 16], TILE, &handle, handle.end() - 1);
     }
 
     fn assert_gemm_exact(rpu: &mut Rpu, m: usize, n: usize, k: usize, rng: &mut quant::XorShift) {
