@@ -12,7 +12,7 @@ Rust API (src/lib.rs)
   -> Verilator model of rtl/rpu_top.sv
        register file, panel buffers, load / compute / store FSMs
        rtl/rpu_sim_memory.sv   external memory model, 8*N-bit beats, 1 MB up to N = 16
-                               and N / 16 MB above
+                               and N / 16 MB above, LOAD_BEATS beats per read
        rtl/rpu_array.sv        N x N output-stationary array + input skew
          rtl/int8_cell.sv      one PE: int8 x int8 -> int32 accumulate
          rtl/delay_cell.sv     skew registers
@@ -70,9 +70,10 @@ Build-time parameters are environment variables read by `build.rs`:
 ```bash
 RPU_N=16 cargo test --release            # array size (default 8)
 RPU_READ_LATENCY=10 cargo test --release # memory read latency in cycles (default 1)
+RPU_LOAD_BEATS=2 cargo test --release    # beats per load request (default 1, must divide N)
 ```
 
-They become `-GN` / `-GREAD_LATENCY` for Verilator and are re-exported to Rust, so `TILE` always equals the RTL `N`. `build.rs` clears the Verilator `obj_dir` before each run; stale generated files from another N do not compile.
+They become `-GN` / `-GREAD_LATENCY` / `-GLOAD_BEATS` for Verilator and are re-exported to Rust, so `TILE` always equals the RTL `N`. `build.rs` clears the Verilator `obj_dir` before each run; stale generated files from another N do not compile.
 
 Icarus smoke test of the array alone (N = 4):
 
@@ -150,7 +151,7 @@ bit 6 STORE_BUSY      C store running (overlaps the next compute)
 
 ### Memory layout
 
-Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest word first; when N is not a multiple of 8, the top bytes of a beat's last word are padding). Base registers hold beat addresses.
+Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest word first; when N is not a multiple of 8, the top bytes of a beat's last word are padding). Base registers hold beat addresses. A load request reads LOAD_BEATS consecutive beats from an address rounded down to a multiple of LOAD_BEATS, so A_BASE and B_BASE must be multiples of LOAD_BEATS (`run_gemm` checks it). The board keeps LOAD_BEATS = 1; 2 is the wide read port of a bigger part (`docs/perf-log.md`, item 14).
 
 - A and B panels: N rows of `ceil(K/N)` beats each, stored column by column: beat c of rows 0..N-1, then beat c + 1 (`pack_panels`). Beat c of a row holds k = cN .. cN + N - 1, k = cN in the lowest byte, zero padded past K. A load reads one column of A and then the same column of B, so the stream can read column c before the later columns arrive.
 - C tile: row-major int32, 4 beats per row (two int32 per host word, low half first).
@@ -161,7 +162,7 @@ Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layou
 ### State machines
 
 ```text
-load (issue and receive sides, one beat per cycle):
+load (issue and receive sides, one request of LOAD_BEATS beats per cycle):
   per beat column: the A rows (unless KEEP_A) into A bank A_BANK, then the B
   rows (unless KEEP_B) into B bank BANK; at the end the B bank is marked
   valid, unless the load came from START
@@ -169,8 +170,9 @@ load (issue and receive sides, one beat per cycle):
 launch (one START waiting for the compute):
   a START on a loaded bank, or a START that loads, is held until the compute is
   IDLE or FINISH and its operands are far enough in: at once for a loaded bank;
-  for a load, once K + 2N beats are in (A and B) or N + 1 (one panel), or at
-  the end of the load (see below)
+  for a load, once K + 2N responses are in (A and B, LOAD_BEATS = 1),
+  2N / LOAD_BEATS + 1 (A and B, LOAD_BEATS > 1) or N / LOAD_BEATS + 1 (one
+  panel), or at the end of the load (see below)
 
 compute:
   IDLE -> CLEAR   set up the stream; wait while the drain of the tile before
@@ -262,7 +264,7 @@ DONE; the host reads all C tiles
 
 Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 93.21% of its busy cycles at N = 8. The overhead is the part of the first A + B load that the first stream does not overlap (K + 2N beats, about 800 cycles), a few cycles per tile (the read latency of each load and the START handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed: at a row block change only the next A loads (K beats, the same as a B preload), because the next block starts with the B tile the block before ended with. Before that order, the next block's A + B load (2K cycles) overlapped one tile (K cycles), and about K cycles per later block stayed exposed (`docs/perf-log.md`, item 9).
 
-The first stream of a GEMM starts before its load ends (`docs/perf-log.md`, item 12). A load brings one beat per cycle; beat b arrives at most one cycle after beat b - 1, because the issue side never stops and the memory never stalls a read. With A and B, column c is complete at beat 2N(c + 1), and the stream reads it from cycle Nc after it starts, so the stream may start once Kp + N - 2 beats are in, with Kp = N * ceil(K/N) <= K + N - 1. The launch waits for K + 2N beats: 3 more than the worst case. With one panel (KEEP_A or KEEP_B) the bound is N - 2 beats and the launch waits for N + 1. The tests pass with both thresholds 3 lower and fail with 4 lower. **A memory that can stall a read (DDR) breaks this**: it needs a stall-aware check or a launch at the end of the load.
+The first stream of a GEMM starts before its load ends (`docs/perf-log.md`, item 12). A load brings one beat per cycle; beat b arrives at most one cycle after beat b - 1, because the issue side never stops and the memory never stalls a read. With A and B, column c is complete at beat 2N(c + 1), and the stream reads it from cycle Nc after it starts, so the stream may start once Kp + N - 2 beats are in, with Kp = N * ceil(K/N) <= K + N - 1. The launch waits for K + 2N beats: 3 more than the worst case. With one panel (KEEP_A or KEEP_B) the bound is N - 2 beats and the launch waits for N + 1. The tests pass with both thresholds 3 lower and fail with 4 lower. With LOAD_BEATS > 1 a response brings LOAD_BEATS rows of one column, so column c is complete at response R(c + 1), R = PN / LOAD_BEATS for P panels. Once R <= N the load is at least as fast as the stream and column 0 decides: the bound is R - 2 responses and the launch waits for R + 1 (N + 1 for A and B at LOAD_BEATS = 2). The exposed part of the first load drops from K + 2N to about N cycles; the tests pass with these thresholds 3 lower and fail with 4 lower too (`docs/perf-log.md`, item 14). **A memory that can stall a read (DDR) breaks this**: it needs a stall-aware check or a launch at the end of the load.
 
 K must fit in one panel (K <= KMAX). Partial sums over K are not split across jobs.
 

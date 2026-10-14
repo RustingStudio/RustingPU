@@ -46,6 +46,7 @@ Needs Rust, Verilator (5.052 tested) and a C++ compiler. Icarus and yosys are op
 cargo test --release                   # bit-exact tests against the host int8 reference
 cargo test --release --features brain  # plus the RustingBrain MLP test
 RPU_N=16 cargo test --release          # another array size
+RPU_N=64 RPU_LOAD_BEATS=2 cargo test --release  # a big array with a 2-beat read port
 ```
 
 The MNIST example reads the four unpacked IDX files from `data/mnist/` (not in the repository; download them from any MNIST mirror). The first run trains the network (about 20 s) and saves it there.
@@ -56,7 +57,7 @@ The MNIST example reads the four unpacked IDX files from `data/mnist/` (not in t
 - INT8 matmul with bias, ReLU and requantization between layers. The input quantization, the last layer's bias and softmax run on the host. Output scales are static, calibrated on training images. No convolution, no BF16 or FP32.
 - K is at most 1024 per panel; partial sums over K are not split across jobs.
 - All operands must fit in the RPU memory: 1 MB up to N = 16, N / 16 MB above.
-- The first load of each GEMM is only partly hidden: the stream starts after about K + 2N beats.
+- The first load of each GEMM is only partly hidden with the board's one-beat read port: the stream starts after about K + 2N beats. A wider port (`RPU_LOAD_BEATS=2`, for bigger parts) starts it after about N.
 
 ## Roadmap
 

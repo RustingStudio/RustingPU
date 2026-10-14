@@ -4,6 +4,13 @@ pub mod quant;
 
 /// Array size N, set at build time with `RPU_N` (default 8).
 pub const TILE: usize = parse_usize(env!("RPU_N"));
+/// Beats per load request, set at build time with `RPU_LOAD_BEATS` (default 1). A and B
+/// must start at a multiple of it.
+pub const LOAD_BEATS: usize = parse_usize(env!("RPU_LOAD_BEATS"));
+const _: () = assert!(
+    TILE.is_multiple_of(LOAD_BEATS),
+    "RPU_LOAD_BEATS must divide RPU_N"
+);
 /// Longest K of one panel job. Must match `KMAX` of `rtl/rpu_top.sv`.
 pub const KMAX: usize = 1024;
 /// Size of the RPU memory. Must match `MEM_BYTES` of `rtl/rpu_top.sv`.
@@ -362,6 +369,11 @@ impl Rpu {
         assert!(apart(b.base, b.end()), "C overlaps B");
         assert!(apart(a.base, a.end()), "C overlaps A");
         assert!(a.end() <= b.base || b.end() <= a.base, "A overlaps B");
+        assert!(
+            (a.base as usize).is_multiple_of(LOAD_BEATS)
+                && (b.base as usize).is_multiple_of(LOAD_BEATS),
+            "A and B must start at a multiple of {LOAD_BEATS} beats"
+        );
         self.write_reg(REG_K_LEN, a.k as u64);
         self.write_reg(REG_A_BASE, a.base.into());
         self.write_reg(REG_B_BASE, b.base.into());
@@ -873,11 +885,17 @@ mod tests {
             println!("{blocks} x {n_tiles} tiles, K = {k}: active {active} / busy {busy} cycles");
             assert_eq!(active as usize, tiles * k);
             // Idle array cycles: the part of the first A + B load that the first stream does
-            // not overlap (K + 2N), the last settle, drain and store (7N), and per tile the
+            // not overlap (K + 2N, or 2N / LOAD_BEATS + 1 when the load keeps up with the
+            // stream), the last settle, drain and store (7N), and per tile the
             // read latency of its load and a few cycles of START handshake, but no settle or
             // drain per tile and no B load at a row block change.
             let idle = busy as usize - tiles * k;
-            let bound = k + 2 * TILE + latency + 7 * TILE + tiles * (latency + 8);
+            let first = if LOAD_BEATS == 1 {
+                k + 2 * TILE
+            } else {
+                2 * TILE / LOAD_BEATS + 1
+            };
+            let bound = first + latency + 7 * TILE + tiles * (latency + 8);
             assert!(idle <= bound, "{idle} idle cycles, bound {bound}");
         }
     }
@@ -974,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_load_moves_one_beat_per_cycle() {
+    fn panel_load_moves_load_beats_per_cycle() {
         let latency: u32 = env!("RPU_READ_LATENCY").parse().unwrap();
         let mut rpu = Rpu::new().unwrap();
         for k in [1, 9, 784] {
@@ -982,7 +1000,8 @@ mod tests {
             let busy = rpu.busy_cycles();
             rpu.preload_panel_i8(0, &panel, &panel, k).unwrap();
             let beats = 2 * TILE as u32 * k.div_ceil(TILE) as u32;
-            assert_eq!(rpu.busy_cycles() - busy, beats + latency, "k = {k}");
+            let requests = beats / LOAD_BEATS as u32;
+            assert_eq!(rpu.busy_cycles() - busy, requests + latency, "k = {k}");
         }
     }
 

@@ -1,6 +1,8 @@
 // RPU top: register file, int8 panel buffers, DMA FSMs and the systolic array.
 // C = A * B^T (NT GEMM) with A and B both N x K_LEN, 1 <= K_LEN <= KMAX.
-// Memory moves 8*N-bit beats (N int8). An A or B panel is stored column by column: beat
+// Memory moves 8*N-bit beats (N int8). The load reads LOAD_BEATS beats per request, so
+// A and B base addresses must be multiples of LOAD_BEATS; LOAD_BEATS = 2 loads A and B
+// as fast as the stream reads them. An A or B panel is stored column by column: beat
 // column c of rows 0..N-1, then column c + 1; a beat holds k = c*N.. c*N + N-1 of one row,
 // k = c*N in the lowest byte, zero padded past K. C is stored
 // row-major as int32, 4 beats per row. Base registers hold beat addresses.
@@ -24,6 +26,9 @@ module rpu_top #(
     parameter int N = 8,
     parameter int KMAX = 1024,
     parameter int READ_LATENCY = 1,
+    // Beats per load request: 1 for the board, 2 or more for a wider read port. Must
+    // divide N.
+    parameter int LOAD_BEATS = 1,
     // 64K beats from N = 16 on, so a bigger array gets a bigger memory.
     parameter int MEM_BYTES = (1 << 20) * ((N > 16) ? N / 16 : 1)
 ) (
@@ -65,6 +70,7 @@ module rpu_top #(
     localparam int DRAIN_W = $clog2(SETTLE_STEPS + 1);
     localparam int STORE_W = $clog2(C_BEATS);
     localparam logic [COL_W-1:0] COL_LAST = COL_W'(N - 1);
+    localparam logic [COL_W-1:0] LOAD_LAST = COL_W'(N - LOAD_BEATS);  // last request of a column
     localparam logic [DRAIN_W-1:0] SETTLE_LAST = DRAIN_W'(SETTLE_STEPS - 1);
     localparam logic [DRAIN_W-1:0] DRAIN_LAST = DRAIN_W'(N - 1);
     localparam logic [STORE_W-1:0] STORE_LAST = STORE_W'(C_BEATS - 1);
@@ -254,7 +260,7 @@ module rpu_top #(
     logic [HOST_ADDR_W-1:0] host_mem_addr;
     logic [63:0] host_mem_rdata;
     logic dma_rd_resp_valid;
-    logic [BEAT_W-1:0] dma_rd_data;
+    logic [LOAD_BEATS*BEAT_W-1:0] dma_rd_data;
     logic dma_wr_valid;
     logic [BEAT_ADDR_W-1:0] dma_wr_addr;
     logic [BEAT_W-1:0] dma_wr_data;
@@ -282,11 +288,14 @@ module rpu_top #(
             logic [BEAT_W-1:0] row_b [0:1][0:ROW_BEATS-1];
             logic [BEAT_W-1:0] beat_a;
             logic [BEAT_W-1:0] beat_b;
+            logic [BEAT_W-1:0] load_beat;
 
+            // A response holds rows recv_row .. recv_row + LOAD_BEATS - 1 of one column.
+            assign load_beat = dma_rd_data[(i % LOAD_BEATS)*BEAT_W +: BEAT_W];
             always_ff @(posedge clk) begin
-                if (load_busy && dma_rd_resp_valid && recv_row == COL_W'(i)) begin
-                    if (!recv_panel) row_a[(load_a_bank ? A_BANK1_BEAT : '0) + RA_W'(recv_beat)] <= dma_rd_data;
-                    else row_b[load_local_bank][recv_beat] <= dma_rd_data;
+                if (load_busy && dma_rd_resp_valid && recv_row == COL_W'(i - i % LOAD_BEATS)) begin
+                    if (!recv_panel) row_a[(load_a_bank ? A_BANK1_BEAT : '0) + RA_W'(recv_beat)] <= load_beat;
+                    else row_b[load_local_bank][recv_beat] <= load_beat;
                 end
             end
 
@@ -371,7 +380,8 @@ module rpu_top #(
     rpu_sim_memory #(
         .N(N),
         .BYTES(MEM_BYTES),
-        .READ_LATENCY(READ_LATENCY)
+        .READ_LATENCY(READ_LATENCY),
+        .LOAD_BEATS(LOAD_BEATS)
     ) external_memory (
         .clk(clk),
         .reset(reset),
@@ -601,14 +611,17 @@ module rpu_top #(
                     cycles <= 32'd0;
                     launch_valid <= 1'b1;
                     launch_ready <= 1'b0;
-                    // Beat b of the load lands at most one cycle after beat b - 1, and the
-                    // stream reads column c from N*c cycles after it starts. Column c is
-                    // complete at beat P*N*(c+1) of a load of P panels, so the stream may
-                    // start once P*N*c + P*N - N*c - 2 beats are in, for the last column
-                    // c = ceil(K/N) - 1: K + 2N - 3 for A and B, N - 2 for one panel. The
-                    // thresholds below leave 3 beats more.
+                    // Response r of the load lands at most one cycle after response r - 1,
+                    // and the stream reads column c from N*c cycles after it starts.
+                    // Column c is complete at response R*(c+1), R = P*N/LOAD_BEATS for P
+                    // panels, so the stream may start once R*(c+1) - N*c - 2 responses
+                    // are in, for every column c. With R > N (LOAD_BEATS = 1, A and B)
+                    // the last column c = ceil(K/N) - 1 decides: K + 2N - 3. Otherwise
+                    // column 0 does: R - 2. The thresholds below leave 3 responses more.
                     launch_wait <= (!control_keep_a && !control_keep_b)
-                        ? (K_W + 1)'(reg_k_len) + (K_W + 1)'(2 * N) : (K_W + 1)'(N + 1);
+                        ? ((LOAD_BEATS == 1) ? (K_W + 1)'(reg_k_len) + (K_W + 1)'(2 * N)
+                                             : (K_W + 1)'(2 * N / LOAD_BEATS + 1))
+                        : (K_W + 1)'(N / LOAD_BEATS + 1);
                     launch_bank <= control_bank;
                     launch_a_bank <= control_a_bank;
                     launch_k_len <= reg_k_len;
@@ -652,10 +665,10 @@ module rpu_top #(
             end
 
             if (issue_active) begin
-                if (issue_panel) issue_b_addr <= issue_b_addr + 1'b1;
-                else issue_a_addr <= issue_a_addr + 1'b1;
-                if (issue_row != COL_LAST) begin
-                    issue_row <= issue_row + 1'b1;
+                if (issue_panel) issue_b_addr <= issue_b_addr + BEAT_ADDR_W'(LOAD_BEATS);
+                else issue_a_addr <= issue_a_addr + BEAT_ADDR_W'(LOAD_BEATS);
+                if (issue_row != LOAD_LAST) begin
+                    issue_row <= issue_row + COL_W'(LOAD_BEATS);
                 end else begin
                     issue_row <= '0;
                     if (load_both && !issue_panel) begin
@@ -675,8 +688,8 @@ module rpu_top #(
                     launch_wait <= launch_wait - 1'b1;
                     if (launch_wait == (K_W + 1)'(1)) launch_ready <= 1'b1;
                 end
-                if (recv_row != COL_LAST) begin
-                    recv_row <= recv_row + 1'b1;
+                if (recv_row != LOAD_LAST) begin
+                    recv_row <= recv_row + COL_W'(LOAD_BEATS);
                 end else begin
                     recv_row <= '0;
                     if (load_both && !recv_panel) begin

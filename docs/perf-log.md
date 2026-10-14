@@ -34,6 +34,10 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 7 hardware requantization | 12 | 97.25% | 851.5 | 96.41% | 152.6 / 9.0 | 5.6 s |
 | 13 big N | 32 | 97.25% | 128.2 | 79.67% | 103.7 / 16.0 | 8.4 s |
 | 13 big N | 64 | 97.25% | 59.8 | 44.49% | 108.2 / 32.2 | 26.1 s |
+| 14 wide load path, LOAD_BEATS 2 | 32 | 97.25% | 111.2 | 91.85% | 103.7 / 16.0 | 8.5 s |
+| 14 wide load path, LOAD_BEATS 2 | 64 | 97.25% | 43.3 | 61.52% | 108.2 / 32.2 | 25.9 s |
+| 14 wide load path, LOAD_BEATS 2 | 16 | 97.25% | 405.3 | 98.68% | 101.5 / 8.0 | 5.5 s |
+| 14 wide load path, LOAD_BEATS 2 | 8 | 97.25% | 1606.7 | 99.58% | 101.5 / 8.0 | 5.2 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -280,6 +284,30 @@ Host words: 115.5 written (A of both layers, 114 words, and 7 register writes pe
   - No STA at N = 32 and 64: the xcup flow has no timing model in yosys here.
 - Tests: all tests pass at N = 32 and 64, READ_LATENCY 1 and 10, with the brain feature (about 30 s per run at N = 64, 4 min with the build). At N = 4, 8, 12, 16 unchanged; Icarus smoke test and Verilator lint (N = 8, 12, 16, 32, 64) clean.
 - Load: `uptime` 4.5 to 5.8 (MNIST), 5 to 9 (synthesis).
+- Commit: `d916e78`.
+
+## Item 14: wide load path for big configs. Done, 2026-10-14
+- Before (item 13): one 8N-bit read port brings A and B at half the stream rate, so the first stream of each GEMM waits for K + 2N beats of its load. At N = 64 batch 64 is one row block and a GEMM has one or two tiles, so that wait is about as long as a tile stream: 44.49% streaming.
+- Fix: parameter `LOAD_BEATS` (`RPU_LOAD_BEATS`, default 1). A load request reads LOAD_BEATS consecutive beats, rows i .. i + LOAD_BEATS - 1 of one panel column, from an address rounded down to a multiple of LOAD_BEATS; the issue and receive sides step by LOAD_BEATS rows, and each panel row memory still takes one write per cycle. A and B must start at a multiple of LOAD_BEATS beats (`run_gemm` checks it; every panel is a multiple of N beats, so the driver's layouts already are). At LOAD_BEATS = 2 a column of A and B (2N beats) arrives in N cycles, as fast as the stream reads it. The board keeps LOAD_BEATS = 1 and its RTL does not change in function or size.
+- Launch threshold: column c is complete at response R(c + 1), R = PN / LOAD_BEATS for P panels. With R <= N column 0 decides, so the stream may start after R - 2 responses; the launch waits for R + 1 (N + 1 for A and B at LOAD_BEATS = 2, N / 2 + 1 for one panel). At LOAD_BEATS = 1 the thresholds are those of item 12. Sweep at N = 8, LOAD_BEATS = 2, READ_LATENCY 1 and 10: both thresholds 3 lower pass, 4 lower fail, as at LOAD_BEATS = 1.
+- MNIST, RPU equal to host int8 for every image, 97.25%, host words unchanged:
+
+  | N | LOAD_BEATS 1 (item 13) | LOAD_BEATS 2 | Streaming |
+  |---|---:|---:|---|
+  | 8 | 1625.5 | 1606.7 (-1.2%) | 98.43% to 99.58% |
+  | 16 | 420.9 | 405.3 (-3.7%) | 95.04% to 98.68% |
+  | 32 | 128.2 | 111.2 (-13.3%) | 79.67% to 91.85% |
+  | 64 | 59.8 | 43.3 (-27.6%) | 44.49% to 61.52% |
+
+  Board config (N = 8 and 16, LOAD_BEATS = 1) remeasured: 1625.5 and 420.9, unchanged.
+- What is left at N = 64, per batch (busy 2,757 cycles, streaming 1,696): the first load, now about 2N / LOAD_BEATS + read latency = 66 cycles per GEMM, and the settle, drain and store of the last tile of each GEMM, about 7N = 448 cycles per GEMM, 896 per batch. The tail grows with N and is paid once per GEMM, so a larger batch (item 15) amortizes it.
+- Synthesis, `rpu_top` (the wider memory port is outside it):
+  - gowin, LOAD_BEATS = 1: N = 8 gw5a 31,237 LUT, 4,036 ALU, 7,977 DFF, 20 SDPX9B, 2,112 RAM16SDP4; N = 16 gw5a 87,779 LUT, 13,759 ALU, 28,478 DFF, 72 SDPX9B, 4,224 RAM16SDP4; N = 8 gw2a 12,463 LUT, 2,928 ALU; N = 16 gw2a 29,096 LUT, 9,593 ALU, 256 MULT9X9. Same as item 7 within abc noise (DFF, MULT and RAM equal).
+  - gw2a N = 8, LOAD_BEATS = 2: 12,166 LUT, 3,011 ALU, 8,037 DFF (+60), same RAM and MULT.
+  - xcup, LOAD_BEATS 1 / 2: N = 16 23,043 / 22,774 LUT, 28,941 / 29,061 FF; N = 32 78,522 / 78,406 LUT, 110,978 / 110,978 FF; N = 64 305,081 / 304,604 LUT, 438,240 / 438,240 FF; DSP, LUT RAM and BRAM equal. The cost of LOAD_BEATS = 2 is the 16N-bit read port of the memory: a 1,024-bit port at N = 64, so a part for it needs wide on-chip memory or a wide external memory controller.
+  - gw5a N = 32 (item 13) still had not finished after 43 min and was stopped.
+- Tests: all tests pass at N = 8 (LOAD_BEATS 1, 2 and 4), 12 (2), 16 (2), 32 (2) and 64 (2), READ_LATENCY 1 and 10, with the brain feature, and still at LOAD_BEATS = 1 (N = 8, 12, 16). `next_tile_streams_during_drain` bounds the exposed first load at 2N / LOAD_BEATS + 1 cycles for LOAD_BEATS > 1, and `panel_load_moves_load_beats_per_cycle` checks 2N ceil(K/N) / LOAD_BEATS + read latency cycles per load. Mutations at LOAD_BEATS = 2, each caught: the odd rows of a response never written, the low beat of a response for every row, the B address stepped by 1, the K + 2N threshold kept (only the idle bound catches it). Not caught by a test: the alignment check in `run_gemm` removed (the driver never makes a misaligned base). Verilator lint N = 8, 12, 16, 32, 64 at LOAD_BEATS 1 and 2 and the Icarus smoke test clean.
+- Load: `uptime` 6.4 to 8.4 (MNIST, tests and synthesis in parallel).
 - Commit: pending.
 
 ## Questions for owner

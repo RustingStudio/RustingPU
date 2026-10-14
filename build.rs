@@ -11,9 +11,11 @@ fn main() {
         "rtl/rpu_top.sv",
     ];
 
-    // Array size and memory read latency, e.g. RPU_N=16 RPU_READ_LATENCY=10 cargo test.
+    // Array size, memory read latency and beats per load request, e.g.
+    // RPU_N=16 RPU_READ_LATENCY=10 RPU_LOAD_BEATS=2 cargo test.
     let n = std::env::var("RPU_N").unwrap_or_else(|_| "8".into());
     let read_latency = std::env::var("RPU_READ_LATENCY").unwrap_or_else(|_| "1".into());
+    let load_beats = std::env::var("RPU_LOAD_BEATS").unwrap_or_else(|_| "1".into());
 
     // A rebuild with other parameters can emit fewer files; never compile stale ones.
     let _ = std::fs::remove_dir_all(&obj_dir);
@@ -22,6 +24,7 @@ fn main() {
     cmd.args(["--cc", "-Wno-CASEINCOMPLETE", "--top-module", "rpu_top"])
         .arg(format!("-GN={n}"))
         .arg(format!("-GREAD_LATENCY={read_latency}"))
+        .arg(format!("-GLOAD_BEATS={load_beats}"))
         .args(["-Mdir", &obj_dir]);
     for f in &rtl_files {
         cmd.arg(format!("{}/{}", base, f));
@@ -55,6 +58,8 @@ fn main() {
     println!("cargo:rustc-env=RPU_N={n}");
     println!("cargo:rerun-if-env-changed=RPU_READ_LATENCY");
     println!("cargo:rustc-env=RPU_READ_LATENCY={read_latency}");
+    println!("cargo:rerun-if-env-changed=RPU_LOAD_BEATS");
+    println!("cargo:rustc-env=RPU_LOAD_BEATS={load_beats}");
     for f in &rtl_files {
         println!("cargo:rerun-if-changed={}", f);
     }
