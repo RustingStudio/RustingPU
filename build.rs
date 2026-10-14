@@ -30,7 +30,7 @@ fn main() {
     assert!(status.success(), "Verilator failed");
 
     let mut build = cc::Build::new();
-    build.cpp(true).flag("-Os").flag("-w");
+    build.cpp(true).flag("-O2").flag("-w");
 
     for entry in std::fs::read_dir(&obj_dir).expect("failed to read Verilator obj_dir") {
         let path = entry.expect("failed to read Verilator output").path();

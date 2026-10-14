@@ -18,6 +18,8 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 5 shadow accumulator | 12 | 97.26% | 939.7 | 87.36% | 179.8 / 108.1 | 19.7 s |
 | 6 operand register | 8 | 97.26% | 1743.2 | 91.78% | 124.5 / 72.0 | 14.6 s |
 | 6 operand register | 16 | 97.26% | 478.0 | 83.68% | 117.7 / 72.0 | 17.7 s |
+| 8 simulation speed | 8 | 97.26% | 1743.2 | 91.78% | 124.5 / 72.0 | 5.5 s |
+| 8 simulation speed | 16 | 97.26% | 478.0 | 83.68% | 117.7 / 72.0 | 6.1 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -117,3 +119,25 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 - Next path, not changed in this item: the B panels are in LUT RAM (item 3), so the read is a LUT RAM read plus a multiplexer tree. Moving them to BSRAM (a single linear address register, as for A) would put a registered read there and free about 2,048 RAM16SDP4 at N = 8, but it needs 128 SDPX9B at N = 16, more than the 118 on the GW5AT-LV60. It changes speed only on the board (no cycle gain in simulation), so it is a question for milestone 2, not a loop item.
 - Tests: the whole suite covers the new timing; mutations: the last flag not registered with the operands fails 9 tests at N = 8 and 16; the settle one cycle shorter fails 9 tests. The overlap threshold passes at 3N - 1 and 3N - 3 and fails at 3N - 4 (`start_right_after_stream_end`), the same boundary as item 5. All pass at N = 8 and 16, READ_LATENCY 1 and 10; Icarus smoke test and Verilator lint clean.
 - Load: `uptime` 4.5 (MNIST), 3.9 (synthesis).
+- Commit: `f826a78`.
+
+## Item 7: hardware bias, ReLU and requantization. Blocked on P1 (not approved).
+
+## Item 8: simulation speed. Done, 2026-10-14
+- Wall time of the MNIST example (10k images, host int8 included), N = 8 / N = 16, all at `f826a78`, measured back to back:
+
+  | Build | N = 8 | N = 16 |
+  |---|---:|---:|
+  | C++ `-Os` (before) | 14.4 s, 14.4 s | 17.7 s, 17.5 s |
+  | C++ `-O2` | 5.9 s | 6.2 s |
+  | C++ `-O3` | 5.9 s | 6.3 s |
+  | C++ `-O2`, Verilator `-O3 --x-assign fast --x-initial fast` | 5.9 s | 6.3 s |
+  | C++ `-O2`, no redundant evals (after) | 5.5 s, 5.6 s, 5.5 s | 6.1 s, 6.1 s, 6.2 s |
+
+- Kept: `-O2` in `build.rs` (-59% and -65%), and the wrapper no longer evaluates the model in `rpu_busy`, `rpu_done` and in `rpu_read` when the address did not change. Every call that changes an input already evaluates before it returns, so the outputs are settled between calls; the driver's wait loops called `eval` three times per cycle, now two. That is a further -6% at N = 8 and about -1% at N = 16, where the larger model makes the clocked evals dominate.
+- Not kept: `-O3` and the Verilator flags gain nothing measurable, so the build stays as it was there.
+- Not done: bulk FFI. Every host word written is one bus cycle in the model, so a bulk call would save only the call itself, a few ns, against about 300 ns of simulation per cycle (5.5 s / 17.4 M cycles). Not worth the API.
+- Build time of the N = 16 example: 21.3 s to 18.1 s.
+- Simulated cycles, accuracy and host words are unchanged (1743.2 and 478.0 cycles per image, 97.26%, RPU equal to host int8 for every image).
+- Tests: all pass at N = 8 and 16, READ_LATENCY 1 and 10. Mutation: `rpu_read` that never evaluates after changing the address fails 5 tests.
+- Load: `uptime` 2.1 to 3.5.

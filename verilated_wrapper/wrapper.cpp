@@ -6,6 +6,8 @@ struct rpu_t {
     Vrpu_top core;
 };
 
+// Every function that changes an input evaluates before it returns, so the outputs are
+// always settled between calls; the readers below evaluate only when they change an input.
 static void rpu_eval(rpu_t* r) {
     r->core.eval();
 }
@@ -61,8 +63,10 @@ void rpu_write(rpu_t *r, uint32_t addr, uint64_t value) {
 
 uint64_t rpu_read(rpu_t* r, uint32_t addr) {
     r->core.mem_we = 0;
-    r->core.mem_addr = addr;
-    rpu_eval(r);
+    if (r->core.mem_addr != addr) {
+        r->core.mem_addr = addr;
+        rpu_eval(r);
+    }
     return r->core.mem_rdata;
 }
 
@@ -74,12 +78,10 @@ void rpu_start(rpu_t* r) {
 }
 
 uint8_t rpu_busy(rpu_t* r) {
-    rpu_eval(r);
     return r->core.busy ? 1 : 0;
 }
 
 uint8_t rpu_done(rpu_t* r) {
-    rpu_eval(r);
     return r->core.done ? 1 : 0;
 }
 
