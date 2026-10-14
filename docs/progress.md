@@ -37,5 +37,14 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - Check: 1000 random tiles + edge tiles bit-exact (`==`), 10 tests pass, fmt and clippy clean. Icarus `tb_tpu.sv` (now drives `drain` and collects `c_col` over N cycles): PASS.
 - Cycles (`examples/baseline.rs`): load A+B 192, compute+store **417** (clear 1 + stream 8 + settle 16 + drain 8 + store 384). The compute part is 33 cycles, up from 25: the old drain copied all of C in one cycle, the shift takes N cycles. That is the plan's 1 + 8 + skew + 8 with skew = 16.
 - Mux check (yosys `proc; opt; memory -nomap; opt` on `rpu_top`): before, yosys printed "Replacing memory \mem_c with list of registers" (64 x 32-bit registers, 64:1 read mux). Now `mem_c` is one `$mem_v2`, 8 x 256 bit, 1 write port, 1 read port. No register-mapped `mem_c`.
+- Commit: `d12ddb1`.
+
+## Phase 5: K streaming. Done, 2026-10-14
+- `rpu_top` has `KMAX = 1024` and new registers: `K_LEN` (5, reset value N), `ACTIVE_LO/HI` (6/7, cycles the array streams), `BUSY_LO/HI` (8/9, cycles busy). Both counters run free from reset; the host takes differences.
+- The local A and B panels are one memory per array row, `[bank][KMAX/2]` x 16 bit. Yosys sees 16 memories with 1 write and 1 read port each (was 2 memories with 8 read ports). Each bank remembers the K_LEN it was loaded with, so a preload with another K can overlap a compute.
+- External layout per bank: A panel, B panel (`N * KMAX/2` words each), C tile. Each row is packed on its own and padded to an even k, so odd K works on the 16-bit bus. Bank 1 now starts at `0x1000 + 8320`.
+- Rust: `run_panel_i8(a, b, k)`, `preload_panel_i8(bank, a, b, k)`, `active_cycles()`, `busy_cycles()`. `run_tile_i8` is `run_panel_i8` with k = N.
+- Check: bit-exact (`==`) for K in {1, 7, 8, 9} (20 random panels each), 64 (10), 784 and 1024 (3 each), and all -127 at K=1024 (16,516,096 per PE). Each job adds exactly K to `active_cycles`. 12 tests pass, fmt and clippy clean, Icarus PASS.
+- Cycles (`examples/baseline.rs`): 8x784 x 784x8 compute **809 = 784 + 25** (clear 1 + settle 16 + drain 8), store C 384, total 1193. The plan said 784 + ~24.
 
 ## Questions for owner
