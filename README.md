@@ -20,6 +20,7 @@ MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBr
 ```bash
 cargo run --release --features brain --example mnist          # N = 8
 RPU_N=16 cargo run --release --features brain --example mnist # N = 16
+RPU_BATCH=256 cargo run --release --features brain --example mnist # batch 256 (default 64)
 ```
 
 ## How it works

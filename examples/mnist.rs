@@ -16,7 +16,7 @@ use rusting_pu::{Rpu, TILE};
 use std::path::Path;
 use std::time::Instant;
 
-/// Images per RPU batch. One activation scale covers the whole batch.
+/// Images per RPU batch unless `RPU_BATCH` sets it. One activation scale covers the whole batch.
 const BATCH: usize = 64;
 /// Training images that fix the hidden layer's output scale.
 const CALIBRATION: usize = 1000;
@@ -88,12 +88,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut mlp = RpuMlp::from_network(&network);
     mlp.calibrate(&train.inputs[..CALIBRATION]);
+    let batch_size = match std::env::var("RPU_BATCH") {
+        Ok(v) => v.parse()?,
+        Err(_) => BATCH,
+    };
     let mut rpu = Rpu::new()?;
     let (mut host, mut on_rpu) = (Vec::with_capacity(count), Vec::with_capacity(count));
     let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
     let (written, read) = (rpu.host_words_written(), rpu.host_words_read());
     let start = Instant::now();
-    for batch in test.inputs.chunks(BATCH) {
+    for batch in test.inputs.chunks(batch_size) {
         let h = mlp.predict_batch_host(batch);
         let r = mlp.predict_batch(&mut rpu, batch)?;
         assert_eq!(r, h, "RPU and host int8 outputs must be bit-identical");
@@ -110,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pct = |c: usize| 100.0 * c as f64 / count as f64;
     println!(
-        "N = {TILE}, batch {BATCH}, {count} test images, calibrated on {CALIBRATION} training images"
+        "N = {TILE}, batch {batch_size}, {count} test images, calibrated on {CALIBRATION} training images"
     );
     println!("f32       {f32_correct} correct, {:.2}%", pct(f32_correct));
     println!(

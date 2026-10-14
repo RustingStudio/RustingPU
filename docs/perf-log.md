@@ -38,6 +38,10 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 14 wide load path, LOAD_BEATS 2 | 64 | 97.25% | 43.3 | 61.52% | 108.2 / 32.2 | 25.9 s |
 | 14 wide load path, LOAD_BEATS 2 | 16 | 97.25% | 405.3 | 98.68% | 101.5 / 8.0 | 5.5 s |
 | 14 wide load path, LOAD_BEATS 2 | 8 | 97.25% | 1606.7 | 99.58% | 101.5 / 8.0 | 5.2 s |
+| 15 batch 256 | 8 | 97.25% | 1613.2 | 99.18% | 99.8 / 8.0 | 4.7 s |
+| 15 batch 256 | 16 | 97.25% | 407.0 | 98.29% | 99.8 / 8.0 | 4.9 s |
+| 15 batch 256, LOAD_BEATS 2 | 32 | 97.25% | 105.8 | 96.57% | 102.1 / 16.0 | 7.5 s |
+| 15 batch 256, LOAD_BEATS 2 | 64 | 97.25% | 33.2 | 80.26% | 106.5 / 32.2 | 21.4 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -308,11 +312,32 @@ Host words: 115.5 written (A of both layers, 114 words, and 7 register writes pe
   - gw5a N = 32 (item 13) still had not finished after 43 min and was stopped.
 - Tests: all tests pass at N = 8 (LOAD_BEATS 1, 2 and 4), 12 (2), 16 (2), 32 (2) and 64 (2), READ_LATENCY 1 and 10, with the brain feature, and still at LOAD_BEATS = 1 (N = 8, 12, 16). `next_tile_streams_during_drain` bounds the exposed first load at 2N / LOAD_BEATS + 1 cycles for LOAD_BEATS > 1, and `panel_load_moves_load_beats_per_cycle` checks 2N ceil(K/N) / LOAD_BEATS + read latency cycles per load. Mutations at LOAD_BEATS = 2, each caught: the odd rows of a response never written, the low beat of a response for every row, the B address stepped by 1, the K + 2N threshold kept (only the idle bound catches it). Not caught by a test: the alignment check in `run_gemm` removed (the driver never makes a misaligned base). Verilator lint N = 8, 12, 16, 32, 64 at LOAD_BEATS 1 and 2 and the Icarus smoke test clean.
 - Load: `uptime` 6.4 to 8.4 (MNIST, tests and synthesis in parallel).
+- Commit: `22618cd`.
+
+## Item 15: batch as a parameter. Done, 2026-10-14
+- Owner (2026-10-14): batch configurable, batch 64 stays the baseline, log both 64 and 256.
+- Change: the MNIST example reads `RPU_BATCH` (default 64). Nothing else changes: the driver and the RTL already take any number of rows, and batch 256 fits the memory at every N (input 256 x 784 bytes, hidden 256 x 128 bytes, C 256 x N x 4 bytes).
+- Accuracy: 97.25% host int8 and RPU at batch 256 too (9,725 correct, RPU equal to host int8 for every image). The input scale is per batch, so a batch of 256 shares one scale over more images; the number of correct images does not change here, the per-image predictions against batch 64 were not compared.
+- MNIST, cycles per image, batch 64 / 256 (10,000 images: 157 batches / 40, the last of 16 images):
+
+  | N | LOAD_BEATS | Batch 64 | Batch 256 | Streaming 64 / 256 | Overhead cycles 64 / 256 |
+  |---|---|---:|---:|---|---:|
+  | 8 | 1 | 1625.5 | 1613.2 (-0.8%) | 98.43% / 99.18% | 254,694 / 131,961 |
+  | 16 | 1 | 420.9 | 407.0 (-3.3%) | 95.04% / 98.29% | 208,709 / 69,596 |
+  | 32 | 2 | 111.2 | 105.8 (-4.9%) | 91.85% / 96.57% | 90,705 / 36,300 |
+  | 64 | 2 | 43.3 | 33.2 (-23.3%) | 61.52% / 80.26% | 166,577 / 65,489 |
+  | 32 | 1 | 128.2 | 111.8 (-12.8%) | 79.67% / 91.38% | |
+  | 64 | 1 | 59.8 | 38.6 (-35.5%) | 44.49% / 69.04% | |
+
+  Overhead = busy - streaming. The streaming cycles do not depend on the batch; the overhead is mostly per GEMM (first load, last tile settle, drain and store), so 4x fewer GEMMs cut it 2 to 3x. Per batch the overhead grows (N = 64: 1,061 to 1,637 cycles), so part of it scales with the row blocks; not profiled yet.
+- Host words written: 101.5 to 99.8 per image, fewer per-batch register and parameter writes. Wall time unchanged.
+- No RTL or driver change, so no synthesis, lint or mutation run beyond the full check. Tests: full check clean.
+- Load: `uptime` 2 to 4 (MNIST).
 - Commit: pending.
 
 ## Questions for owner
-1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host.
+1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
 2. Milestone 2 at N = 16: the two B banks use 4,224 RAM16SDP4 (LUT RAM). Moving them to BSRAM would need 128 SDPX9B with the A banks, more than the 118 that the GW5AT-LV60 has. Keep N = 8 for the first bitstream, or keep B in LUT RAM at N = 16?
 3. DSP counts on the gw5a are not known: yosys maps the multipliers to LUTs on that family. Gowin EDA would give the real numbers, but the loop rules forbid installing it.
 4. Milestone 3 (DDR3): the early launch of item 12 assumes a memory that never stalls a read. A DDR controller needs a stall-aware launch check. Plan it for milestone 3?
-5. A larger batch (for example 256) would amortize the first load of each GEMM (about -2.7% cycles at N = 16), but it changes the activation scale per batch, so the predictions can change. Allowed?
+5. A larger batch (for example 256) would amortize the first load of each GEMM (about -2.7% cycles at N = 16), but it changes the activation scale per batch, so the predictions can change. Allowed? Answered 2026-10-14: configurable, batch 64 stays the baseline, log both (item 15).
