@@ -8,7 +8,9 @@ module rpu_array #(
     input  logic reset,
     input  logic [N-1:0][7:0] a_flat,
     input  logic [N-1:0][7:0] b_flat,
-    // drain: every accumulator loads the one above it; row N-1 appears on c_row.
+    // last: the a_flat and b_flat values are the last k of the tile.
+    input  logic last,
+    // drain: every shadow accumulator loads the one above it; row N-1 appears on c_row.
     input  logic drain,
     output logic [N-1:0][31:0] c_row
 );
@@ -22,19 +24,26 @@ module rpu_array #(
     logic [N:0][N-1:0][7:0] wire_b;
     /* verilator lint_on UNUSEDSIGNAL */
     logic [N:0][N-1:0][31:0] wire_acc;  // wire_acc[i+1][j] is PE (i, j)
+    logic [N-1:0][N:0] last_delay_chain;
+    /* verilator lint_off UNUSEDSIGNAL */  // wire_last[i][N] leaves the last column unused
+    logic [N-1:0][N:0] wire_last;  // travels with wire_a
+    /* verilator lint_on UNUSEDSIGNAL */
 
     genvar i, j;
     generate
         for (i = 0; i < N; i++) begin : delays
             assign a_delay_chain[i][0] = a_flat[i];
             assign b_delay_chain[i][0] = b_flat[i];
+            assign last_delay_chain[i][0] = last;
 
             for (j = 0; j < i; j++) begin : chain
                 delay_cell #(.W(8)) d_a (.clk(clk), .reset(reset), .data_in(a_delay_chain[i][j]), .data_out(a_delay_chain[i][j+1]));
                 delay_cell #(.W(8)) d_b (.clk(clk), .reset(reset), .data_in(b_delay_chain[i][j]), .data_out(b_delay_chain[i][j+1]));
+                delay_cell #(.W(1)) d_l (.clk(clk), .reset(reset), .data_in(last_delay_chain[i][j]), .data_out(last_delay_chain[i][j+1]));
             end
 
             assign wire_a[i][0] = a_delay_chain[i][i];
+            assign wire_last[i][0] = last_delay_chain[i][i];
             assign wire_b[0][i] = b_delay_chain[i][i];
             assign wire_acc[0][i] = '0;
             assign c_row[i] = wire_acc[N][i];
@@ -46,7 +55,9 @@ module rpu_array #(
                     .clk(clk), .reset(reset),
                     .a_in(wire_a[i][j]),
                     .b_in(wire_b[i][j]),
+                    .last_in(wire_last[i][j]),
                     .a_out(wire_a[i][j+1]),
+                    .last_out(wire_last[i][j+1]),
                     .b_out(wire_b[i+1][j]),
                     .drain(drain),
                     .acc_in(wire_acc[i][j]),

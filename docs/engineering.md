@@ -17,7 +17,7 @@ Rust API (src/lib.rs)
          rtl/delay_cell.sv     skew registers
 ```
 
-The array computes an NT GEMM: `C[i][j] = sum_k A[i][k] * B[j][k]`, with A and B both N x K, 1 <= K <= KMAX (1024). Each PE holds one int32 accumulator. Larger matrices are tiled by Rust; the physical array does not grow.
+The array computes an NT GEMM: `C[i][j] = sum_k A[i][k] * B[j][k]`, with A and B both N x K, 1 <= K <= KMAX (1024). Each PE holds a running int32 sum and a shadow register with the finished sum of the tile before, so one tile drains while the next streams. Larger matrices are tiled by Rust; the physical array does not grow.
 
 `cargo test` builds the RTL with Verilator and links it into the crate. There is no FPGA driver yet (milestone 2). `rpu_sim_memory.sv` stands in for the on-chip BSRAM store.
 
@@ -120,10 +120,10 @@ Each panel row keeps both A banks in one memory, A bank 1 from beat `ROW_BEATS`.
 ### STATUS bits
 
 ```text
-bit 0 BUSY            load, compute or store running
-bit 1 DONE            compute finished and C stored
+bit 0 BUSY            load, compute, drain or store running
+bit 1 DONE            compute finished, drained and C stored
 bit 2 LOAD_BUSY
-bit 3 COMPUTE_BUSY    CLEAR, STREAM, SETTLE or DRAIN
+bit 3 COMPUTE_BUSY    CLEAR or STREAM; the settle and drain after it do not count
 bit 4 LOCAL_VALID_0   bank 0 loaded and not yet computed
 bit 5 LOCAL_VALID_1
 bit 6 STORE_BUSY      C store running (overlaps the next compute)
@@ -147,14 +147,19 @@ load (issue and receive sides, one beat per cycle):
   or the compute starts if the load came from START
 
 compute:
-  IDLE -> CLEAR   reset the accumulators
-       -> STREAM  K cycles, one k per cycle from the local panels
-       -> SETTLE  2N - 2 + PE_LATENCY cycles until the last product lands,
-                  then wait for the C store of the previous tile
-       -> DRAIN   N cycles, the array shifts one row down per cycle into mem_c
-       -> FINISH
+  IDLE -> CLEAR   set up the stream; wait while the drain of the tile before
+                  could still overwrite this tile's sums (see below)
+       -> STREAM  K cycles, one k per cycle from the local panels; the last k
+                  carries the last flag
+       -> FINISH  (the next START is accepted from here)
 
-store (separate, starts when DRAIN ends):
+drain (separate, starts when a STREAM ends):
+  IDLE -> SETTLE  2N - 2 + PE_LATENCY cycles until the last sum lands in the
+                  shadow registers, then wait for the C store of the tile before
+       -> SHIFT   N cycles, the shadows shift one row down per cycle into mem_c
+       -> IDLE
+
+store (separate, starts when SHIFT ends):
   4N beats, one per cycle; the memory never stalls a write
 ```
 
@@ -165,12 +170,19 @@ During stream cycle k, row i of the array gets `A[i][k]` and column j gets `B[j]
 Each `int8_cell` is two stages (`PE_LATENCY = 2`):
 
 ```text
-product     <= a_in * b_in                 (int16)
-accumulator <= drain ? acc_in : accumulator + sign_extend(product)
-a_out <= a_in;  b_out <= b_in
+product      <= a_in * b_in                (int16)
+last_product <= last_in
+sum          <= last_product ? 0 : sum + sign_extend(product)
+accumulator  <= drain ? acc_in                                  (the shadow)
+              : last_product ? sum + sign_extend(product) : accumulator
+a_out <= a_in;  b_out <= b_in;  last_out <= last_in
 ```
 
-The settle time `2N - 2 + PE_LATENCY` is exact: one cycle shorter loses the last product of PE (N-1, N-1). The tests include a case where only the last k is nonzero to catch that. During DRAIN each PE loads the accumulator of the PE above, so the bottom row `c_row` delivers C row N-1, then N-2, ..., one per cycle.
+The last flag enters with the last k of a tile and goes through the same skew as row i of A, so it reaches each PE with that PE's last product. The PE then moves the finished sum into the shadow register and restarts its running sum at zero, and the next tile's first product can arrive the cycle after. Outside STREAM the array gets zeros, so the running sums stay zero between tiles; the array is reset only with the RPU.
+
+The settle time `2N - 2 + PE_LATENCY` is exact: one cycle shorter loses the last sum of PE (N-1, N-1). The tests include a case where only the last k is nonzero to catch that. During SHIFT each shadow loads the shadow of the PE above, so the bottom row `c_row` delivers C row N-1, then N-2, ..., one per cycle.
+
+A STREAM may start while the drain before is pending only if its K is at least `OVERLAP_K_MIN = SETTLE_STEPS + N` (3N) and no C store is running (a running store could delay the drain). Otherwise CLEAR waits until the drain is done. The drain shifts must end before PE (0, 0) takes the new tile's sum, K + 1 cycles after the new stream starts. A STREAM starts at the earliest 3 cycles after the one before ends (FINISH, then CLEAR), so 3N - 2 would be enough; a host that polls COMPUTE_BUSY starts one cycle later. `start_right_after_stream_end` runs that case and fails once the threshold is 3N - 4.
 
 ## 5. File overview
 
@@ -208,12 +220,13 @@ for each tile t:
   if tile t+1 is in the same row block: preload B(j+1) with KEEP_A
   else:                                 preload A(r+1) + B0 into the other A bank
   (either preload overlaps compute t)
-  wait until compute t and the preload are done (store t overlaps compute t+1)
+  wait until the stream of t and the preload are done
+  (the settle, drain and store of t overlap the stream of t+1)
   START tile t+1
 wait for DONE, read all C tiles
 ```
 
-Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 86.07% of its busy cycles at N = 8. The first A + B load (1569 cycles) and 25 cycles per tile (clear, settle, drain) are the overhead. With more than one row block, only the first block's A + B load is exposed in full; the next block's A + B load (2K cycles) overlaps the last tile of the block before (K + clear, settle and drain), so about K cycles per later block stay exposed. One read port moves one beat per cycle, so a B load already takes as long as a tile's stream: the A load cannot hide completely.
+Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 87.97% of its busy cycles at N = 8. The overhead is the first A + B load (1569 cycles), about 6 cycles per tile (the B preload's read latency and the host handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed in full; the next block's A + B load (2K cycles) overlaps the last tile of the block before (K cycles), so about K cycles per later block stay exposed. One read port moves one beat per cycle, so a B load already takes as long as a tile's stream: the A load cannot hide completely.
 
 K must fit in one panel (K <= KMAX). Partial sums over K are not split across jobs.
 

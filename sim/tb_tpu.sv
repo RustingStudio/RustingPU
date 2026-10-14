@@ -8,6 +8,7 @@ module tb_tpu;
     logic clk, reset;
     logic [N-1:0][7:0] a_flat;
     logic [N-1:0][7:0] b_flat;
+    logic last;
     logic drain;
     logic [N-1:0][31:0] c_row;
 
@@ -38,6 +39,7 @@ module tb_tpu;
         b[0][0] = -127;
 
         drain = 0;
+        last = 0;
         reset = 1;
         @(negedge clk);
         reset = 0;
@@ -47,8 +49,10 @@ module tb_tpu;
                 a_flat[i] = a[i][k];
                 b_flat[i] = b[i][k];
             end
+            last = k == N - 1;
             @(negedge clk);
         end
+        last = 0;
         for (int i = 0; i < N; i++) begin
             a_flat[i] = 0;
             b_flat[i] = 0;

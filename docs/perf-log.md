@@ -13,6 +13,9 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 3 second A buffer | 8 | 97.26% | 1785.2 | 89.62% | 124.5 / 72.0 | 13.7 s |
 | 3 second A buffer | 16 | 97.26% | 497.7 | 80.37% | 117.7 / 72.0 | 16.7 s |
 | 4 N = 12 | 12 | 97.26% | 963.1 | 85.24% | 179.8 / 108.1 | 8.0 s |
+| 5 shadow accumulator | 8 | 97.26% | 1743.2 | 91.78% | 124.5 / 72.0 | 14.5 s |
+| 5 shadow accumulator | 16 | 97.26% | 478.0 | 83.68% | 117.7 / 72.0 | 17.6 s |
+| 5 shadow accumulator | 12 | 97.26% | 939.7 | 87.36% | 179.8 / 108.1 | 19.7 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -60,3 +63,25 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 - Synthesis of `rpu_top` at N = 12 (same command as item 3): gw5a 42,824 LUT, 7,204 ALU, 10,581 DFF, 36 SDPX9B, 3,264 RAM16SDP4; gw2a 24,581 LUT, 4,900 ALU, 10,581 DFF, 144 MULT9X9, 36 SDPX9B, 3,264 RAM16SDP4. N = 8 and 16 are unchanged (`rpu_top` did not change; `rpu_sim_memory` is a black box there).
 - Tests: the whole suite passes at N = 4, 8, 12, 16 and 24 (READ_LATENCY 1), and with the brain feature at N = 8, 12 and 16, READ_LATENCY 1 and 10. Mutations at N = 12: reading the padding bytes back as C values fails 7 tests; packing beats by host word instead of by N values fails 5. Verilator lint is clean at N = 8, 12 and 16.
 - Load: `uptime` 2.51.
+- Commit: `f1c03fa`.
+
+## Item 5: per-tile overhead (shadow accumulator). Done, 2026-10-14
+- RTL: each PE keeps a running sum and a shadow register (`accumulator`). A last flag enters with the last k of a tile and goes through row i's skew with A, so it reaches each PE with that PE's last product; the PE moves the finished sum into the shadow and restarts the running sum at zero. The settle and drain are now a separate FSM (`drain_state`: SETTLE, SHIFT) that works on the shadows, and the compute FSM is only CLEAR, STREAM, FINISH. COMPUTE_BUSY drops when the stream ends, so the driver starts the next tile while the last one settles, drains and stores. The array is no longer reset in CLEAR (that would wipe the shadows); the running sums are zero between tiles because the array gets zeros outside STREAM. The driver did not change.
+- A stream may start during a pending drain only if K >= 3N (`OVERLAP_K_MIN = SETTLE_STEPS + N`) and no C store is running; otherwise CLEAR waits for the drain. Timing: the drain's last shift must come before PE (0, 0) takes the new sum (K + 1 cycles after the new stream starts). With the fastest START (3 cycles after the stream ends) 3N - 2 would do; with a host that polls COMPUTE_BUSY, 3N - 3. The test `start_right_after_stream_end` does that polling start for K = 3N - 4 to 3N and fails when the threshold is lowered to 3N - 4, as this timing predicts. MNIST has K = 784 and 128, far above 3N.
+- Expected: per tile that is not followed by a row-block switch, the 3N + 1 cycles of clear, settle and drain go away, minus the read latency of the B preload, which the stream now waits for (the port is the limit). That is 15 tiles x 8 blocks (layer 1) + 1 x 8 (layer 2) per batch of 64 at N = 8, and 7 x 4 at N = 16: about -50 and -21 cycles per image.
+- Measured, cycles per image: 1785.2 to 1743.2 at N = 8 (-2.4%), 497.7 to 478.0 at N = 16 (-4.0%), 963.1 to 939.7 at N = 12 (-2.4%). Utilization 89.62% to 91.78%, 80.37% to 83.68%, 85.24% to 87.36%. What is left per tile is about 6 cycles: the B preload's read latency and the host handshake (poll, CONTROL write, START accepted, CLEAR). Accuracy 97.26%, RPU equal to host int8 for every image; host words unchanged (124.5 / 72.0 and 117.7 / 72.0).
+- Wall time: 13.4 to 14.5 s at N = 8, 16.4 to 17.6 s at N = 16, but 8.0 to 19.7 s at N = 12 (both measured twice; HEAD measured again in a separate worktree: 8.0 s). The generated C++ grew by 32% at N = 12, and the C++ is compiled with `-Os`: the same tree built with `-O2` runs N = 12 in 7.5 s and N = 8 in 6.2 s. So the regression is how `-Os` compiles the larger eval function, not the simulated design; item 8 takes it up.
+- Layer 1 for batch 8 (`layer1_batch8_is_bit_exact_and_mostly_streaming`, N = 8): 86.07% to 87.97% streaming (busy 14,575 to 14,260).
+- Synthesis, `rpu_top` (same command as item 3), before / after:
+
+  | N | Family | LUT | ALU | DFF | MULT9X9 | SDPX9B (BSRAM) | RAM16SDP4 (LUT RAM) |
+  |---|---|---:|---:|---:|---:|---:|---:|
+  | 8 | gw5a | 22,162 / 22,091 | 3,336 / 3,347 | 4,874 / 6,954 | 0 / 0 | 16 / 16 | 2,112 / 2,112 |
+  | 8 | gw2a | 12,217 / 12,506 | 2,312 / 2,323 | 4,874 / 6,954 | 64 / 64 | 16 / 16 | 2,112 / 2,112 |
+  | 16 | gw5a | 68,538 / 68,634 | 12,551 / 12,562 | 18,571 / 26,810 | 0 / 0 | 64 / 64 | 4,224 / 4,224 |
+  | 16 | gw2a | 30,749 / 30,814 | 8,455 / 8,466 | 18,571 / 26,810 | 256 / 256 | 64 / 64 | 4,224 / 4,224 |
+
+  The cost is registers: +2,080 DFF at N = 8 and +8,239 at N = 16 (+43% and +44%), that is 32 shadow bits and one last-flag bit per PE plus the last-flag skew. LUT changes by -71 to +289 (the shadow reuses the drain multiplexer the old accumulator had), ALU by +11, BSRAM and LUT RAM not at all. LUT is the scarce resource on the GW5AT-LV60; its registers (59,904, one per LUT4) are not: 26,810 is 45% of them. So the cost is accepted for -2.4% and -4.0% cycles.
+  - Longest combinational path of the PE (`synth_gowin -noiopads`, `delete t:DFF*`, `ltp`; `ltp -noff` does not know the Gowin DFF cells and walks through them): 33 cells before and after, the 32-bit ALU carry chain plus one LUT, at gw5a and gw2a. The shadow does not lengthen it.
+- Tests: `next_tile_streams_during_drain` (8 tiles, K = 25N, bit-exact, and the idle cycles are at most the first load, the last settle, drain and store, and read latency + 8 per tile); `start_right_after_stream_end`; `gemm_with_ragged_shapes_is_bit_exact` adds 2N x 4N GEMMs with K = 3N - 1, 3N and 3N + 1. The Icarus smoke test drives the last flag. Mutations: threshold N fails the ragged test; no overlap at all fails `next_tile_streams_during_drain`; ignoring a running store fails the ragged test; no restart of the running sum fails 8 tests; threshold 3N - 4 fails `start_right_after_stream_end`. Thresholds 3N - 1 to 3N - 3 pass, which is correct by the timing above. All tests pass at N = 4, 8, 12, 16 and 24 (READ_LATENCY 1) and at N = 4, 8, 12 and 16 with READ_LATENCY 10, and with the brain feature at N = 8, 12 and 16. Verilator lint is clean at N = 8, 12 and 16.
+- Load: `uptime` 2.80.

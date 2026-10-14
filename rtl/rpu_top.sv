@@ -8,6 +8,8 @@
 // bank bit). A load with KEEP_A loads only B, so A stays valid across output tiles. The
 // C store runs on its own, overlapping the next compute. The host must not load A into
 // the A bank of a running compute.
+// Each PE keeps its finished sum in a shadow register, so the settle and drain of a tile
+// overlap the stream of the next one. A compute is busy only while it streams.
 module rpu_top #(
     parameter int N = 8,
     parameter int KMAX = 1024,
@@ -35,6 +37,9 @@ module rpu_top #(
     localparam int PE_LATENCY = 2;                   // product register + accumulator
     // Last product reaches PE (N-1, N-1) after 2N-2 skew cycles, then PE_LATENCY.
     localparam int SETTLE_STEPS = 2 * N - 2 + PE_LATENCY;
+    // A stream may start during the drain of the tile before only if it is long enough:
+    // the drain must end before PE (0, 0) takes the new sum, K cycles after the start.
+    localparam int OVERLAP_K_MIN = SETTLE_STEPS + N;
     localparam int BEAT_ADDR_W = $clog2(MEM_BYTES / N);
     localparam int HOST_ADDR_W = $clog2(MEM_BYTES / 8);
     localparam int COL_W = (N > 1) ? $clog2(N) : 1;
@@ -77,16 +82,22 @@ module rpu_top #(
     logic control_keep_a;
     logic control_a_bank;
 
-    typedef enum logic [2:0] {
+    typedef enum logic [1:0] {
         COMPUTE_IDLE,
-        COMPUTE_CLEAR,
+        COMPUTE_CLEAR,   // set up the stream; waits while the drain before needs the array
         COMPUTE_STREAM,
-        COMPUTE_SETTLE,
-        COMPUTE_DRAIN,
         COMPUTE_FINISH
     } compute_state_t;
 
+    // Settle and drain of the tile that last streamed, from the shadow registers.
+    typedef enum logic [1:0] {
+        DRAIN_IDLE,
+        DRAIN_SETTLE,
+        DRAIN_SHIFT
+    } drain_state_t;
+
     compute_state_t compute_state;
+    drain_state_t drain_state;
 
     // Load: the issue side requests one beat per cycle, the receive side writes each
     // response into the panel buffers. Both walk A rows, then B rows.
@@ -118,6 +129,9 @@ module rpu_top #(
     logic [RA_W-1:0] stream_a_addr;
     logic [COL_W-1:0] stream_lane;
     logic [DRAIN_W-1:0] drain_count;
+    logic [BEAT_ADDR_W-1:0] drain_c_base;
+    logic drain_busy;
+    logic stream_last_k;
     logic store_busy;
     logic [BEAT_ADDR_W-1:0] store_c_base;
     logic [STORE_W-1:0] store_idx;
@@ -133,7 +147,6 @@ module rpu_top #(
     logic [N-1:0][7:0] a_flat;
     logic [N-1:0][7:0] b_flat;
     logic [N-1:0][31:0] c_row;
-    logic core_reset;
     logic compute_busy;
     logic host_mem_we;
     logic [HOST_ADDR_W-1:0] host_mem_addr;
@@ -146,12 +159,11 @@ module rpu_top #(
     logic [32*N-1:0] c_store_row;
 
     assign compute_busy = (compute_state == COMPUTE_CLEAR) ||
-                          (compute_state == COMPUTE_STREAM) ||
-                          (compute_state == COMPUTE_SETTLE) ||
-                          (compute_state == COMPUTE_DRAIN);
-    assign busy = load_busy || compute_busy || store_busy;
-    assign done = (compute_state == COMPUTE_FINISH) && !store_busy;
-    assign core_reset = reset || (compute_state == COMPUTE_CLEAR);
+                          (compute_state == COMPUTE_STREAM);
+    assign drain_busy = drain_state != DRAIN_IDLE;
+    assign busy = load_busy || compute_busy || drain_busy || store_busy;
+    assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy;
+    assign stream_last_k = (compute_state == COMPUTE_STREAM) && (stream_k == stream_last);
     assign issue_row_end = int'(issue_k) + N >= int'(load_k_len);
     assign recv_row_end = int'(recv_k) + N >= int'(load_k_len);
 
@@ -180,10 +192,11 @@ module rpu_top #(
 
     rpu_array #(.N(N)) math_core (
         .clk(clk),
-        .reset(core_reset),
+        .reset(reset),
         .a_flat(a_flat),
         .b_flat(b_flat),
-        .drain(compute_state == COMPUTE_DRAIN),
+        .last(stream_last_k),
+        .drain(drain_state == DRAIN_SHIFT),
         .c_row(c_row)
     );
 
@@ -250,6 +263,8 @@ module rpu_top #(
     always_ff @(posedge clk) begin
         if (reset) begin
             compute_state <= COMPUTE_IDLE;
+            drain_state <= DRAIN_IDLE;
+            drain_c_base <= '0;
             cycles <= 32'd0;
             active_cycles <= 32'd0;
             busy_cycles <= 32'd0;
@@ -381,6 +396,39 @@ module rpu_top #(
                 end
             end
 
+            // Before the compute FSM: a stream that ends while the last drain step runs
+            // starts the next settle.
+            case (drain_state)
+                DRAIN_IDLE: begin
+                end
+                DRAIN_SETTLE: begin
+                    // Wait for the store of the previous tile: the drain overwrites mem_c.
+                    if (drain_count == SETTLE_LAST && !store_busy) begin
+                        drain_count <= '0;
+                        drain_state <= DRAIN_SHIFT;
+                    end else if (drain_count != SETTLE_LAST) begin
+                        drain_count <= drain_count + 1'b1;
+                    end
+                end
+                DRAIN_SHIFT: begin
+                    // The shadows shift down each cycle; c_row is row N-1-drain_count.
+                    mem_c[COL_LAST - drain_count[COL_W-1:0]] <= c_row;
+                    if (drain_count == DRAIN_LAST) begin
+                        store_busy <= 1'b1;
+                        store_c_base <= drain_c_base;
+                        store_idx <= '0;
+                        store_row <= '0;
+                        store_part <= '0;
+                        drain_state <= DRAIN_IDLE;
+                    end else begin
+                        drain_count <= drain_count + 1'b1;
+                    end
+                end
+                default: begin
+                    drain_state <= DRAIN_IDLE;
+                end
+            endcase
+
             case (compute_state)
                 COMPUTE_IDLE, COMPUTE_FINISH: begin
                 end
@@ -389,12 +437,18 @@ module rpu_top #(
                     stream_beat <= '0;
                     stream_a_addr <= compute_a_bank ? A_BANK1_BEAT : '0;
                     stream_lane <= '0;
-                    drain_count <= '0;
-                    compute_state <= COMPUTE_STREAM;
+                    // While a drain is pending, a store still busy could delay it.
+                    if (!drain_busy ||
+                        (!store_busy && stream_last >= K_W'(OVERLAP_K_MIN - 1))) begin
+                        compute_state <= COMPUTE_STREAM;
+                    end
                 end
                 COMPUTE_STREAM: begin
                     if (stream_k == stream_last) begin
-                        compute_state <= COMPUTE_SETTLE;
+                        compute_state <= COMPUTE_FINISH;
+                        drain_state <= DRAIN_SETTLE;
+                        drain_count <= '0;
+                        drain_c_base <= compute_c_base;
                     end else begin
                         stream_k <= stream_k + 1'b1;
                         if (stream_lane == COL_LAST) begin
@@ -404,29 +458,6 @@ module rpu_top #(
                         end else begin
                             stream_lane <= stream_lane + 1'b1;
                         end
-                    end
-                end
-                COMPUTE_SETTLE: begin
-                    // Wait for the store of the previous tile: the drain overwrites mem_c.
-                    if (drain_count == SETTLE_LAST && !store_busy) begin
-                        drain_count <= '0;
-                        compute_state <= COMPUTE_DRAIN;
-                    end else if (drain_count != SETTLE_LAST) begin
-                        drain_count <= drain_count + 1'b1;
-                    end
-                end
-                COMPUTE_DRAIN: begin
-                    // The array shifts down each cycle; c_row is row N-1-drain_count.
-                    mem_c[COL_LAST - drain_count[COL_W-1:0]] <= c_row;
-                    if (drain_count == DRAIN_LAST) begin
-                        store_busy <= 1'b1;
-                        store_c_base <= compute_c_base;
-                        store_idx <= '0;
-                        store_row <= '0;
-                        store_part <= '0;
-                        compute_state <= COMPUTE_FINISH;
-                    end else begin
-                        drain_count <= drain_count + 1'b1;
                     end
                 end
                 default: begin

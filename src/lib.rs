@@ -573,9 +573,57 @@ mod tests {
             (2 * TILE + 1, 3 * TILE, 40),
             // One B tile: every tile after the first preloads a new A.
             (3 * TILE, 5, 30),
+            // Around the shortest K whose stream may start during the drain before (3N).
+            (2 * TILE, 4 * TILE, 3 * TILE - 1),
+            (2 * TILE, 4 * TILE, 3 * TILE),
+            (2 * TILE, 4 * TILE, 3 * TILE + 1),
         ] {
             assert_gemm_exact(&mut rpu, m, n, k, &mut rng);
         }
+    }
+
+    /// The next START as soon as the stream ends, with K just under and at the shortest K
+    /// that may overlap the drain (3N). The driver's handshake is slower than this.
+    #[test]
+    fn start_right_after_stream_end() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x5bad_0005_57a2_0002);
+        for k in 3 * TILE - 4..=3 * TILE {
+            let mut panel = || -> Vec<i8> { (0..TILE * k).map(|_| rng.i8_sym()).collect() };
+            let (a0, b0, a1, b1) = (panel(), panel(), panel(), panel());
+            rpu.preload_panel_i8(0, &a0, &b0, k).unwrap();
+            rpu.preload_panel_i8(1, &a1, &b1, k).unwrap();
+            rpu.write_reg(REG_C_BASE, Rpu::c_base(0).into());
+            rpu.write_control(0, 0, CONTROL_START);
+            rpu.tick();
+            rpu.write_reg(REG_C_BASE, Rpu::c_base(1).into());
+            rpu.wait_until(|rpu| !rpu.compute_busy()).unwrap();
+            rpu.write_control(1, 1, CONTROL_START);
+            rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
+            let want = |a: &[i8], b: &[i8]| quant::matmul_nt_i8(a, b, TILE, TILE, k);
+            assert_eq!(rpu.read_c(0), want(&a0, &b0), "k = {k}, tile 0");
+            assert_eq!(rpu.read_c(1), want(&a1, &b1), "k = {k}, tile 1");
+        }
+    }
+
+    #[test]
+    fn next_tile_streams_during_drain() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x5bad_0005_d7a1_0001);
+        // K a multiple of N, so every B preload takes exactly K beats.
+        let (tiles, k) = (8, 25 * TILE);
+        let latency: usize = env!("RPU_READ_LATENCY").parse().unwrap();
+        let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
+        assert_gemm_exact(&mut rpu, TILE, tiles * TILE, k, &mut rng);
+        let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);
+        println!("{tiles} tiles, K = {k}: active {active} / busy {busy} cycles");
+        assert_eq!(active as usize, tiles * k);
+        // Idle array cycles: the first A + B load (2K), the last settle, drain and store
+        // (7N), and per tile the read latency of its B preload and a few cycles of host
+        // handshake, but no settle or drain per tile.
+        let idle = busy as usize - tiles * k;
+        let bound = 2 * k + latency + 7 * TILE + tiles * (latency + 8);
+        assert!(idle <= bound, "{idle} idle cycles, bound {bound}");
     }
 
     /// Plan phase 7 check: layer 1 for batch 8, streaming at least 85% of busy cycles.
