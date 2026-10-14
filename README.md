@@ -1,21 +1,21 @@
 # RustingPU
 
-RustingPU is an 8x8 INT8 systolic-array accelerator in SystemVerilog, driven from Rust. It runs a RustingBrain MNIST MLP at **97.25% test accuracy**, identical to the CPU int8 reference and 0.01 pp from f32, in **1625.5 cycles per image** at **98.43% array utilization**. The array size is a build parameter; at 16x16 the same network takes 420.9 cycles per image at 95.04%.
+RustingPU is an 8x8 INT8 systolic-array accelerator in SystemVerilog, driven from Rust. It runs a RustingBrain MNIST MLP at **97.25% test accuracy**, identical to the CPU int8 reference and 0.01 pp from f32, in **1625.5 cycles per image** at **98.43% array utilization**. The array size is a build parameter; at 16x16 the same network takes 420.6 cycles per image at 95.10%.
 
 This will not beat a GPU or your CPU on speed, and the simulation is far slower than either. The point is a complete chip design, from PE to DMA to driver, running a model trained by its own framework, with every result checked bit for bit against a software reference. The RPU does matrix multiplication and, between layers, bias, ReLU and requantization to int8; the host quantizes the input and finishes the last layer. Until milestone 2 every number comes from Verilator, not silicon.
 
 ## Numbers
 
-MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-14 at commit `16d185b`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
+MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-15 at commit `bab1fd6`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
 
 | | N = 8 | N = 16 |
 |---|---:|---:|
 | f32 accuracy | 97.26% | 97.26% |
 | Host int8 accuracy | 97.25% | 97.25% |
 | RPU accuracy | 97.25% | 97.25% |
-| Cycles per image | 1625.5 | 420.9 |
-| Array utilization | 98.43% | 95.04% |
-| Host words per image, written / read | 101.5 / 8.0 | 101.5 / 8.0 |
+| Cycles per image | 1625.5 | 420.6 |
+| Array utilization | 98.43% | 95.10% |
+| Host words per image, written / read | 101.5 / 5.0 | 101.5 / 6.0 |
 
 ```bash
 cargo run --release --features brain --example mnist          # N = 8
