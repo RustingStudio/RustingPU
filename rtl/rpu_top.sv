@@ -25,13 +25,14 @@ module rpu_top #(
     localparam int C_WORDS = TILE_ELEMS * 2;   // one int32 is two words
     localparam int PE_LATENCY = 2;             // product register + accumulator
     // Last product reaches PE (N-1, N-1) after 2N-2 skew cycles, then PE_LATENCY.
-    localparam int DRAIN_STEPS = 2 * N - 2 + PE_LATENCY;
+    localparam int SETTLE_STEPS = 2 * N - 2 + PE_LATENCY;
     localparam int STREAM_W = (N > 1) ? $clog2(N) : 1;
-    localparam int DRAIN_W = (DRAIN_STEPS > 1) ? $clog2(DRAIN_STEPS + 1) : 1;
+    localparam int DRAIN_W = $clog2(SETTLE_STEPS + 1);
     localparam int DMA_W = $clog2(C_WORDS);
     localparam int EXT_ADDR_W = (EXT_WORDS > 1) ? $clog2(EXT_WORDS) : 1;
     localparam logic [STREAM_W-1:0] STREAM_LAST = STREAM_W'(N - 1);
-    localparam logic [DRAIN_W-1:0] DRAIN_LAST = DRAIN_W'(DRAIN_STEPS - 1);
+    localparam logic [DRAIN_W-1:0] SETTLE_LAST = DRAIN_W'(SETTLE_STEPS - 1);
+    localparam logic [DRAIN_W-1:0] DRAIN_LAST = DRAIN_W'(N - 1);
     localparam logic [DMA_W-1:0] LOAD_LAST = DMA_W'(AB_WORDS - 1);
     localparam logic [DMA_W-1:0] STORE_LAST = DMA_W'(C_WORDS - 1);
     localparam int unsigned REG_CONTROL_ADDR = 0;
@@ -43,7 +44,9 @@ module rpu_top #(
 
     logic [7:0] mem_a [0:1][0:TILE_ELEMS-1];
     logic [7:0] mem_b [0:1][0:TILE_ELEMS-1];
-    logic [31:0] mem_c [0:TILE_ELEMS-1];
+    // C buffer: one wide word per array column, written by the shift drain one
+    // column per cycle (one write port, so it can map to BSRAM).
+    logic [N-1:0][31:0] mem_c [0:N-1];
 
     logic [15:0] reg_a_base;
     logic [15:0] reg_b_base;
@@ -62,6 +65,7 @@ module rpu_top #(
         COMPUTE_IDLE,
         COMPUTE_CLEAR,
         COMPUTE_STREAM,
+        COMPUTE_SETTLE,
         COMPUTE_DRAIN,
         COMPUTE_STORE_C,
         COMPUTE_FINISH
@@ -72,6 +76,8 @@ module rpu_top #(
 
     logic [DMA_W-1:0] load_idx;
     logic [DMA_W-1:0] store_idx;
+    logic [STREAM_W-1:0] store_row;
+    logic [STREAM_W-1:0] store_col;
     logic [STREAM_W-1:0] stream_idx;
     logic [DRAIN_W-1:0] drain_count;
 
@@ -89,7 +95,7 @@ module rpu_top #(
 
     logic [N-1:0][7:0] a_flat;
     logic [N-1:0][7:0] b_flat;
-    logic [N-1:0][N-1:0][31:0] c;
+    logic [N-1:0][31:0] c_col;
     logic core_reset;
     logic load_busy;
     logic compute_busy;
@@ -111,6 +117,7 @@ module rpu_top #(
     assign load_busy = (load_state != LOAD_IDLE);
     assign compute_busy = (compute_state == COMPUTE_CLEAR) ||
                           (compute_state == COMPUTE_STREAM) ||
+                          (compute_state == COMPUTE_SETTLE) ||
                           (compute_state == COMPUTE_DRAIN) ||
                           (compute_state == COMPUTE_STORE_C);
     assign busy = load_busy || compute_busy;
@@ -134,7 +141,8 @@ module rpu_top #(
         .reset(core_reset),
         .a_flat(a_flat),
         .b_flat(b_flat),
-        .c(c)
+        .drain(compute_state == COMPUTE_DRAIN),
+        .c_col(c_col)
     );
 
     assign dma_rd_valid = (load_state == LOAD_A) || (load_state == LOAD_B);
@@ -146,7 +154,8 @@ module rpu_top #(
     assign dma_wr_valid = (compute_state == COMPUTE_STORE_C);
     assign dma_wr_bank = compute_ext_bank;
     assign dma_wr_addr = EXT_ADDR_W'(int'(compute_c_base) + int'(store_idx));
-    assign dma_wr_data = store_idx[0] ? mem_c[store_idx[DMA_W-1:1]][31:16] : mem_c[store_idx[DMA_W-1:1]][15:0];
+    assign dma_wr_data = store_idx[0] ? mem_c[store_col][store_row][31:16]
+                                      : mem_c[store_col][store_row][15:0];
 
     rpu_sim_memory #(
         .WORDS(EXT_WORDS),
@@ -209,6 +218,8 @@ module rpu_top #(
             cycles <= 32'd0;
             load_idx <= '0;
             store_idx <= '0;
+            store_row <= '0;
+            store_col <= '0;
             stream_idx <= '0;
             drain_count <= '0;
             load_local_bank <= 1'b0;
@@ -324,19 +335,26 @@ module rpu_top #(
                     if (stream_idx == STREAM_LAST) begin
                         stream_idx <= '0;
                         drain_count <= '0;
-                        compute_state <= COMPUTE_DRAIN;
+                        compute_state <= COMPUTE_SETTLE;
                     end else begin
                         stream_idx <= stream_idx + 1'b1;
                     end
                 end
+                COMPUTE_SETTLE: begin
+                    if (drain_count == SETTLE_LAST) begin
+                        drain_count <= '0;
+                        compute_state <= COMPUTE_DRAIN;
+                    end else begin
+                        drain_count <= drain_count + 1'b1;
+                    end
+                end
                 COMPUTE_DRAIN: begin
+                    // The array shifts right each cycle; c_col is column N-1-drain_count.
+                    mem_c[STREAM_LAST - drain_count[STREAM_W-1:0]] <= c_col;
                     if (drain_count == DRAIN_LAST) begin
-                        for (int row = 0; row < N; row++) begin
-                            for (int col = 0; col < N; col++) begin
-                                mem_c[row * N + col] <= c[row][col];
-                            end
-                        end
                         store_idx <= '0;
+                        store_row <= '0;
+                        store_col <= '0;
                         compute_state <= COMPUTE_STORE_C;
                     end else begin
                         drain_count <= drain_count + 1'b1;
@@ -349,6 +367,14 @@ module rpu_top #(
                             compute_state <= COMPUTE_FINISH;
                         end else begin
                             store_idx <= store_idx + 1'b1;
+                        end
+                        if (store_idx[0]) begin
+                            if (store_col == STREAM_LAST) begin
+                                store_col <= '0;
+                                store_row <= store_row + 1'b1;
+                            end else begin
+                                store_col <= store_col + 1'b1;
+                            end
                         end
                     end
                 end

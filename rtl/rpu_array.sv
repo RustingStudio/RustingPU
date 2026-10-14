@@ -8,7 +8,9 @@ module rpu_array #(
     input  logic reset,
     input  logic [N-1:0][7:0] a_flat,
     input  logic [N-1:0][7:0] b_flat,
-    output logic [N-1:0][N-1:0][31:0] c
+    // drain: every accumulator loads its left neighbour; column N-1 appears on c_col.
+    input  logic drain,
+    output logic [N-1:0][31:0] c_col
 );
 
     // Packed arrays throughout: Yosys does not take unpacked array ports.
@@ -17,6 +19,7 @@ module rpu_array #(
 
     logic [N-1:0][N:0][7:0] wire_a;
     logic [N:0][N-1:0][7:0] wire_b;
+    logic [N-1:0][N:0][31:0] wire_acc;  // wire_acc[i][j+1] is PE (i, j)
 
     genvar i, j;
     generate
@@ -31,6 +34,8 @@ module rpu_array #(
 
             assign wire_a[i][0] = a_delay_chain[i][i];
             assign wire_b[0][i] = b_delay_chain[i][i];
+            assign wire_acc[i][0] = '0;
+            assign c_col[i] = wire_acc[i][N];
         end
 
         for (i = 0; i < N; i++) begin : row
@@ -41,7 +46,9 @@ module rpu_array #(
                     .b_in(wire_b[i][j]),
                     .a_out(wire_a[i][j+1]),
                     .b_out(wire_b[i+1][j]),
-                    .accumulator(c[i][j])
+                    .drain(drain),
+                    .acc_in(wire_acc[i][j]),
+                    .accumulator(wire_acc[i][j+1])
                 );
             end
         end
