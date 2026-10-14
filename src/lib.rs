@@ -1,3 +1,5 @@
+#[cfg(feature = "brain")]
+pub mod brain;
 pub mod quant;
 
 /// Array size N, set at build time with `RPU_N` (default 8).

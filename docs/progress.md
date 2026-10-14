@@ -69,8 +69,12 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - 15 tests pass at N=8 (latency 1 and 10), N=16 (latency 1 and 10) and N=24. fmt and clippy clean, Icarus PASS. Correction to phase 6: `verilator --lint-only -Wall` was not clean. It flagged `wire_b[N]` as unused (B leaves the bottom row unused). Now silenced with a lint pragma; clean at N=8, 16, 24.
 - `examples/baseline.rs` prints the layer 1 line.
 
-## Phase 8: `brain` feature. Blocked, 2026-10-14
-- Needs `rusting_brain` as an optional dependency (Q3 below). Not started. Phase 9 needs phase 8.
+## Phase 8: `brain` feature. Done, 2026-10-14
+- `rusting_brain = "4"` (crates.io) is an optional dependency behind the `brain` feature (owner approved Q3). The default build has no runtime dependency.
+- `src/brain.rs`: `RpuMlp::from_network` quantizes each layer's `[out, in]` weights once, per output row, with the `quant.rs` rule. `predict_batch(&mut rpu, inputs)` runs every matmul on the RPU through `Rpu::matmul_nt_i8`; `predict_batch_host(inputs)` runs the same steps with `quant::matmul_nt_i8`. Both share one forward: one activation scale per batch, dequantize `acc * w_scale[row] * x_scale`, bias, activation (ReLU, softmax) on the host.
+- Check: 64 random inputs through a seeded 784-128-10 network (ReLU, softmax) give outputs equal with `==` on the RPU and host int8 paths, at N = 8 and N = 16. Mutation: adding 1 to the last RPU accumulator fails the test.
+- Sanity against f32 (untrained network, inputs in [0, 1)): argmax agrees on 63/64, max probability difference 0.0013.
+- `data/` (the MNIST download for phase 9) is gitignored.
 
 ## Phase 10: org readiness. Partial, 2026-10-14
 - Dead RTL deleted (Q5): `bf16_adder`, `bf16_multiplier`, `bf16_systolic_cell`, `dma_streamer`, `rpu_core_2x2/3x3/NxN`, `rpu_orchestrator`, `rpu_orchestrator_3x3/NxN`, `rpu_soc`, `sram`, `systolic_cell`, and testbenches `tb_orch_3x3`, `tb_orchestrator`, `tb_rpu`, `tb_soc`. None were in `build.rs` or the Icarus smoke test. Left: 5 RTL files and `sim/tb_tpu.sv`.
@@ -80,5 +84,4 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - Check: 15 tests pass, fmt and clippy clean, Icarus PASS, lint clean at N=8, 16, 24. A fresh `git clone --branch milestone-1` passes `cargo test --release` (15 tests).
 
 ## Questions for owner
-1. **Q3, still open: `rusting_brain` dependency.** Phases 8, 9 and the README in phase 10 wait on it. May `rusting_pu` take `rusting_brain` as an optional dependency behind a `brain` feature? From where: a path (`../RustingBrain`), git (which URL and rev), or crates.io (`4`)?
-2. **Q4, still open: dataset for phase 9.** The default is the 512 FashionMNIST images already in `~/Code/ai/ml/mllearn/data/FashionMNIST/raw/`, with no download. The plan's phase 9 check uses the full 10k test set. Is the full FashionMNIST test set (10k, already on disk) acceptable? Or download MNIST (~11 MB, never committed)?
+None open. Q3 answered 2026-10-14: `rusting_brain` from crates.io, approved. Q4 answered 2026-10-14: download a dataset; MNIST is in the gitignored `data/mnist/`.

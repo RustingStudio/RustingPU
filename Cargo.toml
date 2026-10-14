@@ -3,5 +3,11 @@ name = "rusting_pu"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+rusting_brain = { version = "4", optional = true }
+
+[features]
+brain = ["dep:rusting_brain"]
+
 [build-dependencies]
 cc = "1"
