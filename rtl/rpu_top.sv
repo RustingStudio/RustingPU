@@ -16,6 +16,10 @@
 // (serpentine B tiles, alternating banks), each loading what its tile does not share.
 // Each PE keeps its finished sum in a shadow register, so the settle and drain of a tile
 // overlap the stream of the next one. A compute is busy only while it streams.
+// CONTROL GEMM with QUANT stores each C row as N int8 instead of N int32: per column j,
+// y = clamp(round((acc + bias[j]) * mult[j] / 2^shift[j]), relu[j] ? 0 : -127, 127), from
+// a parameter memory that the host writes. Row i of tile (r, j) goes to beat
+// C_BASE + r * n_tiles * N + j * N + i, which is the column-major A panel of the next layer.
 module rpu_top #(
     parameter int N = 8,
     parameter int KMAX = 1024,
@@ -75,6 +79,17 @@ module rpu_top #(
     localparam int unsigned REG_PANEL_ADDR = 8;
     localparam int unsigned REG_TILES_ADDR = 9;
     localparam int unsigned MEM_BASE_ADDR = 32'h1000_0000;  // in 64-bit words
+    // Requantization: each store cycle (4 per C row) takes L columns of the row.
+    localparam int L = (N + 3) / 4;
+    localparam int LANE_W = (L > 1) ? $clog2(L) : 1;
+    localparam int QP_DEPTH = 4 * ROW_BEATS;  // (tile column, store part) per lane
+    localparam int QP_AW = $clog2(QP_DEPTH);
+    // Parameter word: bias [31:0] (int32), mult [47:32], shift [53:48], relu [54].
+    localparam int QP_W = 55;
+    // Host word QPARAM_BASE + ((j * 4 + part) << LANE_W) + lane holds column
+    // j * N + part * L + lane.
+    localparam int unsigned QPARAM_BASE_ADDR = 32'h0800_0000;
+    localparam int unsigned QPARAM_WORDS = QP_DEPTH << LANE_W;
     localparam int unsigned MEM_WORDS = MEM_BYTES / 8;
 
     // C buffer: one wide word per array row, written by the shift drain one row per
@@ -94,6 +109,7 @@ module rpu_top #(
     logic control_keep_a;
     logic control_keep_b;
     logic control_a_bank;
+    logic control_quant;
     // GEMM sequencer. A blocks at A_BASE + r * PANEL, B tiles at B_BASE + j * PANEL, C tile
     // (r, j) at C_BASE + (r * n_tiles + j) * C_BEATS. The base registers move with it.
     typedef enum logic [1:0] {
@@ -112,6 +128,7 @@ module rpu_top #(
     logic seq_bank;
     logic seq_block_end;
     logic seq_last;
+    logic [BEAT_ADDR_W-1:0] c_stride;  // beats between the C tiles of one row block
 
     typedef enum logic [1:0] {
         COMPUTE_IDLE,
@@ -162,6 +179,8 @@ module rpu_top #(
     logic launch_a_bank;
     logic [K_W-1:0] launch_k_len;
     logic [BEAT_ADDR_W-1:0] launch_c_base;
+    logic launch_quant;
+    logic [RB_W-1:0] launch_j;  // tile column, for the requantization parameters
 
     logic [K_W-1:0] stream_k;
     logic [K_W-1:0] stream_last;
@@ -179,6 +198,43 @@ module rpu_top #(
     logic [STORE_W-1:0] store_idx;
     logic [COL_W-1:0] store_row;
     logic [1:0] store_part;
+    logic compute_quant;
+    logic drain_quant;
+    logic store_quant;
+    logic [RB_W-1:0] compute_j;
+    logic [RB_W-1:0] drain_j;
+    logic [RB_W-1:0] store_j;
+    // Requantized store: stage 1 holds L int32 of the row and their parameters, stage 2
+    // the products, stage 3 the rounded products, stage 4 the shifted ones, stage 5 writes
+    // the row's N int8 once its last part is done.
+    logic q1_valid;
+    logic [1:0] q1_part;
+    logic [BEAT_ADDR_W-1:0] q1_addr;
+    logic [L-1:0][31:0] q1_acc;
+    logic [L-1:0][QP_W-1:0] q1_par;
+    logic q2_valid;
+    logic [1:0] q2_part;
+    logic [BEAT_ADDR_W-1:0] q2_addr;
+    logic signed [49:0] q2_prod [L];
+    logic [L-1:0][5:0] q2_shift;
+    logic [L-1:0] q2_relu;
+    logic q3_valid;
+    logic [1:0] q3_part;
+    logic [BEAT_ADDR_W-1:0] q3_addr;
+    logic signed [49:0] q3_rnd [L];
+    logic [L-1:0][5:0] q3_shift;
+    logic [L-1:0] q3_relu;
+    logic q4_valid;
+    logic [1:0] q4_part;
+    logic [BEAT_ADDR_W-1:0] q4_addr;
+    logic signed [49:0] q4_val [L];
+    logic [L-1:0] q4_relu;
+    logic [N-1:0][7:0] q_bytes;
+    logic [N-1:0][7:0] q_next;
+    logic q_wr_valid;
+    logic [BEAT_ADDR_W-1:0] q_wr_addr;
+    logic [BEAT_W-1:0] q_wr_data;
+    logic [QP_AW-1:0] qp_read_addr;
 
     logic compute_local_bank;
     logic compute_a_bank;
@@ -207,11 +263,12 @@ module rpu_top #(
                           (compute_state == COMPUTE_STREAM);
     assign drain_busy = drain_state != DRAIN_IDLE;
     assign busy = load_busy || launch_valid || compute_busy || drain_busy || store_busy ||
-                  seq_state != SEQ_IDLE;
+                  q1_valid || q2_valid || q3_valid || q4_valid || q_wr_valid || seq_state != SEQ_IDLE;
     assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy &&
-                  !launch_valid && seq_state == SEQ_IDLE;
+                  !q1_valid && !q2_valid && !q3_valid && !q4_valid && !q_wr_valid && !launch_valid && seq_state == SEQ_IDLE;
     assign seq_block_end = seq_back ? (seq_j == 16'd0) : (seq_j == reg_n_tiles - 16'd1);
     assign seq_last = seq_block_end && (seq_r == reg_m_blocks - 16'd1);
+    assign c_stride = control_quant ? BEAT_ADDR_W'(N) : BEAT_ADDR_W'(C_BEATS);
     assign stream_last_k = (compute_state == COMPUTE_STREAM) && (stream_k == stream_last);
     assign issue_row_end = int'(issue_k) + N >= int'(load_k_len);
     assign recv_row_end = int'(recv_k) + N >= int'(load_k_len);
@@ -261,10 +318,54 @@ module rpu_top #(
         .c_row(c_row)
     );
 
-    assign dma_wr_valid = store_busy;
-    assign dma_wr_addr = store_c_base + BEAT_ADDR_W'(store_idx);
     assign c_store_row = mem_c[store_row];
-    assign dma_wr_data = c_store_row[int'(store_part)*BEAT_W +: BEAT_W];
+    // A raw store writes one beat per cycle; a requantized one, one beat per row.
+    assign dma_wr_valid = (store_busy && !store_quant) || q_wr_valid;
+    assign dma_wr_addr = q_wr_valid ? q_wr_addr : store_c_base + BEAT_ADDR_W'(store_idx);
+    assign dma_wr_data = q_wr_valid ? q_wr_data : c_store_row[int'(store_part)*BEAT_W +: BEAT_W];
+
+    // Requantization parameters: one memory per lane, one read port each.
+    assign qp_read_addr = QP_AW'({store_j, store_part});
+    generate
+        for (i = 0; i < L; i++) begin : qparam_lane
+            logic [QP_W-1:0] qp_mem [0:QP_DEPTH-1];
+            always_ff @(posedge clk) begin
+                if (mem_we && mem_addr >= QPARAM_BASE_ADDR &&
+                    mem_addr < QPARAM_BASE_ADDR + QPARAM_WORDS &&
+                    (L == 1 || int'(mem_addr[LANE_W-1:0]) == i)) begin
+                    qp_mem[QP_AW'((mem_addr - QPARAM_BASE_ADDR) >> LANE_W)] <= mem_wdata[QP_W-1:0];
+                end
+                q1_par[i] <= qp_mem[qp_read_addr];
+                q1_acc[i] <= (int'(store_part) * L + i < N)
+                    ? c_store_row[(int'(store_part) * L + i) * 32 +: 32] : 32'd0;
+                // |acc + bias| < 2^32 and mult < 2^16, so the product fits 49 bits.
+                q2_prod[i] <= 50'(33'(signed'(q1_acc[i])) + 33'(signed'(q1_par[i][31:0]))) *
+                              50'(signed'({1'b0, q1_par[i][47:32]}));
+                q2_shift[i] <= q1_par[i][53:48];
+                q2_relu[i] <= q1_par[i][54];
+                // Round half up; shift <= 48.
+                q3_rnd[i] <= (q2_shift[i] == 6'd0) ? q2_prod[i]
+                    : q2_prod[i] + (50'sd1 <<< (q2_shift[i] - 6'd1));
+                q3_shift[i] <= q2_shift[i];
+                q3_relu[i] <= q2_relu[i];
+                q4_val[i] <= q3_rnd[i] >>> q3_shift[i];
+                q4_relu[i] <= q3_relu[i];
+            end
+        end
+    endgenerate
+
+    // y = clamp(round((acc + bias) * mult / 2^shift), relu ? 0 : -127, 127) per lane.
+    always_comb begin
+        q_next = q_bytes;
+        for (int l = 0; l < L; l++) begin
+            if (int'(q4_part) * L + l < N) begin
+                if (q4_val[l] > 50'sd127) q_next[int'(q4_part) * L + l] = 8'd127;
+                else if (q4_relu[l] && q4_val[l] < 50'sd0) q_next[int'(q4_part) * L + l] = 8'd0;
+                else if (q4_val[l] < -50'sd127) q_next[int'(q4_part) * L + l] = 8'h81;
+                else q_next[int'(q4_part) * L + l] = q4_val[l][7:0];
+            end
+        end
+    end
 
     rpu_sim_memory #(
         .N(N),
@@ -298,6 +399,7 @@ module rpu_top #(
             control_keep_a <= 1'b0;
             control_keep_b <= 1'b0;
             control_a_bank <= 1'b0;
+            control_quant <= 1'b0;
             seq_state <= SEQ_IDLE;
             reg_panel <= '0;
             reg_m_blocks <= '0;
@@ -331,7 +433,7 @@ module rpu_top #(
                                 seq_r <= seq_r + 16'd1;
                                 seq_back <= !seq_back;
                                 reg_a_base <= reg_a_base + reg_panel;
-                                reg_c_base <= reg_c_base + BEAT_ADDR_W'(reg_n_tiles) * BEAT_ADDR_W'(C_BEATS);
+                                reg_c_base <= reg_c_base + BEAT_ADDR_W'(reg_n_tiles) * c_stride;
                                 control_a_bank <= !seq_r[0];
                                 control_keep_a <= 1'b0;
                                 control_keep_b <= 1'b1;
@@ -341,8 +443,7 @@ module rpu_top #(
                                 seq_bank <= !seq_bank;
                                 control_bank <= !seq_bank;
                                 reg_b_base <= seq_back ? reg_b_base - reg_panel : reg_b_base + reg_panel;
-                                reg_c_base <= seq_back ? reg_c_base - BEAT_ADDR_W'(C_BEATS)
-                                                       : reg_c_base + BEAT_ADDR_W'(C_BEATS);
+                                reg_c_base <= seq_back ? reg_c_base - c_stride : reg_c_base + c_stride;
                                 control_keep_a <= 1'b1;
                                 control_keep_b <= 1'b0;
                             end
@@ -361,6 +462,7 @@ module rpu_top #(
                         control_keep_a <= mem_wdata[3];
                         control_a_bank <= mem_wdata[4];
                         control_keep_b <= mem_wdata[5];
+                        control_quant <= mem_wdata[7];
                         if (mem_wdata[6]) begin
                             // Tile 0 loads A and B into bank 0.
                             control_bank <= 1'b0;
@@ -422,6 +524,30 @@ module rpu_top #(
             launch_a_bank <= 1'b0;
             launch_k_len <= '0;
             launch_c_base <= '0;
+            launch_quant <= 1'b0;
+            launch_j <= '0;
+            compute_quant <= 1'b0;
+            drain_quant <= 1'b0;
+            store_quant <= 1'b0;
+            compute_j <= '0;
+            drain_j <= '0;
+            store_j <= '0;
+            q1_valid <= 1'b0;
+            q1_part <= '0;
+            q1_addr <= '0;
+            q2_valid <= 1'b0;
+            q2_part <= '0;
+            q2_addr <= '0;
+            q3_valid <= 1'b0;
+            q3_part <= '0;
+            q3_addr <= '0;
+            q4_valid <= 1'b0;
+            q4_part <= '0;
+            q4_addr <= '0;
+            q_bytes <= '0;
+            q_wr_valid <= 1'b0;
+            q_wr_addr <= '0;
+            q_wr_data <= '0;
             stream_k <= '0;
             stream_last <= '0;
             stream_beat <= '0;
@@ -486,6 +612,8 @@ module rpu_top #(
                     launch_a_bank <= control_a_bank;
                     launch_k_len <= reg_k_len;
                     launch_c_base <= reg_c_base;
+                    launch_quant <= control_quant;
+                    launch_j <= RB_W'(seq_j);
                 end
             end else if ((start_request || start) && !launch_valid && local_valid[control_bank]) begin
                 cycles <= 32'd0;
@@ -496,6 +624,8 @@ module rpu_top #(
                     compute_local_bank <= control_bank;
                     compute_a_bank <= control_a_bank;
                     compute_c_base <= reg_c_base;
+                    compute_quant <= control_quant;
+                    compute_j <= RB_W'(seq_j);
                 end else begin
                     launch_valid <= 1'b1;
                     launch_ready <= 1'b1;
@@ -503,6 +633,8 @@ module rpu_top #(
                     launch_a_bank <= control_a_bank;
                     launch_k_len <= local_k_len[control_bank];
                     launch_c_base <= reg_c_base;
+                    launch_quant <= control_quant;
+                    launch_j <= RB_W'(seq_j);
                 end
             end
 
@@ -514,6 +646,8 @@ module rpu_top #(
                 compute_local_bank <= launch_bank;
                 compute_a_bank <= launch_a_bank;
                 compute_c_base <= launch_c_base;
+                compute_quant <= launch_quant;
+                compute_j <= launch_j;
             end
 
             if (issue_active) begin
@@ -582,6 +716,8 @@ module rpu_top #(
                     if (drain_count == DRAIN_LAST) begin
                         store_busy <= 1'b1;
                         store_c_base <= drain_c_base;
+                        store_quant <= drain_quant;
+                        store_j <= drain_j;
                         store_idx <= '0;
                         store_row <= '0;
                         store_part <= '0;
@@ -615,6 +751,8 @@ module rpu_top #(
                         drain_state <= DRAIN_SETTLE;
                         drain_count <= '0;
                         drain_c_base <= compute_c_base;
+                        drain_quant <= compute_quant;
+                        drain_j <= compute_j;
                     end else begin
                         stream_k <= stream_k + 1'b1;
                         if (stream_lane == COL_LAST) begin
@@ -630,6 +768,30 @@ module rpu_top #(
                     compute_state <= COMPUTE_IDLE;
                 end
             endcase
+
+            // Requantized store: stages 1 to 4 are in q1_* to q4_*, stage 5 builds the row
+            // in q_bytes.
+            q1_valid <= store_busy && store_quant;
+            q1_part <= store_part;
+            q1_addr <= store_c_base + BEAT_ADDR_W'(store_row);
+            q2_valid <= q1_valid;
+            q2_part <= q1_part;
+            q2_addr <= q1_addr;
+            q3_valid <= q2_valid;
+            q3_part <= q2_part;
+            q3_addr <= q2_addr;
+            q4_valid <= q3_valid;
+            q4_part <= q3_part;
+            q4_addr <= q3_addr;
+            q_wr_valid <= 1'b0;
+            if (q4_valid) begin
+                q_bytes <= q_next;
+                if (q4_part == C_ROW_LAST) begin
+                    q_wr_valid <= 1'b1;
+                    q_wr_addr <= q4_addr;
+                    q_wr_data <= q_next;
+                end
+            end
 
             // C store, one beat per cycle: the memory never stalls a write.
             if (store_busy) begin

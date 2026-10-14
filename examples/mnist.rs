@@ -1,5 +1,7 @@
 //! MNIST end to end: train a 784-128-10 MLP with RustingBrain on the CPU (or load the saved
-//! one), then classify the 10k test images in f32, host int8 and on the RPU.
+//! one), then classify the 10k test images in f32, host int8 and on the RPU. The hidden
+//! layer's output scale is calibrated on the first training images, so the RPU keeps the
+//! hidden activations in its memory.
 //!
 //! ```text
 //! cargo run --release --features brain --example mnist [data/mnist]
@@ -16,6 +18,8 @@ use std::time::Instant;
 
 /// Images per RPU batch. One activation scale covers the whole batch.
 const BATCH: usize = 64;
+/// Training images that fix the hidden layer's output scale.
+const CALIBRATION: usize = 1000;
 const SEED: u64 = 0x6d6e_6973_7400_0001;
 
 fn argmax(v: &[f32]) -> usize {
@@ -78,7 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let f32_correct = correct(&network.predict_batch(&test.inputs)?);
+    let train = Dataset::from_idx(
+        dir.join("train-images-idx3-ubyte"),
+        dir.join("train-labels-idx1-ubyte"),
+    )?;
     let mut mlp = RpuMlp::from_network(&network);
+    mlp.calibrate(&train.inputs[..CALIBRATION]);
     let mut rpu = Rpu::new()?;
     let (mut host, mut on_rpu) = (Vec::with_capacity(count), Vec::with_capacity(count));
     let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
@@ -100,7 +109,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (host_correct, rpu_correct) = (correct(&host), correct(&on_rpu));
 
     let pct = |c: usize| 100.0 * c as f64 / count as f64;
-    println!("N = {TILE}, batch {BATCH}, {count} test images");
+    println!(
+        "N = {TILE}, batch {BATCH}, {count} test images, calibrated on {CALIBRATION} training images"
+    );
     println!("f32       {f32_correct} correct, {:.2}%", pct(f32_correct));
     println!(
         "host int8 {host_correct} correct, {:.2}%",

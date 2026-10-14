@@ -35,6 +35,10 @@ Lower-level methods:
 ```text
 upload_b(base, b, n, k)           write B once; returns a ResidentB handle
 matmul_resident(a, m, &b, scratch) GEMM against a resident B; A and C go from `scratch`
+upload_a(base, a, m, k) / read_a  write int8 A as panels; returns a ResidentA handle
+gemm_i32(&a, &b, c_base)          C = A * B^T, read back as int32
+gemm_requant(&a, &b, params, out) requantized int8 output stays in memory as the
+                                  next GEMM's ResidentA; nothing is read back
 run_tile_i8(a, b)                 one N x N x N tile
 run_panel_i8(a, b, k)             one N x k x N panel job
 preload_panel_i8(bank, a, b, k)   load A and B into a local bank, return when loaded
@@ -45,7 +49,7 @@ host_words_written() / _read()    host bus traffic since new (reads: memory only
 busy() / done() / load_busy() / compute_busy() / status()
 ```
 
-`src/quant.rs` holds the host side of the int8 contract: symmetric per-row quantization, the reference `matmul_nt_i8`, and dequantization. Every RTL result is compared with `==` against it.
+`src/quant.rs` holds the host side of the int8 contract: symmetric per-row quantization, the reference `matmul_nt_i8`, dequantization and the requantization rule (`Requant`, section 6). Every RTL result is compared with `==` against it.
 
 ## 2. Build and test
 
@@ -103,6 +107,7 @@ The top-level host port is a synchronous memory-mapped bus with 32-bit word addr
 | 7 | BUSY | ignored | cycles busy (load, compute or store) since reset |
 | 8 | PANEL | beats per panel for GEMM: N * ceil(K/N) | 0 |
 | 9 | TILES | GEMM size: row blocks in bits 15:0, B tiles in bits 31:16 | 0 |
+| `0x0800_0000 + p` | QPARAM | requantization parameters of one column (see below) | 0 |
 | `0x1000_0000 + w` | memory | 64-bit word w | 64-bit word w |
 
 ### CONTROL bits
@@ -117,7 +122,12 @@ bit 4 A_BANK   local A bank 0 or 1: the bank a load fills and a compute reads
 bit 5 KEEP_B   the load fetches only A; B bank BANK keeps its contents and is
                marked valid at the end (ignored with KEEP_A)
 bit 6 GEMM     run a whole tiled GEMM (see section 8); write it with no other bit
+               except QUANT
+bit 7 QUANT    store each C row requantized to int8 (section 6) as one beat;
+               with GEMM, in the A panel layout of the next GEMM
 ```
+
+QPARAM holds one 64-bit word per output column: bias in bits 31:0 (int32, in the accumulator domain), mult in bits 47:32 (u16), shift in bits 53:48 (at most 48), relu in bit 54. The words of B tile j are in L = ceil(N/4) lanes; column `j*N + part*L + lane` (part 0..3) is at `0x0800_0000 + ((j*4 + part) << LANE_W) + lane`, LANE_W = clog2(L) (1 when L = 1). The parameters live in LUT RAM, 4 * ceil(KMAX/N) words per lane. Columns past n keep stale parameters; that is harmless (see the memory layout).
 
 During a GEMM the sequencer drives START and PRELOAD itself and moves A_BASE, B_BASE and C_BASE as it goes. **Do not write registers until DONE**: BUSY stays high and DONE low until the last tile is stored.
 
@@ -143,8 +153,9 @@ Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest w
 
 - A and B panels: N rows of `ceil(K/N)` beats each, stored column by column: beat c of rows 0..N-1, then beat c + 1 (`pack_panels`). Beat c of a row holds k = cN .. cN + N - 1, k = cN in the lowest byte, zero padded past K. A load reads one column of A and then the same column of B, so the stream can read column c before the later columns arrive.
 - C tile: row-major int32, 4 beats per row (two int32 per host word, low half first).
+- Requantized output (QUANT): one int8 beat per row. With GEMM, row i of tile (r, j) goes to beat C_BASE + r * nt * N + j * N + i, which is beat column j of A block r of the next GEMM with K = n. Padding rows and columns hold requantized garbage; the next GEMM streams only k < K and its padding rows are never read back.
 
-Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layout (A, B, C of each bank). `matmul_nt_i8` writes B (all its tiles) from beat 0, then calls `matmul_resident` with the scratch area right after B: all A blocks, then a C area with one tile per output tile. `RpuMlp` uploads each layer's weights once, back to back from beat 0, and puts the scratch area after the last layer; each batch writes only its activations. A `ResidentB` remembers which `Rpu` it was uploaded to, and `matmul_resident` panics if the scratch area overlaps B.
+Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layout (A, B, C of each bank). `matmul_nt_i8` writes B (all its tiles) from beat 0, then calls `matmul_resident` with the scratch area right after B: all A blocks, then a C area with one tile per output tile. `RpuMlp` uploads each layer's weights once, back to back from beat 0, and puts the scratch area after the last layer; each batch writes only its activations. A `ResidentB` remembers which `Rpu` it was uploaded to, and `matmul_resident` panics if the scratch area overlaps B. After `RpuMlp::calibrate`, a batch writes its input A after the weights, and each fused layer writes its int8 output right after its input; the last layer's C goes after that and is the only data read back.
 
 ### State machines
 
@@ -175,7 +186,10 @@ drain (separate, starts when a STREAM ends):
        -> IDLE
 
 store (separate, starts when SHIFT ends):
-  4N beats, one per cycle; the memory never stalls a write
+  4N beats, one per cycle; the memory never stalls a write. With QUANT, 4
+  cycles per row: each cycle reads the parameters of L columns and requantizes
+  them in five register stages (read; bias add and multiply; rounding add;
+  shift; clamp), then one beat per row is written
 ```
 
 ## 4. Systolic dataflow
@@ -205,7 +219,7 @@ A STREAM may start while the drain before is pending only if its K is at least `
 - `build.rs`: runs Verilator on the five active RTL files with `rpu_top` as top, compiles the generated C++ and the wrapper. Update its file list when RTL files change.
 - `src/lib.rs`: FFI, `Rpu`, memory packing, the GEMM scheduler and the hardware tests.
 - `src/quant.rs`: quantization and the reference int8 GEMM.
-- `src/brain.rs` (feature `brain`): `RpuMlp`, a RustingBrain dense network with int8 weights; `predict_batch` runs the matmuls on the RPU, `predict_batch_host` on the host reference.
+- `src/brain.rs` (feature `brain`): `RpuMlp`, a RustingBrain dense network with int8 weights; `predict_batch` runs the matmuls on the RPU, `predict_batch_host` on the host reference, and `calibrate` fixes static output scales so the hidden layers run fused on the RPU.
 - `src/main.rs`: one-tile demo. `examples/baseline.rs`: cycle counts. `examples/mnist.rs` (feature `brain`): MNIST end to end, see `docs/m1-results.md`.
 - `verilated_wrapper/`: the C ABI (`rpu_new/free/reset/tick/cycles/write/read/busy/done`). Keep Verilator types out of Rust. When top-level ports change, update the wrapper and the Rust FFI together.
 - `rtl/`: the five active files above. `sim/tb_tpu.sv`: Icarus smoke test. The old BF16 and integer experiments were deleted in phase 10; git history keeps them.
@@ -216,6 +230,8 @@ A STREAM may start while the drain before is pending only if its K is at least `
 - Products are int16, accumulators int32. K = 1024 at 127 * 127 is 16,516,096, far from overflow.
 - The RTL result must equal `quant::matmul_nt_i8` exactly. Use `==`, never a tolerance.
 - Weights get one symmetric scale per output row (per row of B), the RustingBrain rule. Activations get one scale for the whole batch. Dequantization is host-side.
+- Requantization (QUANT), per column j: `y = clamp(round((acc + bias[j]) * mult[j] / 2^shift[j]), relu ? 0 : -127, 127)`, ties rounded up (add 2^(shift-1), shift right arithmetically). `quant::Requant::apply` is the reference; the RTL must equal it exactly. `Requant::new` turns `acc * acc_scale + bias` with output scale `out_scale` into mult in [2^15, 2^16) and a shift, and the bias into the accumulator domain (`round(bias / acc_scale)`).
+- `RpuMlp::calibrate` fixes each fused layer's output scale to `absmax / 127` of its output on calibration inputs (a static scale, as a TPU uses). The input of the first layer keeps a per-batch scale.
 
 ## 7. Changing N
 

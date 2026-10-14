@@ -87,6 +87,61 @@ pub fn dequantize(acc: &[i32], m: usize, n: usize, a_scale: f32, b_scales: &[f32
         .collect()
 }
 
+/// Fixed-point requantization of one output column, the rule of the RPU's QUANT store:
+/// `y = clamp(round((acc + bias) * mult / 2^shift), relu ? 0 : -127, 127)`, with ties
+/// rounded up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Requant {
+    pub bias: i32,
+    pub mult: u16,
+    /// At most 48.
+    pub shift: u8,
+    pub relu: bool,
+}
+
+impl Requant {
+    /// The column whose float output is `acc * acc_scale + bias` (then ReLU if `relu`),
+    /// quantized with `out_scale`.
+    pub fn new(acc_scale: f32, bias: f32, out_scale: f32, relu: bool) -> Self {
+        if acc_scale == 0.0 || out_scale == 0.0 {
+            // acc is 0 for every row: the output is the quantized bias. A zero output
+            // scale (the output was 0 in calibration) gives 0.
+            let inverse = if out_scale > 0.0 {
+                1.0 / out_scale
+            } else {
+                0.0
+            };
+            return Self {
+                bias: i32::from(quantize_one(bias, inverse)),
+                mult: u16::from(out_scale > 0.0),
+                shift: 0,
+                relu,
+            };
+        }
+        // mult in [2^15, 2^16) unless the shift range runs out.
+        let m = f64::from(acc_scale) / f64::from(out_scale);
+        let shift = (15 - m.log2().floor() as i32).clamp(0, 48);
+        let mult = (m * 2f64.powi(shift)).round();
+        Self {
+            bias: (f64::from(bias) / f64::from(acc_scale))
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
+            mult: mult.min(f64::from(u16::MAX)) as u16,
+            shift: shift as u8,
+            relu,
+        }
+    }
+
+    pub fn apply(&self, acc: i32) -> i8 {
+        let prod = (i64::from(acc) + i64::from(self.bias)) * i64::from(self.mult);
+        let rounded = match self.shift {
+            0 => prod,
+            s => (prod + (1i64 << (s - 1))) >> s,
+        };
+        rounded.clamp(if self.relu { 0 } else { -127 }, 127) as i8
+    }
+}
+
 /// Tiny seeded xorshift64 for tests, so no `rand` dependency is needed.
 #[cfg(test)]
 pub(crate) struct XorShift(pub u64);
@@ -184,6 +239,51 @@ mod tests {
         let q = quantize_rows(&[0.0; 4], 2, 2);
         assert_eq!(q.scales, vec![0.0, 0.0]);
         assert_eq!(q.data, vec![0; 4]);
+    }
+
+    #[test]
+    fn requant_follows_the_float_rule_within_one_step() {
+        let mut rng = XorShift(11);
+        for _ in 0..2000 {
+            let acc_scale = (rng.f32_sym().abs() + 1e-3) * 1e-4;
+            let out_scale = (rng.f32_sym().abs() + 1e-3) * 0.1;
+            let bias = rng.f32_sym();
+            let relu = rng.next_u64().is_multiple_of(2);
+            let acc = (rng.next_u64() % 4_000_001) as i32 - 2_000_000;
+            let q = Requant::new(acc_scale, bias, out_scale, relu);
+            assert!((1 << 15..1 << 16).contains(&u32::from(q.mult)) || q.shift == 48);
+            let y = acc as f32 * acc_scale + bias;
+            let want = (if relu { y.max(0.0) } else { y } / out_scale).clamp(-127.0, 127.0);
+            let got = f32::from(q.apply(acc));
+            assert!((got - want).abs() <= 0.51, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn requant_edges() {
+        let q = Requant {
+            bias: 0,
+            mult: 1,
+            shift: 1,
+            relu: false,
+        };
+        // Ties round up: 1/2 -> 1, -1/2 -> 0, -3/2 -> -1.
+        assert_eq!((q.apply(1), q.apply(-1), q.apply(-3)), (1, 0, -1));
+        let q = Requant {
+            bias: 0,
+            mult: 65535,
+            shift: 0,
+            relu: false,
+        };
+        assert_eq!((q.apply(i32::MAX), q.apply(i32::MIN)), (127, -127));
+        assert_eq!(Requant { relu: true, ..q }.apply(-5), 0);
+        // A zero scale gives the quantized bias for every acc.
+        let q = Requant::new(0.0, 0.5, 0.01, true);
+        assert_eq!(
+            (q.apply(0), Requant::new(0.0, -0.5, 0.01, true).apply(0)),
+            (50, 0)
+        );
+        assert_eq!(Requant::new(0.01, 0.5, 0.0, false).apply(1000), 0);
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub const KMAX: usize = 1024;
 /// Size of the RPU memory. Must match `MEM_BYTES` of `rtl/rpu_top.sv`.
 const MEM_BYTES: usize = 1 << 20;
 
+use quant::Requant;
 use std::cell::Cell;
 use std::fmt;
 use std::ptr::NonNull;
@@ -50,6 +51,18 @@ const CONTROL_A_BANK1: u64 = 0b1_0000;
 const CONTROL_KEEP_B: u64 = 0b10_0000;
 /// Run the whole tiled GEMM described by the base, K, PANEL and TILES registers.
 const CONTROL_GEMM: u64 = 0b100_0000;
+/// CONTROL bit 7, with GEMM: store each C row as N int8, requantized per column.
+const CONTROL_QUANT: u64 = 0b1000_0000;
+/// Host address of requantization parameter word 0.
+const QPARAM_BASE: u32 = 0x0800_0000;
+/// Columns that one store cycle requantizes (4 cycles per C row), and the width of the
+/// lane field in a parameter address.
+const QP_LANES: usize = TILE.div_ceil(4);
+const QP_LANE_W: u32 = if QP_LANES > 1 {
+    (QP_LANES - 1).ilog2() + 1
+} else {
+    1
+};
 const STATUS_LOAD_BUSY: u64 = 0b0100;
 const STATUS_COMPUTE_BUSY: u64 = 0b1000;
 
@@ -110,6 +123,23 @@ impl ResidentB {
     /// First memory beat after this B.
     pub fn end(&self) -> u32 {
         self.base + self.n.div_ceil(TILE) as u32 * panel_beats(self.k)
+    }
+}
+
+/// Int8 activations (`m x k`) in RPU memory, in the A panel layout: written by
+/// [`Rpu::upload_a`] or produced by [`Rpu::gemm_requant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentA {
+    id: u64,
+    base: u32,
+    m: usize,
+    k: usize,
+}
+
+impl ResidentA {
+    /// First memory beat after this A.
+    pub fn end(&self) -> u32 {
+        self.base + self.m.div_ceil(TILE) as u32 * panel_beats(self.k)
     }
 }
 
@@ -205,12 +235,8 @@ impl Rpu {
         handle
     }
 
-    /// The GEMM of [`Rpu::matmul_nt_i8`] with B already in RPU memory. A and the C tiles go
-    /// to memory from beat `scratch`, which must not overlap B. For each block of TILE rows
-    /// of A, A is loaded once. Each tile's load overlaps the compute of the tile before it:
-    /// the B tiles alternate between the two local B banks, and the row blocks between the
-    /// two local A banks. Every other row block walks the B tiles backwards, so the first
-    /// tile of a block uses the B of the last tile before it, and only the next A loads.
+    /// The GEMM of [`Rpu::matmul_nt_i8`] with B already in RPU memory. A goes to memory
+    /// from beat `scratch` and C after it; neither may overlap B.
     pub fn matmul_resident(
         &mut self,
         a: &[i8],
@@ -218,36 +244,53 @@ impl Rpu {
         b: &ResidentB,
         scratch: u32,
     ) -> Result<Vec<i32>, RpuError> {
-        assert_eq!(b.id, self.id, "B was uploaded to another RPU");
-        let (n, k) = (b.n, b.k);
-        assert_eq!(a.len(), m * k, "A must be m x k");
-        let (mt, nt) = (m.div_ceil(TILE), n.div_ceil(TILE));
-        let panel = panel_beats(k);
-        let (a_base, b_base) = (scratch, b.base);
-        let c_base = a_base + mt as u32 * panel;
-        let c_tile = |r: usize, j: usize| c_base + (r * nt + j) as u32 * C_BEATS;
+        let (mt, nt) = (m.div_ceil(TILE) as u32, b.n.div_ceil(TILE) as u32);
+        let scratch_end = scratch + mt * panel_beats(b.k) + mt * nt * C_BEATS;
         assert!(
-            (c_tile(mt, 0) * BEAT_WORDS) as usize * 8 <= MEM_BYTES,
-            "GEMM does not fit in RPU memory"
-        );
-        assert!(
-            c_tile(mt, 0) <= b.base || b.end() <= a_base,
+            scratch_end <= b.base || b.end() <= scratch,
             "scratch overlaps B"
         );
-        self.write_words(a_base, &pack_panels(&pad_rows(a, m, k), k));
-        self.write_reg(REG_K_LEN, k as u64);
-        self.write_reg(REG_A_BASE, a_base.into());
-        self.write_reg(REG_B_BASE, b_base.into());
-        self.write_reg(REG_C_BASE, c_tile(0, 0).into());
-        // The sequencer walks the tiles in serpentine order: B tile j runs backwards in odd
-        // row blocks, so a row block change keeps its B tile and loads only A.
-        self.write_reg(REG_PANEL, panel.into());
-        self.write_reg(REG_TILES, (mt as u64) | (nt as u64) << 16);
-        self.write_reg(REG_CONTROL, CONTROL_GEMM);
-        self.tick();
-        self.wait_until(Self::done)?;
+        let a = self.upload_a(scratch, a, m, b.k);
+        self.gemm_i32(&a, b, a.end())
+    }
 
+    /// Writes A (`m x k`, row-major) into RPU memory from beat `base`, padded to whole tiles.
+    pub fn upload_a(&mut self, base: u32, a: &[i8], m: usize, k: usize) -> ResidentA {
+        assert!((1..=KMAX).contains(&k), "k must be in 1..={KMAX}");
+        assert_eq!(a.len(), m * k, "A must be m x k");
+        let handle = ResidentA {
+            id: self.id,
+            base,
+            m,
+            k,
+        };
+        assert!(
+            (handle.end() * BEAT_WORDS) as usize * 8 <= MEM_BYTES,
+            "A does not fit in RPU memory"
+        );
+        self.write_words(base, &pack_panels(&pad_rows(a, m, k), k));
+        handle
+    }
+
+    /// Reads A back from RPU memory, `m x k` row-major.
+    pub fn read_a(&self, a: &ResidentA) -> Vec<i8> {
+        assert_eq!(a.id, self.id, "A is in another RPU");
+        let words = self.read_words(a.base, ((a.end() - a.base) * BEAT_WORDS) as usize);
+        unpack_panels(&words, a.m, a.k)
+    }
+
+    /// `C = A * B^T` in int32, `m x n` row-major. C goes to memory from beat `c_base`.
+    pub fn gemm_i32(
+        &mut self,
+        a: &ResidentA,
+        b: &ResidentB,
+        c_base: u32,
+    ) -> Result<Vec<i32>, RpuError> {
+        let (mt, nt) = (a.m.div_ceil(TILE), b.n.div_ceil(TILE));
+        let c_tile = |r: usize, j: usize| c_base + (r * nt + j) as u32 * C_BEATS;
+        self.run_gemm(a, b, c_base, c_tile(mt, 0), CONTROL_GEMM)?;
         let tile_words = (C_BEATS * BEAT_WORDS) as usize;
+        let (m, n) = (a.m, b.n);
         let mut c = vec![0i32; m * n];
         for r in 0..mt {
             for j in 0..nt {
@@ -261,6 +304,76 @@ impl Rpu {
             }
         }
         Ok(c)
+    }
+
+    /// `C = A * B^T`, with column j requantized by `params[j]`, stays in RPU memory from
+    /// beat `out_base` as the int8 A (`m x n`) of the next GEMM. Only the parameters cross
+    /// the host link.
+    pub fn gemm_requant(
+        &mut self,
+        a: &ResidentA,
+        b: &ResidentB,
+        params: &[Requant],
+        out_base: u32,
+    ) -> Result<ResidentA, RpuError> {
+        assert_eq!(params.len(), b.n, "one requantization per column");
+        let out = ResidentA {
+            id: self.id,
+            base: out_base,
+            m: a.m,
+            k: b.n,
+        };
+        assert!(out.k <= KMAX, "the output must fit a panel row");
+        // Padding columns keep stale parameters: the next GEMM streams only k < n.
+        for (col, q) in params.iter().enumerate() {
+            assert!(q.shift <= 48, "shift must be at most 48");
+            let (j, w) = (col / TILE, col % TILE);
+            let lane = (((j * 4 + w / QP_LANES) << QP_LANE_W) + w % QP_LANES) as u32;
+            let word = u64::from(q.bias as u32)
+                | u64::from(q.mult) << 32
+                | u64::from(q.shift) << 48
+                | u64::from(q.relu) << 54;
+            self.write_reg(QPARAM_BASE + lane, word);
+        }
+        self.run_gemm(a, b, out_base, out.end(), CONTROL_GEMM | CONTROL_QUANT)?;
+        Ok(out)
+    }
+
+    /// Runs the tiled GEMM sequencer with C (or the requantized output) in
+    /// `c_base..c_end`.
+    fn run_gemm(
+        &mut self,
+        a: &ResidentA,
+        b: &ResidentB,
+        c_base: u32,
+        c_end: u32,
+        control: u64,
+    ) -> Result<(), RpuError> {
+        assert!(
+            a.id == self.id && b.id == self.id,
+            "A or B is in another RPU"
+        );
+        assert_eq!(a.k, b.k, "A and B must have the same k");
+        assert!(
+            (c_end * BEAT_WORDS) as usize * 8 <= MEM_BYTES,
+            "GEMM does not fit in RPU memory"
+        );
+        let apart = |base: u32, end: u32| c_end <= base || end <= c_base;
+        assert!(apart(b.base, b.end()), "C overlaps B");
+        assert!(apart(a.base, a.end()), "C overlaps A");
+        assert!(a.end() <= b.base || b.end() <= a.base, "A overlaps B");
+        self.write_reg(REG_K_LEN, a.k as u64);
+        self.write_reg(REG_A_BASE, a.base.into());
+        self.write_reg(REG_B_BASE, b.base.into());
+        self.write_reg(REG_C_BASE, c_base.into());
+        // The sequencer walks the tiles in serpentine order: B tile j runs backwards in odd
+        // row blocks, so a row block change keeps its B tile and loads only A.
+        self.write_reg(REG_PANEL, panel_beats(a.k).into());
+        let (mt, nt) = (a.m.div_ceil(TILE), b.n.div_ceil(TILE));
+        self.write_reg(REG_TILES, (mt as u64) | (nt as u64) << 16);
+        self.write_reg(REG_CONTROL, control);
+        self.tick();
+        self.wait_until(Self::done)
     }
 
     /// Writes A and B (`TILE x k`) into external `bank` and loads them into the local A and B
@@ -454,6 +567,25 @@ fn pack_panels(m: &[i8], k: usize) -> Vec<u64> {
         .collect()
 }
 
+/// The inverse of [`pack_panels`] for `m x k`, dropping padding rows and columns.
+fn unpack_panels(words: &[u64], m: usize, k: usize) -> Vec<i8> {
+    let beats = k.div_ceil(TILE);
+    let bytes: Vec<i8> = words
+        .chunks_exact(BEAT_WORDS as usize)
+        .flat_map(|beat| beat.iter().flat_map(|w| w.to_le_bytes()).take(TILE))
+        .map(|b| b as i8)
+        .collect();
+    let mut out = vec![0i8; m * k];
+    for (i, row) in out.chunks_exact_mut(k).enumerate() {
+        let (r, ri) = (i / TILE, i % TILE);
+        for (col, v) in row.iter_mut().enumerate() {
+            let beat = (r * beats + col / TILE) * TILE + ri;
+            *v = bytes[beat * TILE + col % TILE];
+        }
+    }
+    out
+}
+
 /// Reads int32 values back from beats of host words: the first N bytes of each beat.
 fn unpack_i32(words: &[u64]) -> Vec<i32> {
     let bytes: Vec<u8> = words
@@ -585,6 +717,87 @@ mod tests {
         // A, then K_LEN, the three bases, PANEL, TILES and CONTROL for all nine tiles.
         let a_words = 3 * panel_beats(k) * BEAT_WORDS;
         assert_eq!(rpu.host_words_written() - written, u64::from(a_words) + 7);
+    }
+
+    fn random_requant(rng: &mut quant::XorShift) -> Requant {
+        if rng.next_u64().is_multiple_of(2) {
+            // Any value the hardware takes, mostly saturating.
+            Requant {
+                bias: rng.next_u64() as i32,
+                mult: rng.next_u64() as u16,
+                shift: (rng.next_u64() % 49) as u8,
+                relu: rng.next_u64().is_multiple_of(2),
+            }
+        } else {
+            // Outputs across the int8 range for |acc| up to about 127^2 * k.
+            let acc_scale = 1e-5 * (1.0 + rng.f32_sym().abs());
+            Requant::new(
+                acc_scale,
+                rng.f32_sym(),
+                0.01,
+                rng.next_u64().is_multiple_of(2),
+            )
+        }
+    }
+
+    fn requant_host(acc: &[i32], n: usize, params: &[Requant]) -> Vec<i8> {
+        let col = |i: usize| &params[i % n];
+        acc.iter()
+            .enumerate()
+            .map(|(i, &v)| col(i).apply(v))
+            .collect()
+    }
+
+    #[test]
+    fn gemm_requant_matches_the_host_rule() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x9e_0a07_0000_0001);
+        for (m, n, k) in [
+            (1, 1, 1),
+            (TILE, TILE, TILE),
+            (3, 2 * TILE + 5, 9),
+            (2 * TILE + 1, 3 * TILE, 40),
+            (3 * TILE, 5, 3 * TILE + 1),
+            (TILE, 4 * TILE, 1),
+        ] {
+            let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+            let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
+            let params: Vec<Requant> = (0..n).map(|_| random_requant(&mut rng)).collect();
+            let bh = rpu.upload_b(0, &b, n, k);
+            let ah = rpu.upload_a(bh.end(), &a, m, k);
+            let written = rpu.host_words_written();
+            let out = rpu.gemm_requant(&ah, &bh, &params, ah.end()).unwrap();
+            // One word per column, then the seven GEMM registers.
+            assert_eq!(rpu.host_words_written() - written, n as u64 + 7);
+            let want = requant_host(&quant::matmul_nt_i8(&a, &b, m, n, k), n, &params);
+            assert_eq!(rpu.read_a(&out), want, "{m}x{k} x {k}x{n}");
+            // The int32 store still works after a requantized GEMM.
+            let c = rpu.gemm_i32(&ah, &bh, out.end()).unwrap();
+            assert_eq!(c, quant::matmul_nt_i8(&a, &b, m, n, k));
+        }
+    }
+
+    /// Layer 2 reads the int8 output of layer 1 straight from RPU memory.
+    #[test]
+    fn requantized_output_feeds_the_next_gemm() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x9e_0a07_0000_0002);
+        let (m, k, n1, n2) = (2 * TILE + 3, 50, 3 * TILE + 2, 7);
+        let x: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+        let w1: Vec<i8> = (0..n1 * k).map(|_| rng.i8_sym()).collect();
+        let w2: Vec<i8> = (0..n2 * n1).map(|_| rng.i8_sym()).collect();
+        let params: Vec<Requant> = (0..n1).map(|_| random_requant(&mut rng)).collect();
+        let b1 = rpu.upload_b(0, &w1, n1, k);
+        let b2 = rpu.upload_b(b1.end(), &w2, n2, n1);
+        let a1 = rpu.upload_a(b2.end(), &x, m, k);
+        let a2 = rpu.gemm_requant(&a1, &b1, &params, a1.end()).unwrap();
+        let read = rpu.host_words_read();
+        let c = rpu.gemm_i32(&a2, &b2, a2.end()).unwrap();
+        let h = requant_host(&quant::matmul_nt_i8(&x, &w1, m, n1, k), n1, &params);
+        assert_eq!(c, quant::matmul_nt_i8(&h, &w2, m, n2, n1));
+        // Only the final C crosses the host link.
+        let c_words = m.div_ceil(TILE) * n2.div_ceil(TILE) * (C_BEATS * BEAT_WORDS) as usize;
+        assert_eq!(rpu.host_words_read() - read, c_words as u64);
     }
 
     fn assert_gemm_exact(rpu: &mut Rpu, m: usize, n: usize, k: usize, rng: &mut quant::XorShift) {

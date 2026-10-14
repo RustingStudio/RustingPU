@@ -29,6 +29,9 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 12 stream during the first load | 8 | 97.26% | 1625.4 | 98.44% | 115.5 / 72.0 | 6.1 s |
 | 12 stream during the first load | 16 | 97.26% | 420.8 | 95.06% | 115.5 / 72.0 | 6.4 s |
 | 12 stream during the first load | 12 | 97.26% | 851.5 | 96.41% | 175.3 / 108.1 | 7.8 s |
+| 7 hardware requantization | 8 | 97.25% | 1625.5 | 98.43% | 101.5 / 8.0 | 4.7 s |
+| 7 hardware requantization | 16 | 97.25% | 420.9 | 95.04% | 101.5 / 8.0 | 5.0 s |
+| 7 hardware requantization | 12 | 97.25% | 851.5 | 96.41% | 152.6 / 9.0 | 5.6 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -130,7 +133,30 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 - Load: `uptime` 4.5 (MNIST), 3.9 (synthesis).
 - Commit: `f826a78`.
 
-## Item 7: hardware bias, ReLU and requantization. Blocked on P1 (not approved).
+## Item 7: hardware bias, ReLU and requantization. Done, 2026-10-14
+- P1 approved by the owner (2026-10-14). Before: the host read layer 1's C (int32), dequantized it, added the bias, applied ReLU, quantized it again with a per-batch scale and wrote it back as layer 2's A: 64 of the 72 words read and 16 of the 115.5 words written per image.
+- Fix:
+  - CONTROL bit 7 QUANT: the C store requantizes each row to int8 and writes one beat per row, `y = clamp(round((acc + bias[j]) * mult[j] / 2^shift[j]), relu ? 0 : -127, 127)`, ties up. With GEMM the rows land in the column-major A panel layout of the next GEMM, so layer 2 reads layer 1's output straight from RPU memory. The per-column parameters (int32 bias in the accumulator domain, u16 mult, 6-bit shift, relu) are written to a QPARAM window at `0x0800_0000`, one 64-bit word per column, in ceil(N/4) lanes so that a row takes 4 cycles, as many as the int32 store.
+  - Host side: `quant::Requant` (the reference rule and `Requant::new` from float scales), `Rpu::upload_a`, `gemm_i32`, `gemm_requant` with a `ResidentA` handle, and `RpuMlp::calibrate`, which fixes the hidden layer's output scale to `absmax / 127` of its output on calibration inputs (a static scale, as a TPU uses). `examples/mnist.rs` calibrates on the first 1,000 training images, not on the test set.
+- Accuracy: 97.25% (9,725 correct), RPU equal to host int8 for every image; f32 97.26%. **-0.01 pp against f32 and against item 12 (97.26%)**, from the static output scale of layer 1 (one image). Calibrated on the test batch itself, the fused path gives the same outputs as the per-batch scales (`calibrated_mlp_keeps_hidden_activations_on_the_rpu`), so the loss is the calibration range, not the rounding rule.
+- Host words per image: written 115.5 to 101.5 (-12%), read 72.0 to 8.0 (-89%; only layer 2's C). At N = 12, 175.3 / 108.1 to 152.6 / 9.0. All host words together: 187.5 to 109.5 (-42%) at N = 8 and 16.
+- Cycles: +785 busy cycles in total at every N (5 per batch: the requant pipeline after the last C store of layer 1), 0.08 per image: 1625.4 to 1625.5, 420.8 to 420.9, 851.5 to 851.5 cycles per image; streaming 98.44% to 98.43%, 95.06% to 95.04%, 96.41% to 96.41%.
+- Wall time 4.7 s, 5.0 s and 5.6 s (load 2.9).
+- Synthesis, `rpu_top`, before (item 12) / after:
+
+  | N | Family | LUT | ALU | DFF | MULT9X9 | SDPX9B (BSRAM) | RAM16SDP4 (LUT RAM) |
+  |---|---|---:|---:|---:|---:|---:|---:|
+  | 8 | gw5a | 22,514 / 31,233 | 3,551 / 4,036 | 7,201 / 7,977 | 0 / 0 | 16 / 20 | 2,112 / 2,112 |
+  | 8 | gw2a | 12,434 / 12,347 | 2,527 / 3,025 | 7,201 / 7,977 | 64 / 69 | 16 / 20 | 2,112 / 2,112 |
+  | 16 | gw5a | 71,739 / 87,767 | 12,755 / 13,759 | 27,186 / 28,478 | 0 / 0 | 64 / 72 | 4,224 / 4,224 |
+  | 16 | gw2a | 29,920 / 29,268 | 8,659 / 9,494 | 27,186 / 28,478 | 256 / 265 | 64 / 72 | 4,224 / 4,224 |
+
+  - The requantizer is ceil(N/4) lanes of a 33 x 17-bit multiply, a rounding add, a shift of up to 48 and a clamp. On gw2a, which maps multipliers to DSPs as the board would, it costs 5 MULT9X9 at N = 8 (2 lanes) and 9 at N = 16 (4 lanes), about 500 to 840 ALU and no LUT beyond the noise. On gw5a yosys has no DSP mapping, so the multipliers are soft logic. With the fixed `abc9 -D 50000` flow: N = 8 gw5a 21,104 to 25,083 LUT (+3,979), N = 16 67,729 to 75,607 (+7,878).
+  - The parameters take 4 SDPX9B at N = 8 and 8 at N = 16 (one 55-bit word per column, 4 * ceil(1024/N) per lane). At N = 16 that is 72 of the 118 SDPX9B of the GW5AT-LV60.
+  - Timing (yosys `sta`, N = 8, same flow as item 6): the first version did the bias add, multiply, rounding, shift and clamp in one stage after the parameter read. Its worst path was that stage on gw5a: 16,404 ps against 8,742 for item 12. Split into five stages (read; bias add and multiply; rounding add; shift; clamp), the requantizer is on no worst path: gw5a 12,359 ps (row A read bypass of the load), gw2a 9,261 ps (B operand path, as item 12 at 8,254). The default flow is noisy here: with the fixed `abc9 -D 50000` mapping, item 12 / item 7 are 17,532 / 12,593 ps on gw5a and 12,640 / 12,359 ps on gw2a, the worst paths in the sequencer and the row A bypass, not in the requantizer. The four extra stages cost 3 cycles per batch and about 390 DFF at N = 8 (50 bits and a few flags per lane and stage).
+- Tests: `gemm_requant_matches_the_host_rule` (6 shapes, random and calibrated parameters, ReLU on and off, host words = n parameters + 7 registers), `requantized_output_feeds_the_next_gemm` (layer 2 reads layer 1's output in RPU memory; only the last C is read back), `requant_follows_the_float_rule_within_one_step`, `requant_edges` (ties, saturation, zero scales) and `calibrated_mlp_keeps_hidden_activations_on_the_rpu` (3 layers, ReLU and linear, RPU equal to host, calibrated on the test batch equal to the unfused path within 1% of the output range, measured equal). RTL mutations, each caught: no rounding, relu ignored, -128 instead of -127 as the lower clamp, a wrong parameter address, the int32 C stride with QUANT, DONE that ignores any stage of the requant pipeline, a stage that takes the valid, part, address, shift or relu of the wrong stage, a logical instead of an arithmetic shift, tile column 0 for every parameter read, a zero-extended bias, the requant stage without QUANT. Driver mutations, each caught: the last layer fused, ReLU off, no scale hand-over between fused layers, activations at one address, a calibration at 100 instead of 127, the bias dropped, a calibration on the signed maximum. Not caught: BUSY that ignores the last requant stages (the driver waits for DONE, which is checked), and the lane guard `part * L + l < N` removed (writes past byte N - 1 are dropped anyway; kept for clarity). All tests pass at N = 4, 8, 12 and 16, READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16) clean.
+- Load: `uptime` 2.9 (MNIST), 3 to 31 (synthesis, run in parallel).
+- Commit: COMMIT.
 
 ## Item 8: simulation speed. Done, 2026-10-14
 - Wall time of the MNIST example (10k images, host int8 included), N = 8 / N = 16, all at `f826a78`, measured back to back:
