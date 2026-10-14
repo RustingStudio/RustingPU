@@ -1,3 +1,5 @@
+pub mod quant;
+
 pub const TILE: usize = 8;
 pub const DIM: usize = TILE;
 pub type Matrix = [[f32; TILE]; TILE];
