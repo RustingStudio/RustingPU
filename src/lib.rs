@@ -382,7 +382,16 @@ impl Rpu {
         // row blocks, so a row block change keeps its B tile and loads only A.
         self.write_reg(REG_PANEL, panel_beats(a.k).into());
         let (mt, nt) = (a.m.div_ceil(TILE), b.n.div_ceil(TILE));
-        self.write_reg(REG_TILES, (mt as u64) | (nt as u64) << 16);
+        // An int32 C row of the last B tile stores only the beats that hold columns below n.
+        let skip = if control & CONTROL_QUANT == 0 {
+            4 - c_row_beats(b.n - (nt - 1) * TILE)
+        } else {
+            0
+        };
+        self.write_reg(
+            REG_TILES,
+            (mt as u64) | (nt as u64) << 16 | (skip as u64) << 32,
+        );
         self.write_reg(REG_CONTROL, control);
         self.tick();
         self.wait_until(Self::done)
@@ -791,6 +800,44 @@ mod tests {
             // The int32 store still works after a requantized GEMM.
             let c = rpu.gemm_i32(&ah, &bh, out.end()).unwrap();
             assert_eq!(c, quant::matmul_nt_i8(&a, &b, m, n, k));
+        }
+    }
+
+    /// An int32 GEMM stores, of each C row of its last B tile, only the beats that hold
+    /// columns below n; the other beats keep what was there.
+    #[test]
+    fn last_b_tile_stores_only_its_columns() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x5707_e000_0000_0017);
+        for n in [TILE + 1, 2 * TILE - 1] {
+            // Three row blocks: the GEMM ends on the last B tile.
+            let (m, k) = (2 * TILE + 1, 40);
+            let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+            let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
+            let bh = rpu.upload_b(0, &b, n, k);
+            let ah = rpu.upload_a(bh.end(), &a, m, k);
+            let c_base = ah.end();
+            let words = (6 * C_BEATS * BEAT_WORDS) as usize;
+            rpu.write_words(c_base, &vec![0x5a5a_5a5a_5a5a_5a5a; words]);
+            let before = rpu.read_words(c_base, words);
+            let c = rpu.gemm_i32(&ah, &bh, c_base).unwrap();
+            assert_eq!(c, quant::matmul_nt_i8(&a, &b, m, n, k));
+            let after = rpu.read_words(c_base, words);
+            let stored = c_row_beats(n - TILE);
+            for (beat, (x, y)) in after
+                .chunks(BEAT_WORDS as usize)
+                .zip(before.chunks(BEAT_WORDS as usize))
+                .enumerate()
+            {
+                let (j, part) = (beat / C_BEATS as usize % 2, beat % 4);
+                let written = j == 0 || part < stored;
+                assert_eq!(x != y, written, "n = {n}, beat {beat}");
+            }
+            // A tile started by the host after the GEMM stores whole rows again.
+            let a: Vec<i8> = (0..N2).map(|_| rng.i8_sym()).collect();
+            let b: Vec<i8> = (0..N2).map(|_| rng.i8_sym()).collect();
+            let c = rpu.run_tile_i8(&a, &b).unwrap();
+            assert_eq!(c, quant::matmul_nt_i8(&a, &b, TILE, TILE, TILE));
         }
     }
 

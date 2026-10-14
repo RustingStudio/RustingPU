@@ -47,6 +47,11 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 16 read only C rows and columns that hold outputs | 12 | 97.25% | 851.5 | 96.41% | 152.6 / 8.0 | 5.6 s |
 | 16 read only C rows and columns that hold outputs, LOAD_BEATS 2 | 32 | 97.25% | 111.2 | 91.85% | 103.7 / 8.0 | 7.8 s |
 | 16 read only C rows and columns that hold outputs, LOAD_BEATS 2 | 64 | 97.25% | 43.3 | 61.52% | 108.2 / 8.0 | 23.7 s |
+| 17 store only the C beats that hold outputs | 8 | 97.25% | 1625.5 | 98.43% | 101.5 / 5.0 | 5.0 s |
+| 17 store only the C beats that hold outputs | 16 | 97.25% | 420.6 | 95.10% | 101.5 / 6.0 | 5.0 s |
+| 17 store only the C beats that hold outputs | 12 | 97.25% | 851.5 | 96.41% | 152.6 / 8.0 | 5.5 s |
+| 17 store only the C beats that hold outputs, LOAD_BEATS 2 | 32 | 97.25% | 109.7 | 93.09% | 103.7 / 8.0 | 7.8 s |
+| 17 store only the C beats that hold outputs, LOAD_BEATS 2 | 64 | 97.25% | 40.3 | 66.12% | 108.2 / 8.0 | 23.1 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -361,6 +366,25 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Tests: the read counts of `requantized_output_feeds_the_next_gemm` and `calibrated_mlp_keeps_hidden_activations_on_the_rpu` now expect m rows of ceil(4 cols / N) beats per B tile. Mutations, each caught: floor instead of ceil for the beats per row (4 tests), one row less per tile (7), a row stride of 1 beat instead of 4 (7). All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 32 and 64, and at N = 8), READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) clean.
 - No RTL change, so no synthesis.
 - Load: `uptime` 2 to 3.5.
+- Commit: `d6cb6f4`.
+
+## Item 17: store only the C beats that hold outputs. Done, 2026-10-15
+- Before: every int32 tile store wrote 4 beats per C row, 4N cycles, and the drain of the next tile waited for it. Layer 2 has 10 outputs, so at N >= 40 one beat of each row holds them all and 3 are stored for nothing; at N = 64 the store (256 cycles) is longer than the layer 2 stream (K = 128).
+- Fix: TILES bits 33:32 give the beats per C row that an int32 store of the last B tile of a GEMM skips, 4 - ceil(4 cols / N) for the cols below n in that tile. `run_gemm` writes it (0 with QUANT, whose rows are N bytes). The skip follows the tile from launch to compute to drain, and the store FSM ends each row after 4 - skip beats, so the last tile stores in (4 - skip)N cycles. The skipped beats are never written; item 16 already reads only the beats that hold outputs. Tiles before the last and manual `run_tile_i8` jobs store all 4 beats.
+- MNIST, cycles per image, RPU equal to host int8 for every image, 97.25%, host words unchanged:
+
+  | N | LOAD_BEATS | Batch 64 | Batch 256 | Streaming 64 / 256 |
+  |---|---|---:|---:|---|
+  | 8 | 1 | 1625.5 (0) | 1613.2 (0) | 98.43% / 99.18% |
+  | 16 | 1 | 420.9 to 420.6 (-0.1%) | 407.0 to 406.9 | 95.10% / 98.31% |
+  | 12 | 1 | 851.5 (0) | | 96.41% |
+  | 32 | 2 | 111.2 to 109.7 (-1.3%) | 105.8 to 104.7 (-1.0%) | 93.09% / 97.61% |
+  | 64 | 2 | 43.3 to 40.3 (-6.9%) | 33.2 to 32.4 (-2.4%) | 66.12% / 82.16% |
+
+  Only the store at the end of a GEMM is exposed. At N = 8 and 12 a batch has an even number of row blocks, so the serpentine order ends layer 2 on B tile 0 and the shorter store of the last B tile was already hidden behind the next tile's stream. At N = 64, batch 64, layer 2 is one tile: 3N = 192 cycles saved per call, 3.0 per image.
+- Synthesis, `rpu_top`, against item 14: gw5a N = 8 31,266 LUT (31,237), 4,031 ALU, 7,982 DFF (+5); gw5a N = 16 87,799 LUT (87,779), 28,482 DFF (+4); gw2a N = 8 12,610 LUT (12,463), 2,972 ALU; gw2a N = 16 29,100 LUT (29,096), 9,539 ALU. xcup N = 8 7,369 LUT (7,290), N = 16 22,983 LUT (23,043 at item 13), N = 32 LOAD_BEATS 2 79,581 LUT (78,406), N = 64 LOAD_BEATS 2 302,551 LUT (304,604); FF +2 to +5, DSP, MULT and RAM equal everywhere. Within abc noise.
+- Tests: new `last_b_tile_stores_only_its_columns` fills memory with a pattern, runs a GEMM of three row blocks and two B tiles (n between N + 1 and 2N - 1), and checks beat by beat that the last tile wrote exactly ceil(4 cols / N) beats per row and every other tile 4; then a `run_tile_i8` after it must still store all 4. Mutations at N = 8, each caught by the new test: no skip at the store (store_part_last always 3), the skip on every B tile, the skip on manual jobs too (no `seq_state` guard), the skip register off by one (8 tests), the skip dropped at compute or at drain, the driver writing skip 0. Not caught: the skip dropped on the direct launch path, which only manual and preloaded jobs take, and those have skip 0 (equivalent). All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) clean.
+- Load: `uptime` 3.3 to 4.4 (tests, MNIST and synthesis in parallel).
 - Commit: pending.
 
 ## Questions for owner

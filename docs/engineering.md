@@ -108,7 +108,7 @@ The top-level host port is a synchronous memory-mapped bus with 32-bit word addr
 | 6 | ACTIVE | ignored | cycles the array streamed since reset |
 | 7 | BUSY | ignored | cycles busy (load, compute or store) since reset |
 | 8 | PANEL | beats per panel for GEMM: N * ceil(K/N) | 0 |
-| 9 | TILES | GEMM size: row blocks in bits 15:0, B tiles in bits 31:16 | 0 |
+| 9 | TILES | GEMM size: row blocks in bits 15:0, B tiles in bits 31:16; bits 33:32 the beats per C row that an int32 store of the last B tile skips (0 with QUANT) | 0 |
 | `0x0800_0000 + p` | QPARAM | requantization parameters of one column (see below) | 0 |
 | `0x1000_0000 + w` | memory | 64-bit word w | 64-bit word w |
 
@@ -154,7 +154,7 @@ bit 6 STORE_BUSY      C store running (overlaps the next compute)
 Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest word first; when N is not a multiple of 8, the top bytes of a beat's last word are padding). Base registers hold beat addresses. A load request reads LOAD_BEATS consecutive beats from an address rounded down to a multiple of LOAD_BEATS, so A_BASE and B_BASE must be multiples of LOAD_BEATS (`run_gemm` checks it). The board keeps LOAD_BEATS = 1; 2 is the wide read port of a bigger part (`docs/perf-log.md`, item 14).
 
 - A and B panels: N rows of `ceil(K/N)` beats each, stored column by column: beat c of rows 0..N-1, then beat c + 1 (`pack_panels`). Beat c of a row holds k = cN .. cN + N - 1, k = cN in the lowest byte, zero padded past K. A load reads one column of A and then the same column of B, so the stream can read column c before the later columns arrive.
-- C tile: row-major int32, 4 beats per row (two int32 per host word, low half first). `gemm_i32` reads back only the rows below m and, per row, the beats that hold the columns below n.
+- C tile: row-major int32, 4 beats per row (two int32 per host word, low half first). In a GEMM without QUANT, the last B tile stores only the first 4 - TILES[33:32] beats of each row, and the other beats keep what was there; `run_gemm` sets TILES[33:32] so that these are the beats that hold columns below n. `gemm_i32` reads back only the rows below m and, per row, the beats that hold the columns below n.
 - Requantized output (QUANT): one int8 beat per row. With GEMM, row i of tile (r, j) goes to beat C_BASE + r * nt * N + j * N + i, which is beat column j of A block r of the next GEMM with K = n. Padding rows and columns hold requantized garbage; the next GEMM streams only k < K and its padding rows are never read back.
 
 Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layout (A, B, C of each bank). `matmul_nt_i8` writes B (all its tiles) from beat 0, then calls `matmul_resident` with the scratch area right after B: all A blocks, then a C area with one tile per output tile. `RpuMlp` uploads each layer's weights once, back to back from beat 0, and puts the scratch area after the last layer; each batch writes only its activations. A `ResidentB` remembers which `Rpu` it was uploaded to, and `matmul_resident` panics if the scratch area overlaps B. After `RpuMlp::calibrate`, a batch writes its input A after the weights, and each fused layer writes its int8 output right after its input; the last layer's C goes after that and is the only data read back.
@@ -189,7 +189,8 @@ drain (separate, starts when a STREAM ends):
        -> IDLE
 
 store (separate, starts when SHIFT ends):
-  4N beats, one per cycle; the memory never stalls a write. With QUANT, 4
+  4N beats, one per cycle; the memory never stalls a write. The last B tile of
+  a GEMM stores 4 - TILES[33:32] beats per row, so (4 - skip)N cycles. With QUANT, 4
   cycles per row: each cycle reads the parameters of L columns and requantizes
   them in five register stages (read; bias add and multiply; rounding add;
   shift; clamp), then one beat per row is written

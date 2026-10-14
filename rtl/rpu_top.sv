@@ -5,7 +5,8 @@
 // as fast as the stream reads them. An A or B panel is stored column by column: beat
 // column c of rows 0..N-1, then column c + 1; a beat holds k = c*N.. c*N + N-1 of one row,
 // k = c*N in the lowest byte, zero padded past K. C is stored
-// row-major as int32, 4 beats per row. Base registers hold beat addresses.
+// row-major as int32, 4 beats per row; in a GEMM the last B tile stores only the first
+// 4 - TILES[33:32] beats of each row. Base registers hold beat addresses.
 // The host bus has 32-bit addresses and 64-bit data words.
 // There are two A panel buffers (CONTROL A bank bit) and two B panel buffers (CONTROL
 // bank bit). A load with KEEP_A loads only B, so A stays valid across output tiles; a load
@@ -68,12 +69,10 @@ module rpu_top #(
     localparam int RA_W = $clog2(2 * ROW_BEATS);    // both A banks in one row memory
     localparam logic [RA_W-1:0] A_BANK1_BEAT = RA_W'(ROW_BEATS);
     localparam int DRAIN_W = $clog2(SETTLE_STEPS + 1);
-    localparam int STORE_W = $clog2(C_BEATS);
     localparam logic [COL_W-1:0] COL_LAST = COL_W'(N - 1);
     localparam logic [COL_W-1:0] LOAD_LAST = COL_W'(N - LOAD_BEATS);  // last request of a column
     localparam logic [DRAIN_W-1:0] SETTLE_LAST = DRAIN_W'(SETTLE_STEPS - 1);
     localparam logic [DRAIN_W-1:0] DRAIN_LAST = DRAIN_W'(N - 1);
-    localparam logic [STORE_W-1:0] STORE_LAST = STORE_W'(C_BEATS - 1);
     localparam logic [1:0] C_ROW_LAST = 2'(C_ROW_BEATS - 1);
     localparam int unsigned REG_CONTROL_ADDR = 0;
     localparam int unsigned REG_STATUS_ADDR = 1;
@@ -129,6 +128,8 @@ module rpu_top #(
     logic [BEAT_ADDR_W-1:0] reg_panel;
     logic [15:0] reg_m_blocks;
     logic [15:0] reg_n_tiles;
+    logic [1:0] reg_c_skip;  // C beats per row that a raw store of the last B tile skips
+    logic [1:0] tile_skip;
     logic [15:0] seq_r;
     logic [15:0] seq_j;
     logic seq_back;  // j runs backwards in this row block
@@ -187,6 +188,7 @@ module rpu_top #(
     logic [K_W-1:0] launch_k_len;
     logic [BEAT_ADDR_W-1:0] launch_c_base;
     logic launch_quant;
+    logic [1:0] launch_skip;
     logic [RB_W-1:0] launch_j;  // tile column, for the requantization parameters
 
     logic [K_W-1:0] stream_k;
@@ -202,11 +204,13 @@ module rpu_top #(
     logic stream_last_k;
     logic store_busy;
     logic [BEAT_ADDR_W-1:0] store_c_base;
-    logic [STORE_W-1:0] store_idx;
+    logic [1:0] store_part_last;
     logic [COL_W-1:0] store_row;
     logic [1:0] store_part;
     logic compute_quant;
+    logic [1:0] compute_skip;
     logic drain_quant;
+    logic [1:0] drain_skip;
     logic store_quant;
     logic [RB_W-1:0] compute_j;
     logic [RB_W-1:0] drain_j;
@@ -275,6 +279,10 @@ module rpu_top #(
                   !q1_valid && !q2_valid && !q3_valid && !q4_valid && !q_wr_valid && !launch_valid && seq_state == SEQ_IDLE;
     assign seq_block_end = seq_back ? (seq_j == 16'd0) : (seq_j == reg_n_tiles - 16'd1);
     assign seq_last = seq_block_end && (seq_r == reg_m_blocks - 16'd1);
+    // An int32 store of the last B tile of a GEMM stores only the beats that hold columns
+    // below n; the rest of each C row is never written. With QUANT the host writes 0.
+    assign tile_skip = (seq_state != SEQ_IDLE && seq_j == reg_n_tiles - 16'd1)
+        ? reg_c_skip : 2'd0;
     assign c_stride = control_quant ? BEAT_ADDR_W'(N) : BEAT_ADDR_W'(C_BEATS);
     assign stream_last_k = (compute_state == COMPUTE_STREAM) && (stream_k == stream_last);
     assign issue_row_end = int'(issue_k) + N >= int'(load_k_len);
@@ -331,7 +339,7 @@ module rpu_top #(
     assign c_store_row = mem_c[store_row];
     // A raw store writes one beat per cycle; a requantized one, one beat per row.
     assign dma_wr_valid = (store_busy && !store_quant) || q_wr_valid;
-    assign dma_wr_addr = q_wr_valid ? q_wr_addr : store_c_base + BEAT_ADDR_W'(store_idx);
+    assign dma_wr_addr = q_wr_valid ? q_wr_addr : store_c_base + BEAT_ADDR_W'({store_row, store_part});
     assign dma_wr_data = q_wr_valid ? q_wr_data : c_store_row[int'(store_part)*BEAT_W +: BEAT_W];
 
     // Requantization parameters: one memory per lane, one read port each.
@@ -415,6 +423,7 @@ module rpu_top #(
             reg_panel <= '0;
             reg_m_blocks <= '0;
             reg_n_tiles <= '0;
+            reg_c_skip <= '0;
             seq_r <= '0;
             seq_j <= '0;
             seq_back <= 1'b0;
@@ -491,6 +500,7 @@ module rpu_top #(
                     REG_TILES_ADDR: begin
                         reg_m_blocks <= mem_wdata[15:0];
                         reg_n_tiles <= mem_wdata[31:16];
+                        reg_c_skip <= mem_wdata[33:32];
                     end
                     REG_A_BASE_ADDR: reg_a_base <= BEAT_ADDR_W'(mem_wdata);
                     REG_B_BASE_ADDR: reg_b_base <= BEAT_ADDR_W'(mem_wdata);
@@ -536,9 +546,12 @@ module rpu_top #(
             launch_k_len <= '0;
             launch_c_base <= '0;
             launch_quant <= 1'b0;
+            launch_skip <= '0;
             launch_j <= '0;
             compute_quant <= 1'b0;
+            compute_skip <= '0;
             drain_quant <= 1'b0;
+            drain_skip <= '0;
             store_quant <= 1'b0;
             compute_j <= '0;
             drain_j <= '0;
@@ -567,7 +580,7 @@ module rpu_top #(
             drain_count <= '0;
             store_busy <= 1'b0;
             store_c_base <= '0;
-            store_idx <= '0;
+            store_part_last <= C_ROW_LAST;
             store_row <= '0;
             store_part <= '0;
             compute_local_bank <= 1'b0;
@@ -627,6 +640,7 @@ module rpu_top #(
                     launch_k_len <= reg_k_len;
                     launch_c_base <= reg_c_base;
                     launch_quant <= control_quant;
+                    launch_skip <= tile_skip;
                     launch_j <= RB_W'(seq_j);
                 end
             end else if ((start_request || start) && !launch_valid && local_valid[control_bank]) begin
@@ -639,6 +653,7 @@ module rpu_top #(
                     compute_a_bank <= control_a_bank;
                     compute_c_base <= reg_c_base;
                     compute_quant <= control_quant;
+                    compute_skip <= tile_skip;
                     compute_j <= RB_W'(seq_j);
                 end else begin
                     launch_valid <= 1'b1;
@@ -648,6 +663,7 @@ module rpu_top #(
                     launch_k_len <= local_k_len[control_bank];
                     launch_c_base <= reg_c_base;
                     launch_quant <= control_quant;
+                    launch_skip <= tile_skip;
                     launch_j <= RB_W'(seq_j);
                 end
             end
@@ -661,6 +677,7 @@ module rpu_top #(
                 compute_a_bank <= launch_a_bank;
                 compute_c_base <= launch_c_base;
                 compute_quant <= launch_quant;
+                compute_skip <= launch_skip;
                 compute_j <= launch_j;
             end
 
@@ -731,8 +748,8 @@ module rpu_top #(
                         store_busy <= 1'b1;
                         store_c_base <= drain_c_base;
                         store_quant <= drain_quant;
+                        store_part_last <= C_ROW_LAST - drain_skip;
                         store_j <= drain_j;
-                        store_idx <= '0;
                         store_row <= '0;
                         store_part <= '0;
                         drain_state <= DRAIN_IDLE;
@@ -766,6 +783,7 @@ module rpu_top #(
                         drain_count <= '0;
                         drain_c_base <= compute_c_base;
                         drain_quant <= compute_quant;
+                        drain_skip <= compute_skip;
                         drain_j <= compute_j;
                     end else begin
                         stream_k <= stream_k + 1'b1;
@@ -809,11 +827,10 @@ module rpu_top #(
 
             // C store, one beat per cycle: the memory never stalls a write.
             if (store_busy) begin
-                if (store_idx == STORE_LAST) begin
+                if (store_row == COL_LAST && store_part == store_part_last) begin
                     store_busy <= 1'b0;
                 end
-                store_idx <= store_idx + 1'b1;
-                if (store_part == C_ROW_LAST) begin
+                if (store_part == store_part_last) begin
                     store_part <= '0;
                     store_row <= store_row + 1'b1;
                 end else begin
