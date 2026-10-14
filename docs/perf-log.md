@@ -215,3 +215,20 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 - Caveat: the launch threshold assumes that a load brings one beat per cycle without gaps, which holds for the BSRAM memory of milestone 2. A memory that can stall reads (DDR) needs a stall-aware check.
 - Tests: all GEMM tests run the new order. `next_tile_streams_during_drain` now bounds the first load at K + 2N idle cycles instead of 2K. Mutations, each caught: A rows only in each column fails 15 tests, a receive side or an issue side that returns to A after a B-only column 5 each, no launch at the end of a load (a K that never reaches the threshold) 1, a launch that ignores the threshold 5, no early launch at all 1 (the idle bound), a sequencer that starts the next load before the compute took the tile 1. The threshold sweep: K + 2N - 3 passes, K + 2N - 4 fails; N - 2 passes, N - 3 fails. All tests pass at N = 4, 8, 12 and 16, READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16) clean.
 - Load: `uptime` 8.4 to 9.9 (another program).
+
+## Profile after item 12, 2026-10-14. No candidate reaches 2%
+Overhead at N = 16, per batch of 64 (busy 26,931 cycles, streaming 25,600):
+- The exposed part of the first load of each GEMM, K + 2N beats: 816 (layer 1) + 160 (layer 2) = 976 cycles, 15.3 cycles per image, 3.6%. With one 8N-bit read port, A and B arrive at half the stream rate, so the stream cannot start earlier without a second port or a wider bus (both outside the rules). Prefetching B while the host writes A does not reduce busy cycles, because the prefetch is busy too (see item 10). A larger batch would amortize it, but changes the activation scale and so the numbers (see item 10).
+- The port idles for about the read latency + 3 cycles between two tile loads: about 4 cycles x 36 tiles = 144 cycles, 2.3 per image, 0.5%.
+- The C store and drain of the last tile of each GEMM: about 170 cycles, 2.7 per image, 0.6%.
+
+At N = 8 the whole overhead is 25.4 cycles per image (1.6%).
+
+Host words: 115.5 written (A of both layers, 114 words, and 7 register writes per GEMM) and 72.0 read (C). Reading only the columns of layer 2 that hold outputs (10 of 16) would read 69 words: -1.6% of all host words. Below 2%, not built.
+
+## Questions for owner
+1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host.
+2. Milestone 2 at N = 16: the two B banks use 4,224 RAM16SDP4 (LUT RAM). Moving them to BSRAM would need 128 SDPX9B with the A banks, more than the 118 that the GW5AT-LV60 has. Keep N = 8 for the first bitstream, or keep B in LUT RAM at N = 16?
+3. DSP counts on the gw5a are not known: yosys maps the multipliers to LUTs on that family. Gowin EDA would give the real numbers, but the loop rules forbid installing it.
+4. Milestone 3 (DDR3): the early launch of item 12 assumes a memory that never stalls a read. A DDR controller needs a stall-aware launch check. Plan it for milestone 3?
+5. A larger batch (for example 256) would amortize the first load of each GEMM (about -2.7% cycles at N = 16), but it changes the activation scale per batch, so the predictions can change. Allowed?
