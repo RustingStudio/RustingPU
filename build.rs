@@ -1,6 +1,6 @@
 fn main() {
     let base = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let obj_dir = format!("{}/obj_dir", base);
+    let obj_dir = format!("{}/obj_dir", std::env::var("OUT_DIR").unwrap());
     let verilator_inc = "/usr/share/verilator/include".to_string();
 
     let rtl_files = [

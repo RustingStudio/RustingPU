@@ -173,9 +173,9 @@ impl Rpu {
     pub fn multiply_dyn(&mut self, a: &DynMatrix, b: &DynMatrix) -> Result<DynMatrix, RpuError> {
         assert_eq!(a.cols, b.rows, "A.cols must equal B.rows");
 
-        let m_tiles = (a.rows + TILE - 1) / TILE;
-        let k_tiles = (a.cols + TILE - 1) / TILE;
-        let n_tiles = (b.cols + TILE - 1) / TILE;
+        let m_tiles = a.rows.div_ceil(TILE);
+        let k_tiles = a.cols.div_ceil(TILE);
+        let n_tiles = b.cols.div_ceil(TILE);
 
         let c_stride = n_tiles * TILE;
         let mut c_data = vec![0.0_f32; m_tiles * TILE * c_stride];
@@ -490,6 +490,76 @@ impl Drop for Rpu {
     }
 }
 
+pub trait MatrixElement: Copy {
+    const ZERO: Self;
+
+    fn mul(self, rhs: Self) -> Self;
+    fn add(self, rhs: Self) -> Self;
+
+    fn is_zero(self) -> bool;
+}
+
+impl MatrixElement for f32 {
+    const ZERO: Self = 0.0;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        self * rhs
+    }
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+
+    #[inline]
+    fn is_zero(self) -> bool {
+        self == 0.0
+    }
+}
+
+impl MatrixElement for BFloat16 {
+    const ZERO: Self = BFloat16::ZERO;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        BFloat16::from_f32(self.to_f32() * rhs.to_f32()).unwrap()
+    }
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        BFloat16::from_f32(self.to_f32() + rhs.to_f32()).unwrap()
+    }
+
+    #[inline]
+    fn is_zero(self) -> bool {
+        self == BFloat16::ZERO
+    }
+}
+
+pub fn mat_mul<T: MatrixElement>(
+    a: &[[T; TILE]; TILE],
+    b: &[[T; TILE]; TILE],
+) -> [[T; TILE]; TILE] {
+    let mut out = [[T::ZERO; TILE]; TILE];
+
+    for i in 0..TILE {
+        for k in 0..TILE {
+            let aik = a[i][k];
+
+            if aik.is_zero() {
+                continue;
+            }
+
+            for j in 0..TILE {
+                out[i][j] = out[i][j].add(aik.mul(b[k][j]));
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,74 +720,4 @@ mod tests {
         assert!(rpu.cycles() > 0);
         assert_eq!(rpu.status() & 0b10, 0b10);
     }
-}
-
-pub trait MatrixElement: Copy {
-    const ZERO: Self;
-
-    fn mul(self, rhs: Self) -> Self;
-    fn add(self, rhs: Self) -> Self;
-
-    fn is_zero(self) -> bool;
-}
-
-impl MatrixElement for f32 {
-    const ZERO: Self = 0.0;
-
-    #[inline]
-    fn mul(self, rhs: Self) -> Self {
-        self * rhs
-    }
-
-    #[inline]
-    fn add(self, rhs: Self) -> Self {
-        self + rhs
-    }
-
-    #[inline]
-    fn is_zero(self) -> bool {
-        self == 0.0
-    }
-}
-
-impl MatrixElement for BFloat16 {
-    const ZERO: Self = BFloat16::ZERO;
-
-    #[inline]
-    fn mul(self, rhs: Self) -> Self {
-        BFloat16::from_f32(self.to_f32() * rhs.to_f32()).unwrap()
-    }
-
-    #[inline]
-    fn add(self, rhs: Self) -> Self {
-        BFloat16::from_f32(self.to_f32() + rhs.to_f32()).unwrap()
-    }
-
-    #[inline]
-    fn is_zero(self) -> bool {
-        self == BFloat16::ZERO
-    }
-}
-
-pub fn mat_mul<T: MatrixElement>(
-    a: &[[T; TILE]; TILE],
-    b: &[[T; TILE]; TILE],
-) -> [[T; TILE]; TILE] {
-    let mut out = [[T::ZERO; TILE]; TILE];
-
-    for i in 0..TILE {
-        for k in 0..TILE {
-            let aik = a[i][k];
-
-            if aik.is_zero() {
-                continue;
-            }
-
-            for j in 0..TILE {
-                out[i][j] = out[i][j].add(aik.mul(b[k][j]));
-            }
-        }
-    }
-
-    out
 }
