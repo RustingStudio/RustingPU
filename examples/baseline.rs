@@ -1,6 +1,6 @@
 //! Prints the cycle counts of one tile job, one K = 784 panel job and layer 1 of the MLP
 //! for batch 8 (8x784 x 784x128). See docs/baseline.md and docs/progress.md.
-use hardware_dev::{Rpu, TILE};
+use rusting_pu::{Rpu, TILE};
 
 /// C is stored as 4 beats per row, one beat per cycle.
 const STORE_CYCLES: u32 = 4 * TILE as u32;

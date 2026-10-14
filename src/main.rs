@@ -1,4 +1,4 @@
-use hardware_dev::{quant, Rpu, TILE};
+use rusting_pu::{quant, Rpu, TILE};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpu = Rpu::new()?;

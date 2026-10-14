@@ -69,4 +69,16 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - 15 tests pass at N=8 (latency 1 and 10), N=16 (latency 1 and 10) and N=24. fmt and clippy clean, Icarus PASS. Correction to phase 6: `verilator --lint-only -Wall` was not clean. It flagged `wire_b[N]` as unused (B leaves the bottom row unused). Now silenced with a lint pragma; clean at N=8, 16, 24.
 - `examples/baseline.rs` prints the layer 1 line.
 
+## Phase 8: `brain` feature. Blocked, 2026-10-14
+- Needs `rusting_brain` as an optional dependency (Q3 below). Not started. Phase 9 needs phase 8.
+
+## Phase 10: org readiness. Partial, 2026-10-14
+- Dead RTL deleted (Q5): `bf16_adder`, `bf16_multiplier`, `bf16_systolic_cell`, `dma_streamer`, `rpu_core_2x2/3x3/NxN`, `rpu_orchestrator`, `rpu_orchestrator_3x3/NxN`, `rpu_soc`, `sram`, `systolic_cell`, and testbenches `tb_orch_3x3`, `tb_orchestrator`, `tb_rpu`, `tb_soc`. None were in `build.rs` or the Icarus smoke test. Left: 5 RTL files and `sim/tb_tpu.sv`.
+- Crate renamed `hardware_dev` to `rusting_pu` (Q7). The directory is not renamed.
+- `docs/engineering.md` tracked (Q6). Hint.md is left as it is. The guide keeps Hint.md's sections, but Hint.md describes the deleted BF16 design (`rpu_bf16_soc.sv`, 16-bit bus, BF16 contract). So each section was rewritten for the current int8 design and is not a verbatim copy.
+- Not done: the README (section 5). Its numbers must come from `docs/m1-results.md`, which phase 9 writes.
+- Check: 15 tests pass, fmt and clippy clean, Icarus PASS, lint clean at N=8, 16, 24. A fresh `git clone --branch milestone-1` passes `cargo test --release` (15 tests).
+
 ## Questions for owner
+1. **Q3, still open: `rusting_brain` dependency.** Phases 8, 9 and the README in phase 10 wait on it. May `rusting_pu` take `rusting_brain` as an optional dependency behind a `brain` feature? From where: a path (`../RustingBrain`), git (which URL and rev), or crates.io (`4`)?
+2. **Q4, still open: dataset for phase 9.** The default is the 512 FashionMNIST images already in `~/Code/ai/ml/mllearn/data/FashionMNIST/raw/`, with no download. The plan's phase 9 check uses the full 10k test set. Is the full FashionMNIST test set (10k, already on disk) acceptable? Or download MNIST (~11 MB, never committed)?
