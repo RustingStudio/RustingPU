@@ -1,4 +1,5 @@
-//! Prints the cycle counts of one tile job and one K = 784 panel job. See docs/baseline.md.
+//! Prints the cycle counts of one tile job, one K = 784 panel job and layer 1 of the MLP
+//! for batch 8 (8x784 x 784x128). See docs/baseline.md and docs/progress.md.
 use hardware_dev::{Rpu, TILE};
 
 /// C is stored as 4 beats per row, one beat per cycle.
@@ -27,5 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             total - STORE_CYCLES,
         );
     }
+    let (m, n, k) = (8, 128, 784);
+    let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
+    rpu.matmul_nt_i8(&vec![1; m * k], &vec![1; n * k], m, n, k)?;
+    let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);
+    println!(
+        "layer 1 {m}x{k} x {k}x{n}: busy {busy} cycles, streaming {active} ({:.2}%)",
+        100.0 * f64::from(active) / f64::from(busy)
+    );
     Ok(())
 }

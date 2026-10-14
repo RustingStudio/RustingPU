@@ -4,6 +4,8 @@ pub mod quant;
 pub const TILE: usize = parse_usize(env!("RPU_N"));
 /// Longest K of one panel job. Must match `KMAX` of `rtl/rpu_top.sv`.
 pub const KMAX: usize = 1024;
+/// Size of the RPU memory. Must match `MEM_BYTES` of `rtl/rpu_top.sv`.
+const MEM_BYTES: usize = 1 << 20;
 
 use std::fmt;
 use std::ptr::NonNull;
@@ -36,6 +38,8 @@ const BANK_BEATS: u32 = 2 * PANEL_BEATS + C_BEATS;
 const CONTROL_START: u64 = 0b0001;
 const CONTROL_BANK1: u64 = 0b0010;
 const CONTROL_PRELOAD: u64 = 0b0100;
+/// Load only B: the A panel buffer keeps its contents.
+const CONTROL_KEEP_A: u64 = 0b1000;
 const STATUS_LOAD_BUSY: u64 = 0b0100;
 const STATUS_COMPUTE_BUSY: u64 = 0b1000;
 
@@ -103,7 +107,7 @@ impl Rpu {
         self.read_reg(REG_ACTIVE) as u32
     }
 
-    /// Free-running count of cycles the RPU was busy (load or compute), since reset.
+    /// Free-running count of cycles the RPU was busy (load, compute or C store), since reset.
     pub fn busy_cycles(&self) -> u32 {
         self.read_reg(REG_BUSY) as u32
     }
@@ -119,6 +123,79 @@ impl Rpu {
         self.start(0);
         self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
         Ok(self.read_c(0))
+    }
+
+    /// Int8 NT GEMM `C[i][j] = sum_k A[i][k] * B[j][k]`: A is `m x k`, B is `n x k`, C is
+    /// `m x n`, all row-major. All operands go into external memory first. For each block
+    /// of TILE rows of A, A is loaded once; the B tiles alternate between the two local
+    /// banks, so the load of the next B overlaps the compute of the current one.
+    pub fn matmul_nt_i8(
+        &mut self,
+        a: &[i8],
+        b: &[i8],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<i32>, RpuError> {
+        assert!((1..=KMAX).contains(&k), "k must be in 1..={KMAX}");
+        assert_eq!(a.len(), m * k, "A must be m x k");
+        assert_eq!(b.len(), n * k, "B must be n x k");
+        let (mt, nt) = (m.div_ceil(TILE), n.div_ceil(TILE));
+        let panel = (TILE * k.div_ceil(TILE)) as u32;
+        let (a_base, b_base) = (0, mt as u32 * panel);
+        let c_base = b_base + nt as u32 * panel;
+        let c_tile = |r: usize, j: usize| c_base + (r * nt + j) as u32 * C_BEATS;
+        assert!(
+            (c_tile(mt, 0) * BEAT_WORDS) as usize * 8 <= MEM_BYTES,
+            "GEMM does not fit in RPU memory"
+        );
+        let pad = |x: &[i8], rows: usize| {
+            let mut v = x.to_vec();
+            v.resize(rows * TILE * k, 0);
+            v
+        };
+        self.write_words(a_base, &pack_rows(&pad(a, mt), k));
+        self.write_words(b_base, &pack_rows(&pad(b, nt), k));
+        self.write_reg(REG_K_LEN, k as u64);
+
+        for r in 0..mt {
+            // Tile 0 has no preloaded bank: START loads A and B first.
+            self.write_reg(REG_A_BASE, (a_base + r as u32 * panel).into());
+            self.write_reg(REG_B_BASE, b_base.into());
+            self.write_reg(REG_C_BASE, c_tile(r, 0).into());
+            for j in 0..nt {
+                self.write_control(j % 2, CONTROL_START);
+                self.tick();
+                self.wait_until(|rpu| !rpu.load_busy())?;
+                if j + 1 < nt {
+                    self.write_reg(REG_B_BASE, (b_base + (j + 1) as u32 * panel).into());
+                    self.write_control((j + 1) % 2, CONTROL_PRELOAD | CONTROL_KEEP_A);
+                    // START took the C base already, so this is for the next tile.
+                    self.write_reg(REG_C_BASE, c_tile(r, j + 1).into());
+                }
+                // The C store of this tile overlaps the next compute.
+                self.wait_until(|rpu| !rpu.load_busy() && !rpu.compute_busy())?;
+            }
+        }
+        self.wait_until(Self::done)?;
+
+        let tile_words = (C_BEATS * BEAT_WORDS) as usize;
+        let mut c = vec![0i32; m * n];
+        for r in 0..mt {
+            for j in 0..nt {
+                let words = self.read_words(c_tile(r, j), tile_words);
+                let tile = words
+                    .iter()
+                    .flat_map(|&w| [w as u32 as i32, (w >> 32) as u32 as i32]);
+                for (idx, v) in tile.enumerate() {
+                    let (i, jj) = (r * TILE + idx / TILE, j * TILE + idx % TILE);
+                    if i < m && jj < n {
+                        c[i * n + jj] = v;
+                    }
+                }
+            }
+        }
+        Ok(c)
     }
 
     /// Writes A and B (`TILE x k`) into external `bank` and loads them into the local buffer
@@ -230,19 +307,25 @@ impl Rpu {
     }
 
     fn wait_until_done(&mut self, max_cycles: usize) -> Result<(), RpuError> {
-        for _ in 0..max_cycles {
-            if self.done() {
-                return Ok(());
-            }
-            self.tick();
-        }
-
-        Err(RpuError::Timeout { max_cycles })
+        self.wait_for(max_cycles, Self::done)
     }
 
     fn wait_until_load_idle(&mut self, max_cycles: usize) -> Result<(), RpuError> {
+        self.wait_for(max_cycles, |rpu| !rpu.load_busy())
+    }
+
+    fn wait_until(&mut self, ready: impl Fn(&Self) -> bool) -> Result<(), RpuError> {
+        self.wait_for(Self::MAX_WAIT_CYCLES, ready)
+    }
+
+    /// Ticks until `ready`, checking before each tick.
+    fn wait_for(
+        &mut self,
+        max_cycles: usize,
+        ready: impl Fn(&Self) -> bool,
+    ) -> Result<(), RpuError> {
         for _ in 0..max_cycles {
-            if !self.load_busy() {
+            if ready(self) {
                 return Ok(());
             }
             self.tick();
@@ -298,12 +381,14 @@ mod tests {
     fn preload_overlaps_active_compute() {
         let mut rpu = Rpu::new().unwrap();
         rpu.preload_panel_i8(0, &[1; N2], &[2; N2], TILE).unwrap();
+        // Host writes take a cycle each, so write bank 1 before the compute starts.
+        rpu.write_panel_i8(1, &[3; N2], &[-4; N2], TILE);
         rpu.start(0);
         assert!(rpu.compute_busy());
 
-        rpu.write_panel_i8(1, &[3; N2], &[-4; N2], TILE);
+        // Only B: a new A must not be loaded while a compute runs.
         rpu.configure_bases(1);
-        rpu.write_control(1, CONTROL_PRELOAD);
+        rpu.write_control(1, CONTROL_PRELOAD | CONTROL_KEEP_A);
         rpu.tick();
         assert!(rpu.compute_busy());
         assert!(rpu.load_busy());
@@ -314,7 +399,53 @@ mod tests {
         rpu.wait_until_load_idle(Rpu::MAX_WAIT_CYCLES).unwrap();
         rpu.start(1);
         rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
-        assert_eq!(rpu.read_c(1), vec![-12 * TILE as i32; N2]);
+        assert_eq!(rpu.read_c(1), vec![-4 * TILE as i32; N2]);
+    }
+
+    fn assert_gemm_exact(rpu: &mut Rpu, m: usize, n: usize, k: usize, rng: &mut quant::XorShift) {
+        let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+        let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
+        let got = rpu.matmul_nt_i8(&a, &b, m, n, k).unwrap();
+        assert_eq!(
+            got,
+            quant::matmul_nt_i8(&a, &b, m, n, k),
+            "{m}x{k} x {k}x{n}"
+        );
+    }
+
+    #[test]
+    fn gemm_with_ragged_shapes_is_bit_exact() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0xfeed_0007_d00d_5eed);
+        for (m, n, k) in [
+            (1, 1, 1),
+            // Short K: the next drain must wait for the C store of the tile before.
+            (TILE, 4 * TILE, 1),
+            (TILE, TILE, TILE),
+            (3, 2 * TILE + 5, 9),
+            (2 * TILE + 1, 3 * TILE, 40),
+        ] {
+            assert_gemm_exact(&mut rpu, m, n, k, &mut rng);
+        }
+    }
+
+    /// Plan phase 7 check: layer 1 for batch 8, streaming at least 85% of busy cycles.
+    #[test]
+    fn layer1_batch8_is_bit_exact_and_mostly_streaming() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x1a7e_0001_8888_0784);
+        let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
+        assert_gemm_exact(&mut rpu, 8, 128, 784, &mut rng);
+        let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);
+        let tiles = 8usize.div_ceil(TILE) * 128usize.div_ceil(TILE);
+        assert_eq!(active as usize, tiles * 784);
+        println!("layer 1 batch 8: active {active} / busy {busy} cycles");
+        if TILE == 8 {
+            assert!(
+                active as f64 >= 0.85 * busy as f64,
+                "active {active}, busy {busy}"
+            );
+        }
     }
 
     #[test]

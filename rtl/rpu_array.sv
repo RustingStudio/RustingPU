@@ -18,7 +18,9 @@ module rpu_array #(
     logic [N-1:0][N:0][7:0] b_delay_chain;
 
     logic [N-1:0][N:0][7:0] wire_a;
+    /* verilator lint_off UNUSEDSIGNAL */  // wire_b[N] leaves the bottom row unused
     logic [N:0][N-1:0][7:0] wire_b;
+    /* verilator lint_on UNUSEDSIGNAL */
     logic [N:0][N-1:0][31:0] wire_acc;  // wire_acc[i+1][j] is PE (i, j)
 
     genvar i, j;

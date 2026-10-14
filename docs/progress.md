@@ -56,5 +56,17 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - `build.rs`: `RPU_N` (default 8) and `RPU_READ_LATENCY` (default 1) set `-GN` and `-GREAD_LATENCY`; Rust `TILE` comes from `RPU_N`. The Verilator `obj_dir` is now cleared before each run: a rebuild with N=24 left `Vrpu_top___024root__1.cpp`, which the N=8 build then compiled and failed on.
 - Check: all 13 tests bit-exact (`==`) with READ_LATENCY 1 and 10, at N=8 and N=16; also at N=24 (latency 1). New test `panel_load_moves_one_beat_per_cycle`: preload busy cycles = `2 * N * ceil(K/N) + READ_LATENCY` for K in {1, 9, 784}. Verilator `--lint-only -Wall` clean at N=8, 16, 24. fmt, clippy clean, Icarus PASS.
 - Cycles (`examples/baseline.rs`, N=8): K=784 load A+B **1569** at latency 1 and **1578** at latency 10, that is 784 beats per panel + latency. Compute 809, store 32. N=16: load 1569, compute 833, store 64.
+- Commit: `11fdf7f`.
+
+## Phase 7: overlap and reuse. Done, 2026-10-14
+- `rpu_top`: one local A panel buffer, two B panel buffers (CONTROL bit 1 picks the B bank). New CONTROL bit 3 `KEEP_A`: a load with it fetches only B, so A stays valid across output tiles. The host must not load a new A while a compute runs. Yosys: 8 `row_a` memories (128 x 64 bit) and 8 `row_b` memories (256 x 64 bit), each 1 write and 1 read port.
+- The C store is its own FSM (`store_busy`, STATUS bit 6), so it overlaps the next compute. The next drain waits in SETTLE until the store is done, because it overwrites `mem_c`. `done` = compute finished and store done; `busy` includes the store.
+- Rust `matmul_nt_i8(a, b, m, n, k)`: any m, n (padded to TILE), 1 <= k <= KMAX. It writes A, all B tiles and the C area into memory first (host writes take a cycle each, so writing B during a compute would stall it). Per block of TILE rows of A: START tile 0 (loads A + B), then for each tile it preloads the next B with `KEEP_A` into the other bank, waits for compute and load to finish, and STARTs the next one. All C tiles are read at the end.
+- Check: layer 1 for batch 8 (8x784 x 784x128, random int8) bit-exact (`==`). **active/busy = 12544 / 14575 = 86.07%** at N=8, latency 1 (86.01% at latency 10, busy 14584). Plan target >= 85%: met. Cycles: A+B load 1569 + 16 tiles x 809 compute + 15 x 2 cycles between tiles (CONTROL write, then CLEAR) + last store 32 = 14575.
+- N=16: active/busy = 6272 / 8311 = **75.47%** (75.38% at latency 10). Below 85% because the 1569-cycle first load is spread over only 8 tiles, and the per-tile overhead is 49 cycles (clear 1 + settle 30 + drain 16 + 2). The test asserts the 85% only at N=8.
+- New test `gemm_with_ragged_shapes_is_bit_exact`: shapes (1,1,1), (N,N,N), (3, 2N+5, 9), (2N+1, 3N, 40), and (N, 4N, 1). With K=1 the store is longer than the compute. Removing the SETTLE wait for the store makes this test fail (mutation checked).
+- `preload_overlaps_active_compute` now preloads with `KEEP_A` and writes bank 1's data before START. At N=16 the 64 host-write cycles were longer than the 63-cycle compute, so the test failed once the store left `compute_busy`.
+- 15 tests pass at N=8 (latency 1 and 10), N=16 (latency 1 and 10) and N=24. fmt and clippy clean, Icarus PASS. Correction to phase 6: `verilator --lint-only -Wall` was not clean. It flagged `wire_b[N]` as unused (B leaves the bottom row unused). Now silenced with a lint pragma; clean at N=8, 16, 24.
+- `examples/baseline.rs` prints the layer 1 line.
 
 ## Questions for owner

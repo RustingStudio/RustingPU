@@ -4,6 +4,10 @@
 // each padded to a whole number of beats, k = 0 in the lowest byte. C is stored
 // row-major as int32, 4 beats per row. Base registers hold beat addresses.
 // The host bus has 32-bit addresses and 64-bit data words.
+// There is one A panel buffer and two B panel buffers (CONTROL bank bit). A load with
+// KEEP_A loads only B, so A stays valid across output tiles. The C store runs on its
+// own, overlapping the next compute. The host must not load a new A while a compute
+// runs.
 module rpu_top #(
     parameter int N = 8,
     parameter int KMAX = 1024,
@@ -68,6 +72,7 @@ module rpu_top #(
     logic start_request;
     logic preload_request;
     logic control_bank;
+    logic control_keep_a;
 
     typedef enum logic [2:0] {
         COMPUTE_IDLE,
@@ -75,7 +80,6 @@ module rpu_top #(
         COMPUTE_STREAM,
         COMPUTE_SETTLE,
         COMPUTE_DRAIN,
-        COMPUTE_STORE_C,
         COMPUTE_FINISH
     } compute_state_t;
 
@@ -107,6 +111,8 @@ module rpu_top #(
     logic [RB_W-1:0] stream_beat;
     logic [COL_W-1:0] stream_lane;
     logic [DRAIN_W-1:0] drain_count;
+    logic store_busy;
+    logic [BEAT_ADDR_W-1:0] store_c_base;
     logic [STORE_W-1:0] store_idx;
     logic [COL_W-1:0] store_row;
     logic [1:0] store_part;
@@ -134,10 +140,9 @@ module rpu_top #(
     assign compute_busy = (compute_state == COMPUTE_CLEAR) ||
                           (compute_state == COMPUTE_STREAM) ||
                           (compute_state == COMPUTE_SETTLE) ||
-                          (compute_state == COMPUTE_DRAIN) ||
-                          (compute_state == COMPUTE_STORE_C);
-    assign busy = load_busy || compute_busy;
-    assign done = (compute_state == COMPUTE_FINISH);
+                          (compute_state == COMPUTE_DRAIN);
+    assign busy = load_busy || compute_busy || store_busy;
+    assign done = (compute_state == COMPUTE_FINISH) && !store_busy;
     assign core_reset = reset || (compute_state == COMPUTE_CLEAR);
     assign issue_row_end = int'(issue_k) + N >= int'(load_k_len);
     assign recv_row_end = int'(recv_k) + N >= int'(load_k_len);
@@ -146,19 +151,19 @@ module rpu_top #(
     genvar i;
     generate
         for (i = 0; i < N; i++) begin : panel_row
-            logic [BEAT_W-1:0] row_a [0:1][0:ROW_BEATS-1];
+            logic [BEAT_W-1:0] row_a [0:ROW_BEATS-1];
             logic [BEAT_W-1:0] row_b [0:1][0:ROW_BEATS-1];
             logic [BEAT_W-1:0] beat_a;
             logic [BEAT_W-1:0] beat_b;
 
             always_ff @(posedge clk) begin
                 if (load_busy && dma_rd_resp_valid && recv_row == COL_W'(i)) begin
-                    if (!recv_panel) row_a[load_local_bank][recv_beat] <= dma_rd_data;
+                    if (!recv_panel) row_a[recv_beat] <= dma_rd_data;
                     else row_b[load_local_bank][recv_beat] <= dma_rd_data;
                 end
             end
 
-            assign beat_a = row_a[compute_local_bank][stream_beat];
+            assign beat_a = row_a[stream_beat];
             assign beat_b = row_b[compute_local_bank][stream_beat];
             assign a_flat[i] = (compute_state == COMPUTE_STREAM) ? beat_a[int'(stream_lane)*8 +: 8] : 8'd0;
             assign b_flat[i] = (compute_state == COMPUTE_STREAM) ? beat_b[int'(stream_lane)*8 +: 8] : 8'd0;
@@ -174,8 +179,8 @@ module rpu_top #(
         .c_row(c_row)
     );
 
-    assign dma_wr_valid = (compute_state == COMPUTE_STORE_C);
-    assign dma_wr_addr = compute_c_base + BEAT_ADDR_W'(store_idx);
+    assign dma_wr_valid = store_busy;
+    assign dma_wr_addr = store_c_base + BEAT_ADDR_W'(store_idx);
     assign c_store_row = mem_c[store_row];
     assign dma_wr_data = c_store_row[int'(store_part)*BEAT_W +: BEAT_W];
 
@@ -208,6 +213,7 @@ module rpu_top #(
             start_request <= 1'b0;
             preload_request <= 1'b0;
             control_bank <= 1'b0;
+            control_keep_a <= 1'b0;
         end else begin
             start_request <= 1'b0;
             preload_request <= 1'b0;
@@ -218,6 +224,7 @@ module rpu_top #(
                         start_request <= mem_wdata[0];
                         control_bank <= mem_wdata[1];
                         preload_request <= mem_wdata[2];
+                        control_keep_a <= mem_wdata[3];
                     end
                     REG_A_BASE_ADDR: reg_a_base <= BEAT_ADDR_W'(mem_wdata);
                     REG_B_BASE_ADDR: reg_b_base <= BEAT_ADDR_W'(mem_wdata);
@@ -256,6 +263,8 @@ module rpu_top #(
             stream_beat <= '0;
             stream_lane <= '0;
             drain_count <= '0;
+            store_busy <= 1'b0;
+            store_c_base <= '0;
             store_idx <= '0;
             store_row <= '0;
             store_part <= '0;
@@ -280,11 +289,11 @@ module rpu_top #(
                 // Preload, or START on a bank that is not loaded yet: load first.
                 load_busy <= 1'b1;
                 issue_active <= 1'b1;
-                issue_panel <= 1'b0;
+                issue_panel <= control_keep_a;
                 issue_row <= '0;
                 issue_k <= '0;
-                issue_addr <= reg_a_base;
-                recv_panel <= 1'b0;
+                issue_addr <= control_keep_a ? reg_b_base : reg_a_base;
+                recv_panel <= control_keep_a;
                 recv_row <= '0;
                 recv_beat <= '0;
                 recv_k <= '0;
@@ -380,10 +389,11 @@ module rpu_top #(
                     end
                 end
                 COMPUTE_SETTLE: begin
-                    if (drain_count == SETTLE_LAST) begin
+                    // Wait for the store of the previous tile: the drain overwrites mem_c.
+                    if (drain_count == SETTLE_LAST && !store_busy) begin
                         drain_count <= '0;
                         compute_state <= COMPUTE_DRAIN;
-                    end else begin
+                    end else if (drain_count != SETTLE_LAST) begin
                         drain_count <= drain_count + 1'b1;
                     end
                 end
@@ -391,31 +401,34 @@ module rpu_top #(
                     // The array shifts down each cycle; c_row is row N-1-drain_count.
                     mem_c[COL_LAST - drain_count[COL_W-1:0]] <= c_row;
                     if (drain_count == DRAIN_LAST) begin
+                        store_busy <= 1'b1;
+                        store_c_base <= compute_c_base;
                         store_idx <= '0;
                         store_row <= '0;
                         store_part <= '0;
-                        compute_state <= COMPUTE_STORE_C;
+                        compute_state <= COMPUTE_FINISH;
                     end else begin
                         drain_count <= drain_count + 1'b1;
-                    end
-                end
-                COMPUTE_STORE_C: begin
-                    // One beat per cycle: the memory never stalls a write.
-                    if (store_idx == STORE_LAST) begin
-                        compute_state <= COMPUTE_FINISH;
-                    end
-                    store_idx <= store_idx + 1'b1;
-                    if (store_part == C_ROW_LAST) begin
-                        store_part <= '0;
-                        store_row <= store_row + 1'b1;
-                    end else begin
-                        store_part <= store_part + 1'b1;
                     end
                 end
                 default: begin
                     compute_state <= COMPUTE_IDLE;
                 end
             endcase
+
+            // C store, one beat per cycle: the memory never stalls a write.
+            if (store_busy) begin
+                if (store_idx == STORE_LAST) begin
+                    store_busy <= 1'b0;
+                end
+                store_idx <= store_idx + 1'b1;
+                if (store_part == C_ROW_LAST) begin
+                    store_part <= '0;
+                    store_row <= store_row + 1'b1;
+                end else begin
+                    store_part <= store_part + 1'b1;
+                end
+            end
         end
     end
 
@@ -429,7 +442,8 @@ module rpu_top #(
 
     always_comb begin
         case (mem_addr)
-            REG_STATUS_ADDR: mem_rdata = 64'({local_valid[1], local_valid[0], compute_busy, load_busy, done, busy});
+            REG_STATUS_ADDR: mem_rdata = 64'({store_busy, local_valid[1], local_valid[0],
+                                              compute_busy, load_busy, done, busy});
             REG_A_BASE_ADDR: mem_rdata = 64'(reg_a_base);
             REG_B_BASE_ADDR: mem_rdata = 64'(reg_b_base);
             REG_C_BASE_ADDR: mem_rdata = 64'(reg_c_base);
