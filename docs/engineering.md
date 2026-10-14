@@ -63,7 +63,7 @@ cargo run --release --example baseline  # cycle counts, see docs/progress.md
 Build-time parameters are environment variables read by `build.rs`:
 
 ```bash
-RPU_N=16 cargo test --release            # array size, a multiple of 8 (default 8)
+RPU_N=16 cargo test --release            # array size (default 8)
 RPU_READ_LATENCY=10 cargo test --release # memory read latency in cycles (default 1)
 ```
 
@@ -131,7 +131,7 @@ bit 6 STORE_BUSY      C store running (overlaps the next compute)
 
 ### Memory layout
 
-Memory moves 8*N-bit beats (N int8 values; N/8 host words, lowest word first). Base registers hold beat addresses.
+Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest word first; when N is not a multiple of 8, the top bytes of a beat's last word are padding). Base registers hold beat addresses.
 
 - A and B panels: N rows one after the other. Each row is padded to `ceil(K/N)` beats, with k = 0 in the lowest byte.
 - C tile: row-major int32, 4 beats per row (two int32 per host word, low half first).
@@ -192,7 +192,7 @@ The settle time `2N - 2 + PE_LATENCY` is exact: one cycle shorter loses the last
 
 ## 7. Changing N
 
-N is one build parameter: `RPU_N`. It must be a multiple of 8 (64-bit host words per beat); it does not need to be a power of 2. Tests pass at N = 8, 16 and 24. Resources grow with N^2 (see `docs/resources.md`); at N = 16 the LUT-only mapping is too large for the GW5AT-LV60, so N = 16 needs DSPs.
+N is one build parameter: `RPU_N`. It does not need to be a multiple of 8 or a power of 2: a beat that does not fill its last 64-bit host word is padded in memory. Tests pass at N = 4, 8, 12, 16 and 24. Resources grow with N^2 (see `docs/resources.md`); at N = 16 the LUT-only mapping is too large for the GW5AT-LV60, so N = 16 needs DSPs.
 
 When Verilator reports width warnings after a change, size the counter and its terminal constant with the same `$clog2` width and cast explicitly. Do not disable width warnings globally.
 

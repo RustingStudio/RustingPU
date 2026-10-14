@@ -1,7 +1,9 @@
 // Simulation model of the milestone-2 BSRAM store: BYTES of memory in 8*N-bit beats.
 // Reads are pipelined: one request per cycle, data READ_LATENCY cycles later with
 // rd_resp_valid. Writes take one beat per cycle and never stall. The host port reads
-// and writes 64-bit words; a beat is N/8 words, lowest word first.
+// and writes 64-bit words; a beat is N/8 words rounded up, lowest word first. When N is
+// not a multiple of 8, the top bytes of a beat's last word are padding: reads drop them
+// and DMA writes store zeros there.
 module rpu_sim_memory #(
     parameter int N = 8,
     parameter int BYTES = 1 << 20,
@@ -27,15 +29,22 @@ module rpu_sim_memory #(
     input  logic [8*N-1:0] wr_data
 );
 
-    localparam int BEAT_WORDS = N / 8;
+    localparam int BEAT_WORDS = (N + 7) / 8;
 
     logic [63:0] mem [0:BYTES/8-1];
     logic [READ_LATENCY-1:0] valid_pipe;
     logic [8*N-1:0] data_pipe [0:READ_LATENCY-1];
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic [64*BEAT_WORDS-1:0] rd_words;  // the padding bytes above 8*N are dropped
+    /* verilator lint_on UNUSEDSIGNAL */
+    logic [64*BEAT_WORDS-1:0] wr_words;
 
-    initial begin
-        if (N % 8 != 0) $fatal(1, "rpu_sim_memory: N must be a multiple of 8");
+    always_comb begin
+        for (int w = 0; w < BEAT_WORDS; w++) begin
+            rd_words[w*64 +: 64] = mem[int'(rd_addr) * BEAT_WORDS + w];
+        end
     end
+    assign wr_words = (64*BEAT_WORDS)'(wr_data);
 
     always_ff @(posedge clk) begin
         if (reset) begin
@@ -45,15 +54,13 @@ module rpu_sim_memory #(
             for (int s = 1; s < READ_LATENCY; s++) valid_pipe[s] <= valid_pipe[s-1];
         end
 
-        for (int w = 0; w < BEAT_WORDS; w++) begin
-            data_pipe[0][w*64 +: 64] <= mem[int'(rd_addr) * BEAT_WORDS + w];
-        end
+        data_pipe[0] <= rd_words[8*N-1:0];
         for (int s = 1; s < READ_LATENCY; s++) data_pipe[s] <= data_pipe[s-1];
 
         if (host_we) mem[host_addr] <= host_wdata;
         if (wr_valid) begin
             for (int w = 0; w < BEAT_WORDS; w++) begin
-                mem[int'(wr_addr) * BEAT_WORDS + w] <= wr_data[w*64 +: 64];
+                mem[int'(wr_addr) * BEAT_WORDS + w] <= wr_words[w*64 +: 64];
             end
         end
     end

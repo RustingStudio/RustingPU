@@ -27,12 +27,9 @@ const REG_BUSY: u32 = 7;
 /// Host address of memory word 0. The host bus moves 64-bit words.
 const MEM_BASE: u32 = 0x1000_0000;
 
-/// A memory beat is N int8, so N/8 host words.
-const BEAT_WORDS: u32 = (TILE / 8) as u32;
-const _: () = assert!(
-    TILE.is_multiple_of(8),
-    "the 64-bit host bus needs N to be a multiple of 8"
-);
+/// A memory beat is N int8 in N/8 host words, rounded up: the last word of a beat is
+/// zero-padded when N is not a multiple of 8.
+const BEAT_WORDS: u32 = TILE.div_ceil(8) as u32;
 /// Beats per panel row: each row is padded to a whole number of beats.
 const ROW_BEATS: u32 = KMAX.div_ceil(TILE) as u32;
 const PANEL_BEATS: u32 = TILE as u32 * ROW_BEATS;
@@ -266,11 +263,8 @@ impl Rpu {
         let mut c = vec![0i32; m * n];
         for r in 0..mt {
             for j in 0..nt {
-                let words = self.read_words(c_tile(r, j), tile_words);
-                let tile = words
-                    .iter()
-                    .flat_map(|&w| [w as u32 as i32, (w >> 32) as u32 as i32]);
-                for (idx, v) in tile.enumerate() {
+                let tile = unpack_i32(&self.read_words(c_tile(r, j), tile_words));
+                for (idx, v) in tile.into_iter().enumerate() {
                     let (i, jj) = (r * TILE + idx / TILE, j * TILE + idx % TILE);
                     if i < m && jj < n {
                         c[i * n + jj] = v;
@@ -307,10 +301,7 @@ impl Rpu {
 
     /// Reads the C tile that the last compute on `bank` stored.
     pub fn read_c(&self, bank: usize) -> Vec<i32> {
-        self.read_words(Self::c_base(bank), (C_BEATS * BEAT_WORDS) as usize)
-            .into_iter()
-            .flat_map(|w| [w as u32 as i32, (w >> 32) as u32 as i32])
-            .collect()
+        unpack_i32(&self.read_words(Self::c_base(bank), (C_BEATS * BEAT_WORDS) as usize))
     }
 
     /// Writes the panels and sets K_LEN. Each row is padded to a whole number of beats.
@@ -453,21 +444,31 @@ fn pad_rows(x: &[i8], rows: usize, k: usize) -> Vec<i8> {
     v
 }
 
-/// Packs `k`-long rows into 64-bit host words, each row zero-padded to whole beats.
-/// Value 0 of a word is its low byte.
+/// Packs `k`-long rows into 64-bit host words, each row zero-padded to whole beats and
+/// each beat to whole words. Value 0 of a word is its low byte.
 fn pack_rows(m: &[i8], k: usize) -> Vec<u64> {
-    let row_bytes = k.div_ceil(TILE) * TILE;
     m.chunks_exact(k)
-        .flat_map(|row| {
-            let mut bytes = vec![0u8; row_bytes];
-            for (dst, &v) in bytes.iter_mut().zip(row) {
+        .flat_map(|row| row.chunks(TILE))
+        .flat_map(|beat| {
+            let mut bytes = [0u8; 8 * BEAT_WORDS as usize];
+            for (dst, &v) in bytes.iter_mut().zip(beat) {
                 *dst = v as u8;
             }
-            bytes
-                .chunks_exact(8)
-                .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
-                .collect::<Vec<_>>()
+            (0..BEAT_WORDS as usize)
+                .map(move |w| u64::from_le_bytes(bytes[8 * w..8 * w + 8].try_into().unwrap()))
         })
+        .collect()
+}
+
+/// Reads int32 values back from beats of host words: the first N bytes of each beat.
+fn unpack_i32(words: &[u64]) -> Vec<i32> {
+    let bytes: Vec<u8> = words
+        .chunks_exact(BEAT_WORDS as usize)
+        .flat_map(|beat| beat.iter().flat_map(|w| w.to_le_bytes()).take(TILE))
+        .collect();
+    bytes
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
         .collect()
 }
 
