@@ -76,6 +76,12 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - Sanity against f32 (untrained network, inputs in [0, 1)): argmax agrees on 63/64, max probability difference 0.0013.
 - `data/` (the MNIST download for phase 9) is gitignored.
 
+## Phase 9: MNIST end to end. Done, 2026-10-14
+- `examples/mnist.rs` (needs `--features brain`): trains 784-128-10 with RustingBrain on the CPU (3 epochs, Adam, seeded, 20 s), saves `data/mnist/mnist-784-128-10.json`, and evaluates the 10k test images in f32, host int8 and on the RPU in batches of 64.
+- N = 8: 97.26% on all three paths, 1890.6 cycles per image, 84.63% utilization. N = 16 (same JSON): 97.26% on all three, 545.0 cycles per image, 73.39%. RPU outputs equal host int8 with `==` for every batch. f32 minus int8 is 0.00 pp.
+- Contradiction with the plan: N = 16 is 545 cycles per image, not ~430. The plan's N = 16 estimate leaves out the unoverlapped A + first B load of each row block (1824 cycles per block, 114 per image). Details and the N = 8 breakdown are in `docs/m1-results.md`.
+- Training is reproducible: a second run from scratch wrote a byte-identical JSON.
+
 ## Phase 10: org readiness. Partial, 2026-10-14
 - Dead RTL deleted (Q5): `bf16_adder`, `bf16_multiplier`, `bf16_systolic_cell`, `dma_streamer`, `rpu_core_2x2/3x3/NxN`, `rpu_orchestrator`, `rpu_orchestrator_3x3/NxN`, `rpu_soc`, `sram`, `systolic_cell`, and testbenches `tb_orch_3x3`, `tb_orchestrator`, `tb_rpu`, `tb_soc`. None were in `build.rs` or the Icarus smoke test. Left: 5 RTL files and `sim/tb_tpu.sv`.
 - Crate renamed `hardware_dev` to `rusting_pu` (Q7). The directory is not renamed.
