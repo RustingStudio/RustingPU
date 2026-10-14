@@ -201,7 +201,7 @@ impl Rpu {
             (handle.end() * BEAT_WORDS) as usize * 8 <= MEM_BYTES,
             "B does not fit in RPU memory"
         );
-        self.write_words(base, &pack_rows(&pad_rows(b, n, k), k));
+        self.write_words(base, &pack_panels(&pad_rows(b, n, k), k));
         handle
     }
 
@@ -234,7 +234,7 @@ impl Rpu {
             c_tile(mt, 0) <= b.base || b.end() <= a_base,
             "scratch overlaps B"
         );
-        self.write_words(a_base, &pack_rows(&pad_rows(a, m, k), k));
+        self.write_words(a_base, &pack_panels(&pad_rows(a, m, k), k));
         self.write_reg(REG_K_LEN, k as u64);
         self.write_reg(REG_A_BASE, a_base.into());
         self.write_reg(REG_B_BASE, b_base.into());
@@ -298,8 +298,8 @@ impl Rpu {
         assert_eq!(a.len(), TILE * k, "A must be TILE x k");
         assert_eq!(b.len(), TILE * k, "B must be TILE x k");
         let a_base = Self::a_base(bank);
-        self.write_words(a_base, &pack_rows(a, k));
-        self.write_words(a_base + PANEL_BEATS, &pack_rows(b, k));
+        self.write_words(a_base, &pack_panels(a, k));
+        self.write_words(a_base + PANEL_BEATS, &pack_panels(b, k));
         self.write_reg(REG_K_LEN, k as u64);
     }
 
@@ -432,11 +432,17 @@ fn pad_rows(x: &[i8], rows: usize, k: usize) -> Vec<i8> {
     v
 }
 
-/// Packs `k`-long rows into 64-bit host words, each row zero-padded to whole beats and
-/// each beat to whole words. Value 0 of a word is its low byte.
-fn pack_rows(m: &[i8], k: usize) -> Vec<u64> {
-    m.chunks_exact(k)
-        .flat_map(|row| row.chunks(TILE))
+/// Packs panels of N `k`-long rows into 64-bit host words, column by column: beat c of
+/// rows 0..N-1, then beat c + 1. Each row is zero-padded to whole beats and each beat to
+/// whole words. Value 0 of a word is its low byte.
+fn pack_panels(m: &[i8], k: usize) -> Vec<u64> {
+    let beats = k.div_ceil(TILE);
+    m.chunks_exact(TILE * k)
+        .flat_map(|panel| {
+            (0..beats).flat_map(move |c| {
+                (0..TILE).map(move |r| &panel[r * k + c * TILE..r * k + k.min(c * TILE + TILE)])
+            })
+        })
         .flat_map(|beat| {
             let mut bytes = [0u8; 8 * BEAT_WORDS as usize];
             for (dst, &v) in bytes.iter_mut().zip(beat) {
@@ -653,11 +659,12 @@ mod tests {
             let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);
             println!("{blocks} x {n_tiles} tiles, K = {k}: active {active} / busy {busy} cycles");
             assert_eq!(active as usize, tiles * k);
-            // Idle array cycles: the first A + B load (2K), the last settle, drain and store
-            // (7N), and per tile the read latency of its preload and a few cycles of START
-            // handshake, but no settle or drain per tile and no B load at a row block change.
+            // Idle array cycles: the part of the first A + B load that the first stream does
+            // not overlap (K + 2N), the last settle, drain and store (7N), and per tile the
+            // read latency of its load and a few cycles of START handshake, but no settle or
+            // drain per tile and no B load at a row block change.
             let idle = busy as usize - tiles * k;
-            let bound = 2 * k + latency + 7 * TILE + tiles * (latency + 8);
+            let bound = k + 2 * TILE + latency + 7 * TILE + tiles * (latency + 8);
             assert!(idle <= bound, "{idle} idle cycles, bound {bound}");
         }
     }

@@ -1,7 +1,8 @@
 // RPU top: register file, int8 panel buffers, DMA FSMs and the systolic array.
 // C = A * B^T (NT GEMM) with A and B both N x K_LEN, 1 <= K_LEN <= KMAX.
-// Memory moves 8*N-bit beats (N int8). A and B rows are stored one after the other,
-// each padded to a whole number of beats, k = 0 in the lowest byte. C is stored
+// Memory moves 8*N-bit beats (N int8). An A or B panel is stored column by column: beat
+// column c of rows 0..N-1, then column c + 1; a beat holds k = c*N.. c*N + N-1 of one row,
+// k = c*N in the lowest byte, zero padded past K. C is stored
 // row-major as int32, 4 beats per row. Base registers hold beat addresses.
 // The host bus has 32-bit addresses and 64-bit data words.
 // There are two A panel buffers (CONTROL A bank bit) and two B panel buffers (CONTROL
@@ -9,8 +10,10 @@
 // with KEEP_B loads only A, so a B bank serves the first tile of the next row block. The
 // C store runs on its own, overlapping the next compute. The host must not load A into
 // the A bank of a running compute.
-// CONTROL GEMM runs a whole tiled GEMM: the sequencer issues every START and preload
-// itself, in the order the Rust driver used before (serpentine B tiles, alternating banks).
+// A load walks the columns, so a START that loads its operands begins to stream before
+// the load ends, once the beats it has still to wait for cannot fall behind the stream.
+// CONTROL GEMM runs a whole tiled GEMM: the sequencer issues a START for every tile
+// (serpentine B tiles, alternating banks), each loading what its tile does not share.
 // Each PE keeps its finished sum in a shadow register, so the settle and drain of a tile
 // overlap the stream of the next one. A compute is busy only while it streams.
 module rpu_top #(
@@ -93,13 +96,11 @@ module rpu_top #(
     logic control_a_bank;
     // GEMM sequencer. A blocks at A_BASE + r * PANEL, B tiles at B_BASE + j * PANEL, C tile
     // (r, j) at C_BASE + (r * n_tiles + j) * C_BEATS. The base registers move with it.
-    typedef enum logic [2:0] {
+    typedef enum logic [1:0] {
         SEQ_IDLE,
         SEQ_START,       // START the current tile
         SEQ_STARTED,     // START is taken this cycle
-        SEQ_LOAD_WAIT,   // wait for the load START may have begun, then preload the next tile
-        SEQ_PRELOADED,   // the preload is taken this cycle
-        SEQ_TILE_WAIT    // wait for the stream and the preload
+        SEQ_WAIT         // wait until its load is done and its compute has begun
     } seq_state_t;
     seq_state_t seq_state;
     logic [BEAT_ADDR_W-1:0] reg_panel;
@@ -130,13 +131,15 @@ module rpu_top #(
     drain_state_t drain_state;
 
     // Load: the issue side requests one beat per cycle, the receive side writes each
-    // response into the panel buffers. Both walk A rows, then B rows.
+    // response into the panel buffers. Both walk the beat columns; in each column the A
+    // rows, then the B rows.
     logic load_busy;
     logic issue_active;
     logic issue_panel;  // 0: A, 1: B
     logic [COL_W-1:0] issue_row;
     logic [K_W-1:0] issue_k;  // k of the beat's first value
-    logic [BEAT_ADDR_W-1:0] issue_addr;
+    logic [BEAT_ADDR_W-1:0] issue_a_addr;
+    logic [BEAT_ADDR_W-1:0] issue_b_addr;
     logic recv_panel;
     logic [COL_W-1:0] recv_row;
     logic [RB_W-1:0] recv_beat;
@@ -147,10 +150,18 @@ module rpu_top #(
     logic load_local_bank;
     logic load_a_bank;
     logic load_then_compute;
-    logic load_keep_b;
+    logic load_keep_a;
+    logic load_both;  // A and B
     logic [K_W-1:0] load_k_len;
-    logic [BEAT_ADDR_W-1:0] load_b_base;
-    logic [BEAT_ADDR_W-1:0] load_c_base;
+    // A START waits here for the compute: it may stream once launch_ready is set, either
+    // at the end of its load or once launch_wait beats are left to receive before it.
+    logic launch_valid;
+    logic launch_ready;
+    logic [K_W:0] launch_wait;
+    logic launch_bank;
+    logic launch_a_bank;
+    logic [K_W-1:0] launch_k_len;
+    logic [BEAT_ADDR_W-1:0] launch_c_base;
 
     logic [K_W-1:0] stream_k;
     logic [K_W-1:0] stream_last;
@@ -195,9 +206,10 @@ module rpu_top #(
     assign compute_busy = (compute_state == COMPUTE_CLEAR) ||
                           (compute_state == COMPUTE_STREAM);
     assign drain_busy = drain_state != DRAIN_IDLE;
-    assign busy = load_busy || compute_busy || drain_busy || store_busy || seq_state != SEQ_IDLE;
+    assign busy = load_busy || launch_valid || compute_busy || drain_busy || store_busy ||
+                  seq_state != SEQ_IDLE;
     assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy &&
-                  seq_state == SEQ_IDLE;
+                  !launch_valid && seq_state == SEQ_IDLE;
     assign seq_block_end = seq_back ? (seq_j == 16'd0) : (seq_j == reg_n_tiles - 16'd1);
     assign seq_last = seq_block_end && (seq_r == reg_m_blocks - 16'd1);
     assign stream_last_k = (compute_state == COMPUTE_STREAM) && (stream_k == stream_last);
@@ -266,7 +278,7 @@ module rpu_top #(
         .host_wdata(mem_wdata),
         .host_rdata(host_mem_rdata),
         .rd_valid(issue_active),
-        .rd_addr(issue_addr),
+        .rd_addr(issue_panel ? issue_b_addr : issue_a_addr),
         .rd_resp_valid(dma_rd_resp_valid),
         .rd_data(dma_rd_data),
         .wr_valid(dma_wr_valid),
@@ -302,22 +314,18 @@ module rpu_top #(
                 SEQ_IDLE: begin
                 end
                 SEQ_START: begin
-                    // Tile 0 finds its B bank empty and loads A and B first.
                     start_request <= 1'b1;
-                    control_bank <= seq_bank;
-                    control_a_bank <= seq_r[0];
-                    control_keep_a <= 1'b0;
-                    control_keep_b <= 1'b0;
                     seq_state <= SEQ_STARTED;
                 end
-                SEQ_STARTED: seq_state <= SEQ_LOAD_WAIT;
-                SEQ_LOAD_WAIT: begin
-                    if (!load_busy) begin
+                SEQ_STARTED: seq_state <= SEQ_WAIT;
+                SEQ_WAIT: begin
+                    // The next load may start once this one is done and the compute has
+                    // taken this tile: the B bank and A bank it fills are then free.
+                    if (!load_busy && !launch_valid) begin
                         if (seq_last) begin
                             seq_state <= SEQ_IDLE;
                         end else begin
-                            preload_request <= 1'b1;
-                            seq_state <= SEQ_PRELOADED;
+                            seq_state <= SEQ_START;
                             if (seq_block_end) begin
                                 // Next row block, same B tile and B bank: load only A.
                                 seq_r <= seq_r + 16'd1;
@@ -341,12 +349,6 @@ module rpu_top #(
                         end
                     end
                 end
-                SEQ_PRELOADED: seq_state <= SEQ_TILE_WAIT;
-                SEQ_TILE_WAIT: begin
-                    if (!load_busy && !compute_busy) begin
-                        seq_state <= SEQ_START;
-                    end
-                end
                 default: seq_state <= SEQ_IDLE;
             endcase
 
@@ -360,6 +362,11 @@ module rpu_top #(
                         control_a_bank <= mem_wdata[4];
                         control_keep_b <= mem_wdata[5];
                         if (mem_wdata[6]) begin
+                            // Tile 0 loads A and B into bank 0.
+                            control_bank <= 1'b0;
+                            control_a_bank <= 1'b0;
+                            control_keep_a <= 1'b0;
+                            control_keep_b <= 1'b0;
                             seq_state <= SEQ_START;
                             seq_r <= '0;
                             seq_j <= '0;
@@ -396,7 +403,8 @@ module rpu_top #(
             issue_panel <= 1'b0;
             issue_row <= '0;
             issue_k <= '0;
-            issue_addr <= '0;
+            issue_a_addr <= '0;
+            issue_b_addr <= '0;
             recv_panel <= 1'b0;
             recv_row <= '0;
             recv_beat <= '0;
@@ -404,10 +412,16 @@ module rpu_top #(
             load_local_bank <= 1'b0;
             load_a_bank <= 1'b0;
             load_then_compute <= 1'b0;
-            load_keep_b <= 1'b0;
+            load_keep_a <= 1'b0;
+            load_both <= 1'b0;
             load_k_len <= '0;
-            load_b_base <= '0;
-            load_c_base <= '0;
+            launch_valid <= 1'b0;
+            launch_ready <= 1'b0;
+            launch_wait <= '0;
+            launch_bank <= 1'b0;
+            launch_a_bank <= 1'b0;
+            launch_k_len <= '0;
+            launch_c_base <= '0;
             stream_k <= '0;
             stream_last <= '0;
             stream_beat <= '0;
@@ -435,16 +449,16 @@ module rpu_top #(
                 active_cycles <= active_cycles + 32'd1;
             end
 
-            if ((preload_request || start_request || start) && !load_busy &&
-                (preload_request || !local_valid[control_bank]) &&
-                (preload_request || compute_state == COMPUTE_IDLE || compute_state == COMPUTE_FINISH)) begin
+            if ((preload_request || ((start_request || start) && !launch_valid)) && !load_busy &&
+                (preload_request || !local_valid[control_bank])) begin
                 // Preload, or START on a bank that is not loaded yet: load first.
                 load_busy <= 1'b1;
                 issue_active <= 1'b1;
                 issue_panel <= control_keep_a;
                 issue_row <= '0;
                 issue_k <= '0;
-                issue_addr <= control_keep_a ? reg_b_base : reg_a_base;
+                issue_a_addr <= reg_a_base;
+                issue_b_addr <= reg_b_base;
                 recv_panel <= control_keep_a;
                 recv_row <= '0;
                 recv_beat <= '0;
@@ -452,71 +466,98 @@ module rpu_top #(
                 load_local_bank <= control_bank;
                 load_a_bank <= control_a_bank;
                 load_then_compute <= !preload_request;
-                load_keep_b <= control_keep_b;
+                load_keep_a <= control_keep_a;
+                load_both <= !control_keep_a && !control_keep_b;
                 load_k_len <= reg_k_len;
-                load_b_base <= reg_b_base;
-                load_c_base <= reg_c_base;
                 local_valid[control_bank] <= 1'b0;
                 if (!preload_request) begin
                     cycles <= 32'd0;
-                    compute_state <= COMPUTE_IDLE;
+                    launch_valid <= 1'b1;
+                    launch_ready <= 1'b0;
+                    // Beat b of the load lands at most one cycle after beat b - 1, and the
+                    // stream reads column c from N*c cycles after it starts. Column c is
+                    // complete at beat P*N*(c+1) of a load of P panels, so the stream may
+                    // start once P*N*c + P*N - N*c - 2 beats are in, for the last column
+                    // c = ceil(K/N) - 1: K + 2N - 3 for A and B, N - 2 for one panel. The
+                    // thresholds below leave 3 beats more.
+                    launch_wait <= (!control_keep_a && !control_keep_b)
+                        ? (K_W + 1)'(reg_k_len) + (K_W + 1)'(2 * N) : (K_W + 1)'(N + 1);
+                    launch_bank <= control_bank;
+                    launch_a_bank <= control_a_bank;
+                    launch_k_len <= reg_k_len;
+                    launch_c_base <= reg_c_base;
                 end
-            end else if ((start_request || start) && local_valid[control_bank] &&
-                         (compute_state == COMPUTE_IDLE || compute_state == COMPUTE_FINISH)) begin
+            end else if ((start_request || start) && !launch_valid && local_valid[control_bank]) begin
                 cycles <= 32'd0;
-                compute_state <= COMPUTE_CLEAR;
-                stream_last <= local_k_len[control_bank] - 1'b1;
-                compute_local_bank <= control_bank;
-                compute_a_bank <= control_a_bank;
-                compute_c_base <= reg_c_base;
                 local_valid[control_bank] <= 1'b0;
+                if (compute_state == COMPUTE_IDLE || compute_state == COMPUTE_FINISH) begin
+                    compute_state <= COMPUTE_CLEAR;
+                    stream_last <= local_k_len[control_bank] - 1'b1;
+                    compute_local_bank <= control_bank;
+                    compute_a_bank <= control_a_bank;
+                    compute_c_base <= reg_c_base;
+                end else begin
+                    launch_valid <= 1'b1;
+                    launch_ready <= 1'b1;
+                    launch_bank <= control_bank;
+                    launch_a_bank <= control_a_bank;
+                    launch_k_len <= local_k_len[control_bank];
+                    launch_c_base <= reg_c_base;
+                end
+            end
+
+            if (launch_valid && launch_ready &&
+                (compute_state == COMPUTE_IDLE || compute_state == COMPUTE_FINISH)) begin
+                launch_valid <= 1'b0;
+                compute_state <= COMPUTE_CLEAR;
+                stream_last <= launch_k_len - 1'b1;
+                compute_local_bank <= launch_bank;
+                compute_a_bank <= launch_a_bank;
+                compute_c_base <= launch_c_base;
             end
 
             if (issue_active) begin
-                issue_addr <= issue_addr + 1'b1;
-                if (!issue_row_end) begin
-                    issue_k <= issue_k + K_W'(N);
+                if (issue_panel) issue_b_addr <= issue_b_addr + 1'b1;
+                else issue_a_addr <= issue_a_addr + 1'b1;
+                if (issue_row != COL_LAST) begin
+                    issue_row <= issue_row + 1'b1;
                 end else begin
-                    issue_k <= '0;
-                    if (issue_row != COL_LAST) begin
-                        issue_row <= issue_row + 1'b1;
-                    end else if (!issue_panel && !load_keep_b) begin
-                        issue_row <= '0;
+                    issue_row <= '0;
+                    if (load_both && !issue_panel) begin
                         issue_panel <= 1'b1;
-                        issue_addr <= load_b_base;
-                    end else begin
+                    end else if (issue_row_end) begin
                         issue_active <= 1'b0;
+                    end else begin
+                        issue_panel <= load_keep_a;
+                        issue_k <= issue_k + K_W'(N);
                     end
                 end
             end
 
             if (load_busy && dma_rd_resp_valid) begin
                 // The row buffers in panel_row take dma_rd_data at (recv_row, recv_beat).
-                if (!recv_row_end) begin
-                    recv_k <= recv_k + K_W'(N);
-                    recv_beat <= recv_beat + 1'b1;
+                if (load_then_compute && launch_wait != '0) begin
+                    launch_wait <= launch_wait - 1'b1;
+                    if (launch_wait == (K_W + 1)'(1)) launch_ready <= 1'b1;
+                end
+                if (recv_row != COL_LAST) begin
+                    recv_row <= recv_row + 1'b1;
                 end else begin
-                    recv_k <= '0;
-                    recv_beat <= '0;
-                    if (recv_row != COL_LAST) begin
-                        recv_row <= recv_row + 1'b1;
-                    end else if (!recv_panel && !load_keep_b) begin
-                        recv_row <= '0;
+                    recv_row <= '0;
+                    if (load_both && !recv_panel) begin
                         recv_panel <= 1'b1;
-                    end else begin
+                    end else if (recv_row_end) begin
                         load_busy <= 1'b0;
                         local_k_len[load_local_bank] <= load_k_len;
-                        if (load_then_compute &&
-                            (compute_state == COMPUTE_IDLE || compute_state == COMPUTE_FINISH)) begin
-                            compute_state <= COMPUTE_CLEAR;
-                            stream_last <= load_k_len - 1'b1;
-                            compute_local_bank <= load_local_bank;
-                            compute_a_bank <= load_a_bank;
-                            compute_c_base <= load_c_base;
-                            local_valid[load_local_bank] <= 1'b0;
+                        if (load_then_compute) begin
+                            launch_ready <= 1'b1;
                         end else begin
                             local_valid[load_local_bank] <= 1'b1;
                         end
+                    end else begin
+                        recv_panel <= load_keep_a;
+                        recv_beat <= recv_beat + 1'b1;
+                        recv_k <= recv_k + K_W'(N);
                     end
                 end
             end

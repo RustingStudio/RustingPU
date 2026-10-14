@@ -26,6 +26,9 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 11 GEMM sequencer | 8 | 97.26% | 1643.8 | 97.33% | 115.5 / 72.0 | 5.3 s |
 | 11 GEMM sequencer | 16 | 97.26% | 435.5 | 91.86% | 115.5 / 72.0 | 5.8 s |
 | 11 GEMM sequencer | 12 | 97.26% | 867.7 | 94.61% | 175.3 / 108.1 | 6.9 s |
+| 12 stream during the first load | 8 | 97.26% | 1625.4 | 98.44% | 115.5 / 72.0 | 6.1 s |
+| 12 stream during the first load | 16 | 97.26% | 420.8 | 95.06% | 115.5 / 72.0 | 6.4 s |
+| 12 stream during the first load | 12 | 97.26% | 851.5 | 96.41% | 175.3 / 108.1 | 7.8 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -189,3 +192,26 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
   The LUT drops are ABC9 noise. With the fixed `abc9 -D 50000` flow (item 6), N = 8 gw5a goes from 20,830 to 21,060 LUT (+1.1%); the sequencer costs about 230 LUT, 167 ALU (the counters and base adders) and 85 DFF.
 - Tests: `gemm_writes_its_registers_once` (a 3 x 3 tile GEMM is bit-exact and writes the A words plus 7). All GEMM tests now run through the sequencer, including the idle bound of `next_tile_streams_during_drain`. Mutations, each caught: no direction flip at a row block change fails 4 tests, no B bank flip 2, no KEEP_B at a row block change 1 (the idle bound), a C step of one tile at a row block change 4, the wrong A bank 4, DONE not gated by the sequencer 3, a GEMM that ends after the first row block 4, a next START that does not wait for the preload 1, a sequencer stuck after START 5. All tests pass at N = 4, 8, 12 and 16, READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16) clean.
 - Load: `uptime` 2.7 to 3.2.
+- Commit: `9002fc3`.
+
+## Item 12: stream during the first load of a GEMM. Done, 2026-10-14
+- Profile after item 11 (per batch of 64): the first A + B load of each GEMM is still exposed, 2Kp beats before the first stream (Kp = N * ceil(K/N)): 1,824 cycles at N = 8 and N = 16, 28.5 cycles per image, 6.5% of the cycles at N = 16. Both panels were stored row by row, so the stream had to wait for the last row. Stored column by column, column c of A and B is in after 2N(c + 1) beats while the stream reads it from cycle Nc, so the stream can start after about Kp + N beats and end with the load. Expected about K - 2N cycles less per GEMM: -13 cycles per image, -3% at N = 16 and -0.8% at N = 8.
+- Fix:
+  - `pack_panels` stores every A and B panel column by column (beat c of rows 0..N-1, then beat c + 1), and the load walks the same order: per column the A rows, then the B rows.
+  - A START is held in a launch register until the compute is free and the load is far enough: K + 2N beats in for A and B, N + 1 for one panel, or the load is done. The bound is Kp + N - 2 and N - 2 beats (engineering.md, section 8), so 3 beats of margin; the tests pass with both thresholds 3 lower and fail with 4 lower.
+  - A START is now taken while a compute runs, so the sequencer starts tile t + 1 as soon as the load of t is done and the compute has taken t: one START per tile, no PRELOAD. Tile t + 1 then streams right after t, from a load that may still run.
+- Measured, cycles per image: 1643.8 to 1625.4 at N = 8 (-1.1%), 435.5 to 420.8 at N = 16 (-3.4%), 867.7 to 851.5 at N = 12 (-1.9%). Streaming 97.33% to 98.44%, 91.86% to 95.06%, 94.61% to 96.41%. Accuracy 97.26%, RPU equal to host int8 for every image. Host words unchanged. Layer 1 for batch 8 at N = 8 streams 93.21% of its busy cycles (87.97% before).
+- Wall time 5.3 to 6.1 s and 5.8 to 6.4 s: measured under load 8.4 from another program, not comparable; the simulated work is smaller.
+- Synthesis, `rpu_top`, before (item 11) / after:
+
+  | N | Family | LUT | ALU | DFF | MULT9X9 | SDPX9B (BSRAM) | RAM16SDP4 (LUT RAM) |
+  |---|---|---:|---:|---:|---:|---:|---:|
+  | 8 | gw5a | 25,614 / 22,514 | 3,514 / 3,551 | 7,170 / 7,201 | 0 / 0 | 16 / 16 | 2,112 / 2,112 |
+  | 8 | gw2a | 11,806 / 12,434 | 2,490 / 2,527 | 7,170 / 7,201 | 64 / 64 | 16 / 16 | 2,112 / 2,112 |
+  | 16 | gw5a | 75,375 / 71,739 | 12,720 / 12,755 | 27,153 / 27,186 | 0 / 0 | 64 / 64 | 4,224 / 4,224 |
+  | 16 | gw2a | 28,110 / 29,920 | 8,624 / 8,659 | 27,153 / 27,186 | 256 / 256 | 64 / 64 | 4,224 / 4,224 |
+
+  With the fixed `abc9 -D 50000` flow, N = 8 gw5a goes from 21,060 to 21,104 LUT. The A panels stay in BSRAM: the stream reads one address per row memory per cycle while the load writes another.
+- Caveat: the launch threshold assumes that a load brings one beat per cycle without gaps, which holds for the BSRAM memory of milestone 2. A memory that can stall reads (DDR) needs a stall-aware check.
+- Tests: all GEMM tests run the new order. `next_tile_streams_during_drain` now bounds the first load at K + 2N idle cycles instead of 2K. Mutations, each caught: A rows only in each column fails 15 tests, a receive side or an issue side that returns to A after a B-only column 5 each, no launch at the end of a load (a K that never reaches the threshold) 1, a launch that ignores the threshold 5, no early launch at all 1 (the idle bound), a sequencer that starts the next load before the compute took the tile 1. The threshold sweep: K + 2N - 3 passes, K + 2N - 4 fails; N - 2 passes, N - 3 fails. All tests pass at N = 4, 8, 12 and 16, READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16) clean.
+- Load: `uptime` 8.4 to 9.9 (another program).

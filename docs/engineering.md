@@ -108,7 +108,8 @@ The top-level host port is a synchronous memory-mapped bus with 32-bit word addr
 ### CONTROL bits
 
 ```text
-bit 0 START    compute on the selected banks; if the B bank is not loaded, load first
+bit 0 START    compute on the selected banks; if the B bank is not loaded, load first.
+               Taken while a compute runs: the new compute waits for it
 bit 1 BANK     local B bank 0 or 1
 bit 2 PRELOAD  load into the selected banks; may overlap a compute on the other banks
 bit 3 KEEP_A   the load fetches only B; the A banks keep their contents
@@ -140,7 +141,7 @@ bit 6 STORE_BUSY      C store running (overlaps the next compute)
 
 Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest word first; when N is not a multiple of 8, the top bytes of a beat's last word are padding). Base registers hold beat addresses.
 
-- A and B panels: N rows one after the other. Each row is padded to `ceil(K/N)` beats, with k = 0 in the lowest byte.
+- A and B panels: N rows of `ceil(K/N)` beats each, stored column by column: beat c of rows 0..N-1, then beat c + 1 (`pack_panels`). Beat c of a row holds k = cN .. cN + N - 1, k = cN in the lowest byte, zero padded past K. A load reads one column of A and then the same column of B, so the stream can read column c before the later columns arrive.
 - C tile: row-major int32, 4 beats per row (two int32 per host word, low half first).
 
 Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layout (A, B, C of each bank). `matmul_nt_i8` writes B (all its tiles) from beat 0, then calls `matmul_resident` with the scratch area right after B: all A blocks, then a C area with one tile per output tile. `RpuMlp` uploads each layer's weights once, back to back from beat 0, and puts the scratch area after the last layer; each batch writes only its activations. A `ResidentB` remembers which `Rpu` it was uploaded to, and `matmul_resident` panics if the scratch area overlaps B.
@@ -149,16 +150,22 @@ Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layou
 
 ```text
 load (issue and receive sides, one beat per cycle):
-  A rows (unless KEEP_A) into A bank A_BANK, then B rows (unless KEEP_B) into
-  B bank BANK; the B bank is marked valid at the end,
-  or the compute starts if the load came from START
+  per beat column: the A rows (unless KEEP_A) into A bank A_BANK, then the B
+  rows (unless KEEP_B) into B bank BANK; at the end the B bank is marked
+  valid, unless the load came from START
+
+launch (one START waiting for the compute):
+  a START on a loaded bank, or a START that loads, is held until the compute is
+  IDLE or FINISH and its operands are far enough in: at once for a loaded bank;
+  for a load, once K + 2N beats are in (A and B) or N + 1 (one panel), or at
+  the end of the load (see below)
 
 compute:
   IDLE -> CLEAR   set up the stream; wait while the drain of the tile before
                   could still overwrite this tile's sums (see below)
        -> STREAM  K cycles, one k per cycle from the local panels; the last k
                   carries the last flag
-       -> FINISH  (the next START is accepted from here)
+       -> FINISH  (a held START streams from here)
 
 drain (separate, starts when a STREAM ends):
   IDLE -> SETTLE  OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1 cycles (2N) until the
@@ -224,20 +231,21 @@ When Verilator reports width warnings after a change, size the counter and its t
 tile t = (row block r, B tile j), on A bank r % 2; j runs forwards in even
   row blocks and backwards in odd ones, so the last B of a block is the first
   of the next
-START tile 0                          (loads A0 + B0, then computes)
+START tile 0                          (loads A0 + B0; streams once K + 2N beats are in)
 for each tile t:
-  if tile t+1 is in the same row block: preload its B with KEEP_A into the
-                                        other B bank
-  else:                                 preload A(r+1) with KEEP_B into the
-                                        other A bank; B bank stays
-  (either preload overlaps compute t)
-  wait until the stream of t and the preload are done
+  wait until the load of t is done and the compute has taken t
+  if tile t+1 is in the same row block: START it with KEEP_A on the other
+                                        B bank (loads only its B)
+  else:                                 START it with KEEP_B on the other
+                                        A bank (loads only A(r+1)); B bank stays
+  (the load overlaps the stream of t; t+1 streams when t ends)
   (the settle, drain and store of t overlap the stream of t+1)
-  START tile t+1
 DONE; the host reads all C tiles
 ```
 
-Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 87.97% of its busy cycles at N = 8. The overhead is the first A + B load (1569 cycles), about 6 cycles per tile (the B preload's read latency and the START handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed: at a row block change only the next A loads (K beats, the same as a B preload), because the next block starts with the B tile the block before ended with. Before that order, the next block's A + B load (2K cycles) overlapped one tile (K cycles), and about K cycles per later block stayed exposed (`docs/perf-log.md`, item 9).
+Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 93.21% of its busy cycles at N = 8. The overhead is the part of the first A + B load that the first stream does not overlap (K + 2N beats, about 800 cycles), a few cycles per tile (the read latency of each load and the START handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed: at a row block change only the next A loads (K beats, the same as a B preload), because the next block starts with the B tile the block before ended with. Before that order, the next block's A + B load (2K cycles) overlapped one tile (K cycles), and about K cycles per later block stayed exposed (`docs/perf-log.md`, item 9).
+
+The first stream of a GEMM starts before its load ends (`docs/perf-log.md`, item 12). A load brings one beat per cycle; beat b arrives at most one cycle after beat b - 1, because the issue side never stops and the memory never stalls a read. With A and B, column c is complete at beat 2N(c + 1), and the stream reads it from cycle Nc after it starts, so the stream may start once Kp + N - 2 beats are in, with Kp = N * ceil(K/N) <= K + N - 1. The launch waits for K + 2N beats: 3 more than the worst case. With one panel (KEEP_A or KEEP_B) the bound is N - 2 beats and the launch waits for N + 1. The tests pass with both thresholds 3 lower and fail with 4 lower. **A memory that can stall a read (DDR) breaks this**: it needs a stall-aware check or a launch at the end of the load.
 
 K must fit in one panel (K <= KMAX). Partial sums over K are not split across jobs.
 
