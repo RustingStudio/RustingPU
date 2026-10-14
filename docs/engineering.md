@@ -101,6 +101,8 @@ The top-level host port is a synchronous memory-mapped bus with 32-bit word addr
 | 5 | K_LEN | K of the next load (reset value N) | K_LEN |
 | 6 | ACTIVE | ignored | cycles the array streamed since reset |
 | 7 | BUSY | ignored | cycles busy (load, compute or store) since reset |
+| 8 | PANEL | beats per panel for GEMM: N * ceil(K/N) | 0 |
+| 9 | TILES | GEMM size: row blocks in bits 15:0, B tiles in bits 31:16 | 0 |
 | `0x1000_0000 + w` | memory | 64-bit word w | 64-bit word w |
 
 ### CONTROL bits
@@ -113,7 +115,10 @@ bit 3 KEEP_A   the load fetches only B; the A banks keep their contents
 bit 4 A_BANK   local A bank 0 or 1: the bank a load fills and a compute reads
 bit 5 KEEP_B   the load fetches only A; B bank BANK keeps its contents and is
                marked valid at the end (ignored with KEEP_A)
+bit 6 GEMM     run a whole tiled GEMM (see section 8); write it with no other bit
 ```
+
+During a GEMM the sequencer drives START and PRELOAD itself and moves A_BASE, B_BASE and C_BASE as it goes. **Do not write registers until DONE**: BUSY stays high and DONE low until the last tile is stored.
 
 There are two local A buffers and two local B buffers. A B bank is marked valid when its load ends; the A banks are not tracked. **Never load A into the A bank of a running compute** (a load without KEEP_A and with the same A_BANK): it overwrites the A the compute is reading. `preload_panel_i8` and `start` use the same number for both banks.
 
@@ -122,8 +127,8 @@ Each panel row keeps both A banks in one memory, A bank 1 from beat `ROW_BEATS`.
 ### STATUS bits
 
 ```text
-bit 0 BUSY            load, compute, drain or store running
-bit 1 DONE            compute finished, drained and C stored
+bit 0 BUSY            load, compute, drain, store or GEMM sequencer running
+bit 1 DONE            compute finished, drained and C stored, no GEMM running
 bit 2 LOAD_BUSY
 bit 3 COMPUTE_BUSY    CLEAR or STREAM; the settle and drain after it do not count
 bit 4 LOCAL_VALID_0   bank 0 loaded and not yet computed
@@ -213,10 +218,9 @@ When Verilator reports width warnings after a change, size the counter and its t
 
 ## 8. Scheduling larger matrices
 
-`matmul_nt_i8` keeps the array streaming:
+`matmul_resident` writes the A blocks (B is already resident), then K_LEN, A_BASE, B_BASE, C_BASE (of tile 0), PANEL and TILES, sets CONTROL GEMM and waits for DONE: 7 register writes per GEMM. The A blocks lie PANEL beats apart from A_BASE, the B tiles PANEL beats apart from B_BASE, and C tile (r, j) is at C_BASE + (r * nt + j) * 4N, with nt the B tile count in TILES. The sequencer in `rpu_top.sv` runs the schedule that the Rust driver ran before, with the same cycle count; the driver then wrote about 4 registers per tile (`docs/perf-log.md`, item 11):
 
 ```text
-write A blocks into memory (B is already resident; host writes are slow: do them first)
 tile t = (row block r, B tile j), on A bank r % 2; j runs forwards in even
   row blocks and backwards in odd ones, so the last B of a block is the first
   of the next
@@ -230,10 +234,10 @@ for each tile t:
   wait until the stream of t and the preload are done
   (the settle, drain and store of t overlap the stream of t+1)
   START tile t+1
-wait for DONE, read all C tiles
+DONE; the host reads all C tiles
 ```
 
-Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 87.97% of its busy cycles at N = 8. The overhead is the first A + B load (1569 cycles), about 6 cycles per tile (the B preload's read latency and the host handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed: at a row block change only the next A loads (K beats, the same as a B preload), because the next block starts with the B tile the block before ended with. Before that order, the next block's A + B load (2K cycles) overlapped one tile (K cycles), and about K cycles per later block stayed exposed (`docs/perf-log.md`, item 9).
+Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 87.97% of its busy cycles at N = 8. The overhead is the first A + B load (1569 cycles), about 6 cycles per tile (the B preload's read latency and the START handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed: at a row block change only the next A loads (K beats, the same as a B preload), because the next block starts with the B tile the block before ended with. Before that order, the next block's A + B load (2K cycles) overlapped one tile (K cycles), and about K cycles per later block stayed exposed (`docs/perf-log.md`, item 9).
 
 K must fit in one panel (K <= KMAX). Partial sums over K are not split across jobs.
 

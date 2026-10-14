@@ -9,6 +9,8 @@
 // with KEEP_B loads only A, so a B bank serves the first tile of the next row block. The
 // C store runs on its own, overlapping the next compute. The host must not load A into
 // the A bank of a running compute.
+// CONTROL GEMM runs a whole tiled GEMM: the sequencer issues every START and preload
+// itself, in the order the Rust driver used before (serpentine B tiles, alternating banks).
 // Each PE keeps its finished sum in a shadow register, so the settle and drain of a tile
 // overlap the stream of the next one. A compute is busy only while it streams.
 module rpu_top #(
@@ -67,6 +69,8 @@ module rpu_top #(
     localparam int unsigned REG_K_LEN_ADDR = 5;
     localparam int unsigned REG_ACTIVE_ADDR = 6;
     localparam int unsigned REG_BUSY_ADDR = 7;
+    localparam int unsigned REG_PANEL_ADDR = 8;
+    localparam int unsigned REG_TILES_ADDR = 9;
     localparam int unsigned MEM_BASE_ADDR = 32'h1000_0000;  // in 64-bit words
     localparam int unsigned MEM_WORDS = MEM_BYTES / 8;
 
@@ -87,6 +91,26 @@ module rpu_top #(
     logic control_keep_a;
     logic control_keep_b;
     logic control_a_bank;
+    // GEMM sequencer. A blocks at A_BASE + r * PANEL, B tiles at B_BASE + j * PANEL, C tile
+    // (r, j) at C_BASE + (r * n_tiles + j) * C_BEATS. The base registers move with it.
+    typedef enum logic [2:0] {
+        SEQ_IDLE,
+        SEQ_START,       // START the current tile
+        SEQ_STARTED,     // START is taken this cycle
+        SEQ_LOAD_WAIT,   // wait for the load START may have begun, then preload the next tile
+        SEQ_PRELOADED,   // the preload is taken this cycle
+        SEQ_TILE_WAIT    // wait for the stream and the preload
+    } seq_state_t;
+    seq_state_t seq_state;
+    logic [BEAT_ADDR_W-1:0] reg_panel;
+    logic [15:0] reg_m_blocks;
+    logic [15:0] reg_n_tiles;
+    logic [15:0] seq_r;
+    logic [15:0] seq_j;
+    logic seq_back;  // j runs backwards in this row block
+    logic seq_bank;
+    logic seq_block_end;
+    logic seq_last;
 
     typedef enum logic [1:0] {
         COMPUTE_IDLE,
@@ -171,8 +195,11 @@ module rpu_top #(
     assign compute_busy = (compute_state == COMPUTE_CLEAR) ||
                           (compute_state == COMPUTE_STREAM);
     assign drain_busy = drain_state != DRAIN_IDLE;
-    assign busy = load_busy || compute_busy || drain_busy || store_busy;
-    assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy;
+    assign busy = load_busy || compute_busy || drain_busy || store_busy || seq_state != SEQ_IDLE;
+    assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy &&
+                  seq_state == SEQ_IDLE;
+    assign seq_block_end = seq_back ? (seq_j == 16'd0) : (seq_j == reg_n_tiles - 16'd1);
+    assign seq_last = seq_block_end && (seq_r == reg_m_blocks - 16'd1);
     assign stream_last_k = (compute_state == COMPUTE_STREAM) && (stream_k == stream_last);
     assign issue_row_end = int'(issue_k) + N >= int'(load_k_len);
     assign recv_row_end = int'(recv_k) + N >= int'(load_k_len);
@@ -259,9 +286,69 @@ module rpu_top #(
             control_keep_a <= 1'b0;
             control_keep_b <= 1'b0;
             control_a_bank <= 1'b0;
+            seq_state <= SEQ_IDLE;
+            reg_panel <= '0;
+            reg_m_blocks <= '0;
+            reg_n_tiles <= '0;
+            seq_r <= '0;
+            seq_j <= '0;
+            seq_back <= 1'b0;
+            seq_bank <= 1'b0;
         end else begin
             start_request <= 1'b0;
             preload_request <= 1'b0;
+
+            case (seq_state)
+                SEQ_IDLE: begin
+                end
+                SEQ_START: begin
+                    // Tile 0 finds its B bank empty and loads A and B first.
+                    start_request <= 1'b1;
+                    control_bank <= seq_bank;
+                    control_a_bank <= seq_r[0];
+                    control_keep_a <= 1'b0;
+                    control_keep_b <= 1'b0;
+                    seq_state <= SEQ_STARTED;
+                end
+                SEQ_STARTED: seq_state <= SEQ_LOAD_WAIT;
+                SEQ_LOAD_WAIT: begin
+                    if (!load_busy) begin
+                        if (seq_last) begin
+                            seq_state <= SEQ_IDLE;
+                        end else begin
+                            preload_request <= 1'b1;
+                            seq_state <= SEQ_PRELOADED;
+                            if (seq_block_end) begin
+                                // Next row block, same B tile and B bank: load only A.
+                                seq_r <= seq_r + 16'd1;
+                                seq_back <= !seq_back;
+                                reg_a_base <= reg_a_base + reg_panel;
+                                reg_c_base <= reg_c_base + BEAT_ADDR_W'(reg_n_tiles) * BEAT_ADDR_W'(C_BEATS);
+                                control_a_bank <= !seq_r[0];
+                                control_keep_a <= 1'b0;
+                                control_keep_b <= 1'b1;
+                            end else begin
+                                // Next B tile into the other B bank: load only B.
+                                seq_j <= seq_back ? seq_j - 16'd1 : seq_j + 16'd1;
+                                seq_bank <= !seq_bank;
+                                control_bank <= !seq_bank;
+                                reg_b_base <= seq_back ? reg_b_base - reg_panel : reg_b_base + reg_panel;
+                                reg_c_base <= seq_back ? reg_c_base - BEAT_ADDR_W'(C_BEATS)
+                                                       : reg_c_base + BEAT_ADDR_W'(C_BEATS);
+                                control_keep_a <= 1'b1;
+                                control_keep_b <= 1'b0;
+                            end
+                        end
+                    end
+                end
+                SEQ_PRELOADED: seq_state <= SEQ_TILE_WAIT;
+                SEQ_TILE_WAIT: begin
+                    if (!load_busy && !compute_busy) begin
+                        seq_state <= SEQ_START;
+                    end
+                end
+                default: seq_state <= SEQ_IDLE;
+            endcase
 
             if (mem_we) begin
                 case (mem_addr)
@@ -272,6 +359,18 @@ module rpu_top #(
                         control_keep_a <= mem_wdata[3];
                         control_a_bank <= mem_wdata[4];
                         control_keep_b <= mem_wdata[5];
+                        if (mem_wdata[6]) begin
+                            seq_state <= SEQ_START;
+                            seq_r <= '0;
+                            seq_j <= '0;
+                            seq_back <= 1'b0;
+                            seq_bank <= 1'b0;
+                        end
+                    end
+                    REG_PANEL_ADDR: reg_panel <= BEAT_ADDR_W'(mem_wdata);
+                    REG_TILES_ADDR: begin
+                        reg_m_blocks <= mem_wdata[15:0];
+                        reg_n_tiles <= mem_wdata[31:16];
                     end
                     REG_A_BASE_ADDR: reg_a_base <= BEAT_ADDR_W'(mem_wdata);
                     REG_B_BASE_ADDR: reg_b_base <= BEAT_ADDR_W'(mem_wdata);

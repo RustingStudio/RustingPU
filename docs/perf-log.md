@@ -23,6 +23,9 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 9 serpentine B order | 8 | 97.26% | 1643.8 | 97.34% | 124.3 / 72.0 | 5.2 s |
 | 9 serpentine B order | 16 | 97.26% | 435.4 | 91.87% | 117.6 / 72.0 | 5.7 s |
 | 9 serpentine B order | 12 | 97.26% | 867.7 | 94.62% | 179.6 / 108.1 | 6.9 s |
+| 11 GEMM sequencer | 8 | 97.26% | 1643.8 | 97.33% | 115.5 / 72.0 | 5.3 s |
+| 11 GEMM sequencer | 16 | 97.26% | 435.5 | 91.86% | 115.5 / 72.0 | 5.8 s |
+| 11 GEMM sequencer | 12 | 97.26% | 867.7 | 94.61% | 175.3 / 108.1 | 6.9 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -163,3 +166,26 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
   The RTL change is two flip-flops (the KEEP_B bit and its copy for the running load) and two gates; the LUT differences are ABC9 mapping noise (item 6).
 - Tests: `keep_b_load_fills_only_a` (while B bank 0 computes, a KEEP_B load with B_BASE on another B fills only A bank 1; the next START computes the old B with the new A). `next_tile_streams_during_drain` now also runs a 3 x 3 tile GEMM and checks the same idle bound, which allows no B load at a row block change. Mutations: an issue side that ignores KEEP_B fails 2 tests, a receive side that ignores it fails 3, the forward order in every row block fails 2, a B bank that flips at the row block change fails 2, and a full A + B preload at the row block change fails the idle bound. All tests pass at N = 4, 8, 12 and 16, READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16) clean.
 - Load: `uptime` 3.8 (MNIST).
+- Commit: `d8a3413`.
+
+## Item 10: prefetch the next GEMM's first B tile. Rejected without implementation, 2026-10-14
+- Idea: load the first B tile of layer 2 while layer 1 still runs, so only A of the first tile is exposed.
+- The single read port is busy with a preload during every tile except the last one of a GEMM. The prefetch could only use the last tile of layer 1 and would hide at most one B panel per batch: 256 beats at N = 8, about 4 cycles per image (0.2%). Below the 2% bar, so not built.
+- Also considered and not built: a larger batch (changes quantization, so the numbers would not be comparable), a second read port or a wider bus (breaks the 8N-bit bus rule).
+
+## Item 11: GEMM sequencer. Done, 2026-10-14
+- Profile after item 9 (N = 8, per image): 124.3 host words written. Most are the activations; the per-tile register writes of `matmul_resident` (START, the next B_BASE or A_BASE, the PRELOAD, the next C_BASE: about 4 writes for each of 144 tiles per batch of 64) are about 9. Expected -7% host words written at N = 8 and -2% at N = 16, no change in cycles.
+- Fix: a sequencer in `rpu_top` runs the tile schedule of item 9. The host writes K_LEN, A_BASE, B_BASE, C_BASE, PANEL (word 8, beats per panel), TILES (word 9, row blocks and B tiles) and CONTROL bit 6 (GEMM), and waits for DONE: 7 register writes per GEMM. The sequencer issues START and PRELOAD as the driver did and moves the base registers itself: A and B by PANEL beats, C by one 4N-beat tile within a row block and by a row of tiles at a row block change. BUSY covers the sequencer and DONE waits for it.
+- Measured, host words written per image: 124.3 to 115.5 at N = 8 (-7.1%), 117.6 to 115.5 at N = 16 (-1.8%), 179.6 to 175.3 at N = 12 (-2.4%). Reads unchanged. Cycles per image 1643.8 to 1643.8, 435.4 to 435.5, 867.7 to 867.7: the sequencer takes as many cycles per tile as the polling host (a write is one cycle, a status read takes none), so the handshake did not shrink. Accuracy 97.26%, RPU equal to host int8 for every image.
+- Synthesis, `rpu_top`, before (item 9) / after:
+
+  | N | Family | LUT | ALU | DFF | MULT9X9 | SDPX9B (BSRAM) | RAM16SDP4 (LUT RAM) |
+  |---|---|---:|---:|---:|---:|---:|---:|
+  | 8 | gw5a | 31,728 / 25,614 | 3,347 / 3,514 | 7,085 / 7,170 | 0 / 0 | 16 / 16 | 2,112 / 2,112 |
+  | 8 | gw2a | 12,755 / 11,806 | 2,323 / 2,490 | 7,085 / 7,170 | 64 / 64 | 16 / 16 | 2,112 / 2,112 |
+  | 16 | gw5a | 117,835 / 75,375 | 12,562 / 12,720 | 27,069 / 27,153 | 0 / 0 | 64 / 64 | 4,224 / 4,224 |
+  | 16 | gw2a | 29,320 / 28,110 | 8,466 / 8,624 | 27,069 / 27,153 | 256 / 256 | 64 / 64 | 4,224 / 4,224 |
+
+  The LUT drops are ABC9 noise. With the fixed `abc9 -D 50000` flow (item 6), N = 8 gw5a goes from 20,830 to 21,060 LUT (+1.1%); the sequencer costs about 230 LUT, 167 ALU (the counters and base adders) and 85 DFF.
+- Tests: `gemm_writes_its_registers_once` (a 3 x 3 tile GEMM is bit-exact and writes the A words plus 7). All GEMM tests now run through the sequencer, including the idle bound of `next_tile_streams_during_drain`. Mutations, each caught: no direction flip at a row block change fails 4 tests, no B bank flip 2, no KEEP_B at a row block change 1 (the idle bound), a C step of one tile at a row block change 4, the wrong A bank 4, DONE not gated by the sequencer 3, a GEMM that ends after the first row block 4, a next START that does not wait for the preload 1, a sequencer stuck after START 5. All tests pass at N = 4, 8, 12 and 16, READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16) clean.
+- Load: `uptime` 2.7 to 3.2.

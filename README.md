@@ -27,14 +27,14 @@ RPU_N=16 cargo run --release --features brain --example mnist # N = 16
 host (Rust)                          RPU (SystemVerilog, simulated by Verilator)
   RpuMlp: quantize activations         register file: CONTROL, STATUS, A/B/C base, K
   write A, B to RPU memory  ----bus--> 1 MB memory, 8*N-bit beats
-  start tiles, read C                  load FSM: A panel + two B panels (double-buffered)
+  start the GEMM, read C               load FSM: A panel + two B panels (double-buffered)
   dequantize, bias, ReLU,              N x N array of int8 x int8 -> int32 PEs,
   softmax                              output-stationary, K streamed one per cycle
                                        C drained by shifting rows, stored while the
                                        next tile computes
 ```
 
-The array computes `C[i][j] = sum_k A[i][k] * B[j][k]` for N x K panels, K up to 1024. A weight matrix `[out, in]` is used as B directly. Rust tiles larger matrices: A stays loaded across all output tiles of a row block, and the next B loads while the current tile computes. The full design is in [`docs/engineering.md`](docs/engineering.md).
+The array computes `C[i][j] = sum_k A[i][k] * B[j][k]` for N x K panels, K up to 1024. A weight matrix `[out, in]` is used as B directly. A sequencer in the RPU tiles larger matrices: A stays loaded across all output tiles of a row block, and the next B loads while the current tile computes. The full design is in [`docs/engineering.md`](docs/engineering.md).
 
 ## Build
 

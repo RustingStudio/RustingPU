@@ -24,6 +24,8 @@ const REG_C_BASE: u32 = 4;
 const REG_K_LEN: u32 = 5;
 const REG_ACTIVE: u32 = 6;
 const REG_BUSY: u32 = 7;
+const REG_PANEL: u32 = 8;
+const REG_TILES: u32 = 9;
 /// Host address of memory word 0. The host bus moves 64-bit words.
 const MEM_BASE: u32 = 0x1000_0000;
 
@@ -41,12 +43,13 @@ const BANK_BEATS: u32 = 2 * PANEL_BEATS + C_BEATS;
 const CONTROL_START: u64 = 0b0001;
 const CONTROL_BANK1: u64 = 0b0010;
 const CONTROL_PRELOAD: u64 = 0b0100;
-/// Load only B: the A panel buffer keeps its contents.
-const CONTROL_KEEP_A: u64 = 0b1000;
 /// CONTROL bit 4: the local A bank that a load fills and a compute reads.
 const CONTROL_A_BANK1: u64 = 0b1_0000;
-/// Load only A: the B panel buffer keeps its contents.
+/// Load only A: the B panel buffer keeps its contents. The GEMM sequencer sets it itself.
+#[cfg(test)]
 const CONTROL_KEEP_B: u64 = 0b10_0000;
+/// Run the whole tiled GEMM described by the base, K, PANEL and TILES registers.
+const CONTROL_GEMM: u64 = 0b100_0000;
 const STATUS_LOAD_BUSY: u64 = 0b0100;
 const STATUS_COMPUTE_BUSY: u64 = 0b1000;
 
@@ -236,36 +239,12 @@ impl Rpu {
         self.write_reg(REG_A_BASE, a_base.into());
         self.write_reg(REG_B_BASE, b_base.into());
         self.write_reg(REG_C_BASE, c_tile(0, 0).into());
-        // Tile t is (row block r = t / nt, B tile j), with j running backwards in odd row
-        // blocks. A bank r % 2; the B bank flips with each new B tile and stays at a row
-        // block change. Tile 0 has no preloaded bank: START loads A and B first.
-        let tiles = mt * nt;
-        let tile = |t: usize| {
-            let (r, i) = (t / nt, t % nt);
-            (r, if r % 2 == 0 { i } else { nt - 1 - i })
-        };
-        let mut bank = 0;
-        for t in 0..tiles {
-            let r = t / nt;
-            self.write_control(bank, r % 2, CONTROL_START);
-            self.tick();
-            self.wait_until(|rpu| !rpu.load_busy())?;
-            if t + 1 < tiles {
-                let (r1, j1) = tile(t + 1);
-                if r1 != r {
-                    self.write_reg(REG_A_BASE, (a_base + r1 as u32 * panel).into());
-                    self.write_control(bank, r1 % 2, CONTROL_PRELOAD | CONTROL_KEEP_B);
-                } else {
-                    bank = 1 - bank;
-                    self.write_reg(REG_B_BASE, (b_base + j1 as u32 * panel).into());
-                    self.write_control(bank, r1 % 2, CONTROL_PRELOAD | CONTROL_KEEP_A);
-                }
-                // START took the C base already, so this is for the next tile.
-                self.write_reg(REG_C_BASE, c_tile(r1, j1).into());
-            }
-            // The C store of this tile overlaps the next compute.
-            self.wait_until(|rpu| !rpu.load_busy() && !rpu.compute_busy())?;
-        }
+        // The sequencer walks the tiles in serpentine order: B tile j runs backwards in odd
+        // row blocks, so a row block change keeps its B tile and loads only A.
+        self.write_reg(REG_PANEL, panel.into());
+        self.write_reg(REG_TILES, (mt as u64) | (nt as u64) << 16);
+        self.write_reg(REG_CONTROL, CONTROL_GEMM);
+        self.tick();
         self.wait_until(Self::done)?;
 
         let tile_words = (C_BEATS * BEAT_WORDS) as usize;
@@ -586,6 +565,22 @@ mod tests {
         let _ = rpu.matmul_resident(&[1; TILE * 16], TILE, &handle, handle.end() - 1);
     }
 
+    #[test]
+    fn gemm_writes_its_registers_once() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x5e9_0011_0000_0001);
+        let (m, n, k) = (2 * TILE + 1, 3 * TILE, 40);
+        let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+        let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
+        let handle = rpu.upload_b(0, &b, n, k);
+        let written = rpu.host_words_written();
+        let got = rpu.matmul_resident(&a, m, &handle, handle.end()).unwrap();
+        assert_eq!(got, quant::matmul_nt_i8(&a, &b, m, n, k));
+        // A, then K_LEN, the three bases, PANEL, TILES and CONTROL for all nine tiles.
+        let a_words = 3 * panel_beats(k) * BEAT_WORDS;
+        assert_eq!(rpu.host_words_written() - written, u64::from(a_words) + 7);
+    }
+
     fn assert_gemm_exact(rpu: &mut Rpu, m: usize, n: usize, k: usize, rng: &mut quant::XorShift) {
         let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
         let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
@@ -659,7 +654,7 @@ mod tests {
             println!("{blocks} x {n_tiles} tiles, K = {k}: active {active} / busy {busy} cycles");
             assert_eq!(active as usize, tiles * k);
             // Idle array cycles: the first A + B load (2K), the last settle, drain and store
-            // (7N), and per tile the read latency of its preload and a few cycles of host
+            // (7N), and per tile the read latency of its preload and a few cycles of START
             // handshake, but no settle or drain per tile and no B load at a row block change.
             let idle = busy as usize - tiles * k;
             let bound = 2 * k + latency + 7 * TILE + tiles * (latency + 8);
