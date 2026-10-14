@@ -167,11 +167,12 @@ The settle time `2N - 2 + PE_LATENCY` is exact: one cycle shorter loses the last
 
 ## 5. File overview
 
-- `Cargo.toml`: crate `rusting_pu`, build dependency `cc` only.
+- `Cargo.toml`: crate `rusting_pu`, build dependency `cc`. The optional `brain` feature adds `rusting_brain` (crates.io); the default build has no runtime dependency.
 - `build.rs`: runs Verilator on the five active RTL files with `rpu_top` as top, compiles the generated C++ and the wrapper. Update its file list when RTL files change.
 - `src/lib.rs`: FFI, `Rpu`, memory packing, the GEMM scheduler and the hardware tests.
 - `src/quant.rs`: quantization and the reference int8 GEMM.
-- `src/main.rs`: one-tile demo. `examples/baseline.rs`: cycle counts.
+- `src/brain.rs` (feature `brain`): `RpuMlp`, a RustingBrain dense network with int8 weights; `predict_batch` runs the matmuls on the RPU, `predict_batch_host` on the host reference.
+- `src/main.rs`: one-tile demo. `examples/baseline.rs`: cycle counts. `examples/mnist.rs` (feature `brain`): MNIST end to end, see `docs/m1-results.md`.
 - `verilated_wrapper/`: the C ABI (`rpu_new/free/reset/tick/cycles/write/read/busy/done`). Keep Verilator types out of Rust. When top-level ports change, update the wrapper and the Rust FFI together.
 - `rtl/`: the five active files above. `sim/tb_tpu.sv`: Icarus smoke test. The old BF16 and integer experiments were deleted in phase 10; git history keeps them.
 

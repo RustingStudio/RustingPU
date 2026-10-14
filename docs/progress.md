@@ -82,12 +82,12 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - Contradiction with the plan: N = 16 is 545 cycles per image, not ~430. The plan's N = 16 estimate leaves out the unoverlapped A + first B load of each row block (1824 cycles per block, 114 per image). Details and the N = 8 breakdown are in `docs/m1-results.md`.
 - Training is reproducible: a second run from scratch wrote a byte-identical JSON.
 
-## Phase 10: org readiness. Partial, 2026-10-14
+## Phase 10: org readiness. Done, 2026-10-14
 - Dead RTL deleted (Q5): `bf16_adder`, `bf16_multiplier`, `bf16_systolic_cell`, `dma_streamer`, `rpu_core_2x2/3x3/NxN`, `rpu_orchestrator`, `rpu_orchestrator_3x3/NxN`, `rpu_soc`, `sram`, `systolic_cell`, and testbenches `tb_orch_3x3`, `tb_orchestrator`, `tb_rpu`, `tb_soc`. None were in `build.rs` or the Icarus smoke test. Left: 5 RTL files and `sim/tb_tpu.sv`.
 - Crate renamed `hardware_dev` to `rusting_pu` (Q7). The directory is not renamed.
 - `docs/engineering.md` tracked (Q6). Hint.md is left as it is. The guide keeps Hint.md's sections, but Hint.md describes the deleted BF16 design (`rpu_bf16_soc.sv`, 16-bit bus, BF16 contract). So each section was rewritten for the current int8 design and is not a verbatim copy.
-- Not done: the README (section 5). Its numbers must come from `docs/m1-results.md`, which phase 9 writes.
-- Check: 15 tests pass, fmt and clippy clean, Icarus PASS, lint clean at N=8, 16, 24. A fresh `git clone --branch milestone-1` passes `cargo test --release` (15 tests).
+- README written from the section 5 outline. Every number in it is copied from `docs/m1-results.md`. `docs/engineering.md` now lists `src/brain.rs`, `examples/mnist.rs` and the `brain` feature.
+- Check: 15 tests pass, fmt and clippy clean, Icarus PASS, lint clean at N=8, 16, 24. A fresh `git clone --branch milestone-1` passes `cargo test --release` (15 tests) and `cargo test --release --features brain` (16 tests), checked again after the README commit; the clone has no `data/`.
 
 ## Questions for owner
 None open. Q3 answered 2026-10-14: `rusting_brain` from crates.io, approved. Q4 answered 2026-10-14: download a dataset; MNIST is in the gitignored `data/mnist/`.
