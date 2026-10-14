@@ -4,10 +4,10 @@
 // each padded to a whole number of beats, k = 0 in the lowest byte. C is stored
 // row-major as int32, 4 beats per row. Base registers hold beat addresses.
 // The host bus has 32-bit addresses and 64-bit data words.
-// There is one A panel buffer and two B panel buffers (CONTROL bank bit). A load with
-// KEEP_A loads only B, so A stays valid across output tiles. The C store runs on its
-// own, overlapping the next compute. The host must not load a new A while a compute
-// runs.
+// There are two A panel buffers (CONTROL A bank bit) and two B panel buffers (CONTROL
+// bank bit). A load with KEEP_A loads only B, so A stays valid across output tiles. The
+// C store runs on its own, overlapping the next compute. The host must not load A into
+// the A bank of a running compute.
 module rpu_top #(
     parameter int N = 8,
     parameter int KMAX = 1024,
@@ -40,6 +40,8 @@ module rpu_top #(
     localparam int COL_W = (N > 1) ? $clog2(N) : 1;
     localparam int K_W = $clog2(KMAX + N + 1);       // holds K_LEN and a beat's k + N
     localparam int RB_W = (ROW_BEATS > 1) ? $clog2(ROW_BEATS) : 1;
+    localparam int RA_W = $clog2(2 * ROW_BEATS);    // both A banks in one row memory
+    localparam logic [RA_W-1:0] A_BANK1_BEAT = RA_W'(ROW_BEATS);
     localparam int DRAIN_W = $clog2(SETTLE_STEPS + 1);
     localparam int STORE_W = $clog2(C_BEATS);
     localparam logic [COL_W-1:0] COL_LAST = COL_W'(N - 1);
@@ -73,6 +75,7 @@ module rpu_top #(
     logic preload_request;
     logic control_bank;
     logic control_keep_a;
+    logic control_a_bank;
 
     typedef enum logic [2:0] {
         COMPUTE_IDLE,
@@ -101,6 +104,7 @@ module rpu_top #(
     logic recv_row_end;
 
     logic load_local_bank;
+    logic load_a_bank;
     logic load_then_compute;
     logic [K_W-1:0] load_k_len;
     logic [BEAT_ADDR_W-1:0] load_b_base;
@@ -109,6 +113,9 @@ module rpu_top #(
     logic [K_W-1:0] stream_k;
     logic [K_W-1:0] stream_last;
     logic [RB_W-1:0] stream_beat;
+    // A read address, bank included. One register (not {bank, beat}) so that synthesis
+    // folds it into a synchronous BSRAM read port.
+    logic [RA_W-1:0] stream_a_addr;
     logic [COL_W-1:0] stream_lane;
     logic [DRAIN_W-1:0] drain_count;
     logic store_busy;
@@ -118,6 +125,7 @@ module rpu_top #(
     logic [1:0] store_part;
 
     logic compute_local_bank;
+    logic compute_a_bank;
     logic [BEAT_ADDR_W-1:0] compute_c_base;
     logic local_valid [0:1];
     logic [K_W-1:0] local_k_len [0:1];
@@ -151,19 +159,19 @@ module rpu_top #(
     genvar i;
     generate
         for (i = 0; i < N; i++) begin : panel_row
-            logic [BEAT_W-1:0] row_a [0:ROW_BEATS-1];
+            logic [BEAT_W-1:0] row_a [0:2*ROW_BEATS-1];
             logic [BEAT_W-1:0] row_b [0:1][0:ROW_BEATS-1];
             logic [BEAT_W-1:0] beat_a;
             logic [BEAT_W-1:0] beat_b;
 
             always_ff @(posedge clk) begin
                 if (load_busy && dma_rd_resp_valid && recv_row == COL_W'(i)) begin
-                    if (!recv_panel) row_a[recv_beat] <= dma_rd_data;
+                    if (!recv_panel) row_a[(load_a_bank ? A_BANK1_BEAT : '0) + RA_W'(recv_beat)] <= dma_rd_data;
                     else row_b[load_local_bank][recv_beat] <= dma_rd_data;
                 end
             end
 
-            assign beat_a = row_a[stream_beat];
+            assign beat_a = row_a[stream_a_addr];
             assign beat_b = row_b[compute_local_bank][stream_beat];
             assign a_flat[i] = (compute_state == COMPUTE_STREAM) ? beat_a[int'(stream_lane)*8 +: 8] : 8'd0;
             assign b_flat[i] = (compute_state == COMPUTE_STREAM) ? beat_b[int'(stream_lane)*8 +: 8] : 8'd0;
@@ -214,6 +222,7 @@ module rpu_top #(
             preload_request <= 1'b0;
             control_bank <= 1'b0;
             control_keep_a <= 1'b0;
+            control_a_bank <= 1'b0;
         end else begin
             start_request <= 1'b0;
             preload_request <= 1'b0;
@@ -225,6 +234,7 @@ module rpu_top #(
                         control_bank <= mem_wdata[1];
                         preload_request <= mem_wdata[2];
                         control_keep_a <= mem_wdata[3];
+                        control_a_bank <= mem_wdata[4];
                     end
                     REG_A_BASE_ADDR: reg_a_base <= BEAT_ADDR_W'(mem_wdata);
                     REG_B_BASE_ADDR: reg_b_base <= BEAT_ADDR_W'(mem_wdata);
@@ -254,6 +264,7 @@ module rpu_top #(
             recv_beat <= '0;
             recv_k <= '0;
             load_local_bank <= 1'b0;
+            load_a_bank <= 1'b0;
             load_then_compute <= 1'b0;
             load_k_len <= '0;
             load_b_base <= '0;
@@ -261,6 +272,7 @@ module rpu_top #(
             stream_k <= '0;
             stream_last <= '0;
             stream_beat <= '0;
+            stream_a_addr <= '0;
             stream_lane <= '0;
             drain_count <= '0;
             store_busy <= 1'b0;
@@ -269,6 +281,7 @@ module rpu_top #(
             store_row <= '0;
             store_part <= '0;
             compute_local_bank <= 1'b0;
+            compute_a_bank <= 1'b0;
             compute_c_base <= '0;
             local_valid[0] <= 1'b0;
             local_valid[1] <= 1'b0;
@@ -298,6 +311,7 @@ module rpu_top #(
                 recv_beat <= '0;
                 recv_k <= '0;
                 load_local_bank <= control_bank;
+                load_a_bank <= control_a_bank;
                 load_then_compute <= !preload_request;
                 load_k_len <= reg_k_len;
                 load_b_base <= reg_b_base;
@@ -313,6 +327,7 @@ module rpu_top #(
                 compute_state <= COMPUTE_CLEAR;
                 stream_last <= local_k_len[control_bank] - 1'b1;
                 compute_local_bank <= control_bank;
+                compute_a_bank <= control_a_bank;
                 compute_c_base <= reg_c_base;
                 local_valid[control_bank] <= 1'b0;
             end
@@ -356,6 +371,7 @@ module rpu_top #(
                             compute_state <= COMPUTE_CLEAR;
                             stream_last <= load_k_len - 1'b1;
                             compute_local_bank <= load_local_bank;
+                            compute_a_bank <= load_a_bank;
                             compute_c_base <= load_c_base;
                             local_valid[load_local_bank] <= 1'b0;
                         end else begin
@@ -371,6 +387,7 @@ module rpu_top #(
                 COMPUTE_CLEAR: begin
                     stream_k <= '0;
                     stream_beat <= '0;
+                    stream_a_addr <= compute_a_bank ? A_BANK1_BEAT : '0;
                     stream_lane <= '0;
                     drain_count <= '0;
                     compute_state <= COMPUTE_STREAM;
@@ -383,6 +400,7 @@ module rpu_top #(
                         if (stream_lane == COL_LAST) begin
                             stream_lane <= '0;
                             stream_beat <= stream_beat + 1'b1;
+                            stream_a_addr <= stream_a_addr + 1'b1;
                         end else begin
                             stream_lane <= stream_lane + 1'b1;
                         end

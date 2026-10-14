@@ -46,6 +46,8 @@ const CONTROL_BANK1: u64 = 0b0010;
 const CONTROL_PRELOAD: u64 = 0b0100;
 /// Load only B: the A panel buffer keeps its contents.
 const CONTROL_KEEP_A: u64 = 0b1000;
+/// CONTROL bit 4: the local A bank that a load fills and a compute reads.
+const CONTROL_A_BANK1: u64 = 0b1_0000;
 const STATUS_LOAD_BUSY: u64 = 0b0100;
 const STATUS_COMPUTE_BUSY: u64 = 0b1000;
 
@@ -203,8 +205,10 @@ impl Rpu {
 
     /// The GEMM of [`Rpu::matmul_nt_i8`] with B already in RPU memory. A and the C tiles go
     /// to memory from beat `scratch`, which must not overlap B. For each block of TILE rows
-    /// of A, A is loaded once; the B tiles alternate between the two local banks, so the
-    /// load of the next B overlaps the compute of the current one.
+    /// of A, A is loaded once. Each tile's load overlaps the compute of the tile before it:
+    /// the B tiles alternate between the two local B banks, and the row blocks between the
+    /// two local A banks, so the last tile of a block computes while the next block's A and
+    /// first B load.
     pub fn matmul_resident(
         &mut self,
         a: &[i8],
@@ -230,24 +234,31 @@ impl Rpu {
         );
         self.write_words(a_base, &pack_rows(&pad_rows(a, m, k), k));
         self.write_reg(REG_K_LEN, k as u64);
-        for r in 0..mt {
-            // Tile 0 has no preloaded bank: START loads A and B first.
-            self.write_reg(REG_A_BASE, (a_base + r as u32 * panel).into());
-            self.write_reg(REG_B_BASE, b_base.into());
-            self.write_reg(REG_C_BASE, c_tile(r, 0).into());
-            for j in 0..nt {
-                self.write_control(j % 2, CONTROL_START);
-                self.tick();
-                self.wait_until(|rpu| !rpu.load_busy())?;
-                if j + 1 < nt {
-                    self.write_reg(REG_B_BASE, (b_base + (j + 1) as u32 * panel).into());
-                    self.write_control((j + 1) % 2, CONTROL_PRELOAD | CONTROL_KEEP_A);
-                    // START took the C base already, so this is for the next tile.
-                    self.write_reg(REG_C_BASE, c_tile(r, j + 1).into());
+        self.write_reg(REG_A_BASE, a_base.into());
+        self.write_reg(REG_B_BASE, b_base.into());
+        self.write_reg(REG_C_BASE, c_tile(0, 0).into());
+        // Tile t is (row block t / nt, B tile t % nt), on B bank t % 2 and A bank r % 2.
+        // Tile 0 has no preloaded bank: START loads A and B first.
+        let tiles = mt * nt;
+        for t in 0..tiles {
+            let r = t / nt;
+            self.write_control(t % 2, r % 2, CONTROL_START);
+            self.tick();
+            self.wait_until(|rpu| !rpu.load_busy())?;
+            if t + 1 < tiles {
+                let (r1, j1) = ((t + 1) / nt, (t + 1) % nt);
+                let mut flags = CONTROL_PRELOAD | CONTROL_KEEP_A;
+                if r1 != r {
+                    self.write_reg(REG_A_BASE, (a_base + r1 as u32 * panel).into());
+                    flags = CONTROL_PRELOAD;
                 }
-                // The C store of this tile overlaps the next compute.
-                self.wait_until(|rpu| !rpu.load_busy() && !rpu.compute_busy())?;
+                self.write_reg(REG_B_BASE, (b_base + j1 as u32 * panel).into());
+                self.write_control((t + 1) % 2, r1 % 2, flags);
+                // START took the C base already, so this is for the next tile.
+                self.write_reg(REG_C_BASE, c_tile(r1, j1).into());
             }
+            // The C store of this tile overlaps the next compute.
+            self.wait_until(|rpu| !rpu.load_busy() && !rpu.compute_busy())?;
         }
         self.wait_until(Self::done)?;
 
@@ -270,8 +281,9 @@ impl Rpu {
         Ok(c)
     }
 
-    /// Writes A and B (`TILE x k`) into external `bank` and loads them into the local buffer
-    /// of the same bank. Returns once the load is done; a compute on the other bank may run.
+    /// Writes A and B (`TILE x k`) into external `bank` and loads them into the local A and B
+    /// banks of the same number. Returns once the load is done; a compute on the other bank
+    /// may run.
     pub fn preload_panel_i8(
         &mut self,
         bank: usize,
@@ -281,7 +293,7 @@ impl Rpu {
     ) -> Result<(), RpuError> {
         self.write_panel_i8(bank, a, b, k);
         self.configure_bases(bank);
-        self.write_control(bank, CONTROL_PRELOAD);
+        self.write_control(bank, bank, CONTROL_PRELOAD);
         self.tick();
         self.wait_until_load_idle(Self::MAX_WAIT_CYCLES)
     }
@@ -289,7 +301,7 @@ impl Rpu {
     /// Starts the compute on local `bank`. Without a preloaded bank, the RPU loads first.
     pub fn start(&mut self, bank: usize) {
         self.configure_bases(bank);
-        self.write_control(bank, CONTROL_START);
+        self.write_control(bank, bank, CONTROL_START);
         self.tick();
     }
 
@@ -350,9 +362,11 @@ impl Rpu {
         self.write_reg(REG_C_BASE, Self::c_base(bank).into());
     }
 
-    fn write_control(&mut self, bank: usize, flags: u64) {
+    /// Writes CONTROL with local B bank `bank` and local A bank `a_bank`.
+    fn write_control(&mut self, bank: usize, a_bank: usize, flags: u64) {
         let bank_flag = if bank == 0 { 0 } else { CONTROL_BANK1 };
-        self.write_reg(REG_CONTROL, flags | bank_flag);
+        let a_flag = if a_bank == 0 { 0 } else { CONTROL_A_BANK1 };
+        self.write_reg(REG_CONTROL, flags | bank_flag | a_flag);
     }
 
     fn a_base(bank: usize) -> u32 {
@@ -482,27 +496,30 @@ mod tests {
 
     #[test]
     fn preload_overlaps_active_compute() {
+        const K: usize = 3 * TILE;
         let mut rpu = Rpu::new().unwrap();
-        rpu.preload_panel_i8(0, &[1; N2], &[2; N2], TILE).unwrap();
+        rpu.preload_panel_i8(0, &[1; TILE * K], &[2; TILE * K], K)
+            .unwrap();
         // Host writes take a cycle each, so write bank 1 before the compute starts.
-        rpu.write_panel_i8(1, &[3; N2], &[-4; N2], TILE);
+        rpu.write_panel_i8(1, &[3; TILE * K], &[-4; TILE * K], K);
         rpu.start(0);
         assert!(rpu.compute_busy());
 
-        // Only B: a new A must not be loaded while a compute runs.
+        // A and B: the new A goes to A bank 1 and must not touch the A of the running
+        // compute.
         rpu.configure_bases(1);
-        rpu.write_control(1, CONTROL_PRELOAD | CONTROL_KEEP_A);
+        rpu.write_control(1, 1, CONTROL_PRELOAD);
         rpu.tick();
         assert!(rpu.compute_busy());
         assert!(rpu.load_busy());
 
         rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
-        assert_eq!(rpu.read_c(0), vec![2 * TILE as i32; N2]);
+        assert_eq!(rpu.read_c(0), vec![2 * K as i32; N2]);
 
         rpu.wait_until_load_idle(Rpu::MAX_WAIT_CYCLES).unwrap();
         rpu.start(1);
         rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
-        assert_eq!(rpu.read_c(1), vec![-4 * TILE as i32; N2]);
+        assert_eq!(rpu.read_c(1), vec![-12 * K as i32; N2]);
     }
 
     #[test]
@@ -553,6 +570,8 @@ mod tests {
             (TILE, TILE, TILE),
             (3, 2 * TILE + 5, 9),
             (2 * TILE + 1, 3 * TILE, 40),
+            // One B tile: every tile after the first preloads a new A.
+            (3 * TILE, 5, 30),
         ] {
             assert_gemm_exact(&mut rpu, m, n, k, &mut rng);
         }

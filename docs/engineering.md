@@ -106,13 +106,16 @@ The top-level host port is a synchronous memory-mapped bus with 32-bit word addr
 ### CONTROL bits
 
 ```text
-bit 0 START    compute on the selected bank; if it is not loaded, load first
-bit 1 BANK     local bank 0 or 1 (selects the B buffer)
-bit 2 PRELOAD  load into the selected bank; may overlap a compute on the other bank
-bit 3 KEEP_A   the load fetches only B; the A buffer keeps its contents
+bit 0 START    compute on the selected banks; if the B bank is not loaded, load first
+bit 1 BANK     local B bank 0 or 1
+bit 2 PRELOAD  load into the selected banks; may overlap a compute on the other banks
+bit 3 KEEP_A   the load fetches only B; the A banks keep their contents
+bit 4 A_BANK   local A bank 0 or 1: the bank a load fills and a compute reads
 ```
 
-There is one local A buffer and two local B buffers. **Never load a new A (a load without KEEP_A) while a compute runs**: it overwrites the A the compute is reading.
+There are two local A buffers and two local B buffers. A B bank is marked valid when its load ends; the A banks are not tracked. **Never load A into the A bank of a running compute** (a load without KEEP_A and with the same A_BANK): it overwrites the A the compute is reading. `preload_panel_i8` and `start` use the same number for both banks.
+
+Each panel row keeps both A banks in one memory, A bank 1 from beat `ROW_BEATS`. The A read address is one register (`stream_a_addr`), so yosys folds it into a synchronous BSRAM read port. An address made of two registers with different enables (`{bank, beat}`) is not folded and the memory goes to LUT RAM; the B panels are mapped that way today (see `docs/perf-log.md`, item 3).
 
 ### STATUS bits
 
@@ -139,7 +142,8 @@ Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layou
 
 ```text
 load (issue and receive sides, one beat per cycle):
-  A rows (unless KEEP_A), then B rows; the bank is marked valid at the end,
+  A rows (unless KEEP_A) into A bank A_BANK, then B rows into B bank BANK; the
+  B bank is marked valid at the end,
   or the compute starts if the load came from START
 
 compute:
@@ -198,16 +202,18 @@ When Verilator reports width warnings after a change, size the counter and its t
 
 ```text
 write A blocks into memory (B is already resident; host writes are slow: do them first)
-for each block of N rows of A:
-  START tile 0 on bank 0              (loads A + B0, then computes)
-  for each output tile j:
-    preload B(j+1) with KEEP_A into the other bank (overlaps compute j)
-    wait until compute j and the preload are done (store j overlaps compute j+1)
-    START tile j+1 on the other bank
+tile t = (row block r, B tile j), on B bank t % 2 and A bank r % 2
+START tile 0                          (loads A0 + B0, then computes)
+for each tile t:
+  if tile t+1 is in the same row block: preload B(j+1) with KEEP_A
+  else:                                 preload A(r+1) + B0 into the other A bank
+  (either preload overlaps compute t)
+  wait until compute t and the preload are done (store t overlaps compute t+1)
+  START tile t+1
 wait for DONE, read all C tiles
 ```
 
-Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 86.07% of its busy cycles at N = 8. The first A + B load (1569 cycles) and 25 cycles per tile (clear, settle, drain) are the overhead.
+Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 86.07% of its busy cycles at N = 8. The first A + B load (1569 cycles) and 25 cycles per tile (clear, settle, drain) are the overhead. With more than one row block, only the first block's A + B load is exposed in full; the next block's A + B load (2K cycles) overlaps the last tile of the block before (K + clear, settle and drain), so about K cycles per later block stay exposed. One read port moves one beat per cycle, so a B load already takes as long as a tile's stream: the A load cannot hide completely.
 
 K must fit in one panel (K <= KMAX). Partial sums over K are not split across jobs.
 

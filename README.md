@@ -54,7 +54,7 @@ The MNIST example reads the four unpacked IDX files from `data/mnist/` (not in t
 - INT8 matmul only. Bias, ReLU, softmax and quantization run on the host. No convolution, no BF16 or FP32.
 - K is at most 1024 per panel; partial sums over K are not split across jobs.
 - All operands must fit in the 1 MB RPU memory.
-- One A buffer: the first load of each block of N rows of A does not overlap compute. That is most of the gap between busy and streaming cycles.
+- The first A + B load of each GEMM overlaps no compute, and each later block of N rows of A exposes about K cycles of its load: one read port moves one beat per cycle. Numbers after milestone 1 are in [`docs/perf-log.md`](docs/perf-log.md).
 
 ## Roadmap
 
