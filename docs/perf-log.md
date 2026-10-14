@@ -20,6 +20,9 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 6 operand register | 16 | 97.26% | 478.0 | 83.68% | 117.7 / 72.0 | 17.7 s |
 | 8 simulation speed | 8 | 97.26% | 1743.2 | 91.78% | 124.5 / 72.0 | 5.5 s |
 | 8 simulation speed | 16 | 97.26% | 478.0 | 83.68% | 117.7 / 72.0 | 6.1 s |
+| 9 serpentine B order | 8 | 97.26% | 1643.8 | 97.34% | 124.3 / 72.0 | 5.2 s |
+| 9 serpentine B order | 16 | 97.26% | 435.4 | 91.87% | 117.6 / 72.0 | 5.7 s |
+| 9 serpentine B order | 12 | 97.26% | 867.7 | 94.62% | 179.6 / 108.1 | 6.9 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -141,3 +144,22 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 - Simulated cycles, accuracy and host words are unchanged (1743.2 and 478.0 cycles per image, 97.26%, RPU equal to host int8 for every image).
 - Tests: all pass at N = 8 and 16, READ_LATENCY 1 and 10. Mutation: `rpu_read` that never evaluates after changing the address fails 5 tests.
 - Load: `uptime` 2.1 to 3.5.
+- Commit: `bac9d6e`.
+
+## Item 9: serpentine B order at a row block change. Done, 2026-10-14
+- Profile after item 8 (N = 16, batch 64, per batch): 4,992 busy cycles are not streaming. About 1,830 are the first A + B load of each layer, about 2,440 are the exposed part of the A + B load at each of the 6 later row block changes (2K beats overlapping one K-cycle tile, item 3), about 216 the per-tile handshake and about 140 the last settle, drain and store of each layer. At N = 8 the row block changes are about 6,030 of 9,150. So the row block change was the largest item: expected -38 cycles per image at N = 16 (-8%) and -94 at N = 8 (-5.4%).
+- Fix: odd row blocks walk the B tiles backwards, so a row block starts with the B tile the block before ended with, and that B is still in its bank. A new CONTROL bit 5 (KEEP_B) loads only A; the B bank keeps its contents and is marked valid at the end of the load. At a row block change, `matmul_resident` preloads only the next A (K beats, as long as a B preload) into the other A bank, on the B bank of the running tile, and the next START computes at once. The C tiles keep their places, so the results are in the same order.
+- Measured, cycles per image: 1743.2 to 1643.8 at N = 8 (-5.7%), 478.0 to 435.4 at N = 16 (-8.9%), 939.7 (item 5) to 867.7 at N = 12 (-7.7%). Streaming 91.78% to 97.34%, 83.68% to 91.87%, 87.36% to 94.62%. Accuracy 97.26%, RPU equal to host int8 for every image. Host words written 124.5 to 124.3 and 117.7 to 117.6 (no B_BASE write at a row block change); reads unchanged.
+- What is left per batch: the first A + B load of each layer (1,824 cycles: 28.5 cycles per image, 1.7% at N = 8 and 6.5% at N = 16), about 6 cycles of handshake per tile, and the last settle, drain and store of each layer.
+- Synthesis, `rpu_top` (same command as item 3), before (item 6) / after:
+
+  | N | Family | LUT | ALU | DFF | MULT9X9 | SDPX9B (BSRAM) | RAM16SDP4 (LUT RAM) |
+  |---|---|---:|---:|---:|---:|---:|---:|
+  | 8 | gw5a | 35,155 / 31,728 | 3,347 / 3,347 | 7,083 / 7,085 | 0 / 0 | 16 / 16 | 2,112 / 2,112 |
+  | 8 | gw2a | 12,762 / 12,755 | 2,323 / 2,323 | 7,083 / 7,085 | 64 / 64 | 16 / 16 | 2,112 / 2,112 |
+  | 16 | gw5a | 117,706 / 117,835 | 12,562 / 12,562 | 27,067 / 27,069 | 0 / 0 | 64 / 64 | 4,224 / 4,224 |
+  | 16 | gw2a | 29,851 / 29,320 | 8,466 / 8,466 | 27,067 / 27,069 | 256 / 256 | 64 / 64 | 4,224 / 4,224 |
+
+  The RTL change is two flip-flops (the KEEP_B bit and its copy for the running load) and two gates; the LUT differences are ABC9 mapping noise (item 6).
+- Tests: `keep_b_load_fills_only_a` (while B bank 0 computes, a KEEP_B load with B_BASE on another B fills only A bank 1; the next START computes the old B with the new A). `next_tile_streams_during_drain` now also runs a 3 x 3 tile GEMM and checks the same idle bound, which allows no B load at a row block change. Mutations: an issue side that ignores KEEP_B fails 2 tests, a receive side that ignores it fails 3, the forward order in every row block fails 2, a B bank that flips at the row block change fails 2, and a full A + B preload at the row block change fails the idle bound. All tests pass at N = 4, 8, 12 and 16, READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16) clean.
+- Load: `uptime` 3.8 (MNIST).

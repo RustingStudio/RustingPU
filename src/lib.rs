@@ -45,6 +45,8 @@ const CONTROL_PRELOAD: u64 = 0b0100;
 const CONTROL_KEEP_A: u64 = 0b1000;
 /// CONTROL bit 4: the local A bank that a load fills and a compute reads.
 const CONTROL_A_BANK1: u64 = 0b1_0000;
+/// Load only A: the B panel buffer keeps its contents.
+const CONTROL_KEEP_B: u64 = 0b10_0000;
 const STATUS_LOAD_BUSY: u64 = 0b0100;
 const STATUS_COMPUTE_BUSY: u64 = 0b1000;
 
@@ -204,8 +206,8 @@ impl Rpu {
     /// to memory from beat `scratch`, which must not overlap B. For each block of TILE rows
     /// of A, A is loaded once. Each tile's load overlaps the compute of the tile before it:
     /// the B tiles alternate between the two local B banks, and the row blocks between the
-    /// two local A banks, so the last tile of a block computes while the next block's A and
-    /// first B load.
+    /// two local A banks. Every other row block walks the B tiles backwards, so the first
+    /// tile of a block uses the B of the last tile before it, and only the next A loads.
     pub fn matmul_resident(
         &mut self,
         a: &[i8],
@@ -234,23 +236,30 @@ impl Rpu {
         self.write_reg(REG_A_BASE, a_base.into());
         self.write_reg(REG_B_BASE, b_base.into());
         self.write_reg(REG_C_BASE, c_tile(0, 0).into());
-        // Tile t is (row block t / nt, B tile t % nt), on B bank t % 2 and A bank r % 2.
-        // Tile 0 has no preloaded bank: START loads A and B first.
+        // Tile t is (row block r = t / nt, B tile j), with j running backwards in odd row
+        // blocks. A bank r % 2; the B bank flips with each new B tile and stays at a row
+        // block change. Tile 0 has no preloaded bank: START loads A and B first.
         let tiles = mt * nt;
+        let tile = |t: usize| {
+            let (r, i) = (t / nt, t % nt);
+            (r, if r % 2 == 0 { i } else { nt - 1 - i })
+        };
+        let mut bank = 0;
         for t in 0..tiles {
             let r = t / nt;
-            self.write_control(t % 2, r % 2, CONTROL_START);
+            self.write_control(bank, r % 2, CONTROL_START);
             self.tick();
             self.wait_until(|rpu| !rpu.load_busy())?;
             if t + 1 < tiles {
-                let (r1, j1) = ((t + 1) / nt, (t + 1) % nt);
-                let mut flags = CONTROL_PRELOAD | CONTROL_KEEP_A;
+                let (r1, j1) = tile(t + 1);
                 if r1 != r {
                     self.write_reg(REG_A_BASE, (a_base + r1 as u32 * panel).into());
-                    flags = CONTROL_PRELOAD;
+                    self.write_control(bank, r1 % 2, CONTROL_PRELOAD | CONTROL_KEEP_B);
+                } else {
+                    bank = 1 - bank;
+                    self.write_reg(REG_B_BASE, (b_base + j1 as u32 * panel).into());
+                    self.write_control(bank, r1 % 2, CONTROL_PRELOAD | CONTROL_KEEP_A);
                 }
-                self.write_reg(REG_B_BASE, (b_base + j1 as u32 * panel).into());
-                self.write_control((t + 1) % 2, r1 % 2, flags);
                 // START took the C base already, so this is for the next tile.
                 self.write_reg(REG_C_BASE, c_tile(r1, j1).into());
             }
@@ -524,6 +533,34 @@ mod tests {
     }
 
     #[test]
+    fn keep_b_load_fills_only_a() {
+        const K: usize = 3 * TILE;
+        let mut rpu = Rpu::new().unwrap();
+        rpu.preload_panel_i8(0, &[1; TILE * K], &[2; TILE * K], K)
+            .unwrap();
+        rpu.write_panel_i8(1, &[3; TILE * K], &[-4; TILE * K], K);
+        rpu.start(0);
+
+        // While B bank 0 computes, load only A into A bank 1. B_BASE points at a B the load
+        // must not fetch.
+        rpu.configure_bases(1);
+        rpu.write_control(0, 1, CONTROL_PRELOAD | CONTROL_KEEP_B);
+        rpu.tick();
+        assert!(rpu.compute_busy());
+        assert!(rpu.load_busy());
+
+        rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
+        assert_eq!(rpu.read_c(0), vec![2 * K as i32; N2]);
+
+        // The B of the last compute with the new A.
+        rpu.wait_until_load_idle(Rpu::MAX_WAIT_CYCLES).unwrap();
+        rpu.write_control(0, 1, CONTROL_START);
+        rpu.tick();
+        rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
+        assert_eq!(rpu.read_c(1), vec![6 * K as i32; N2]);
+    }
+
+    #[test]
     fn resident_b_serves_many_a_and_any_placement() {
         let mut rpu = Rpu::new().expect("RPU model");
         let mut rng = quant::XorShift(0x0e51_de47_b000_0001);
@@ -610,20 +647,24 @@ mod tests {
     fn next_tile_streams_during_drain() {
         let mut rpu = Rpu::new().unwrap();
         let mut rng = quant::XorShift(0x5bad_0005_d7a1_0001);
-        // K a multiple of N, so every B preload takes exactly K beats.
-        let (tiles, k) = (8, 25 * TILE);
+        // K a multiple of N, so every preload of B (or of A only, at a row block change)
+        // takes exactly K beats.
+        let k = 25 * TILE;
         let latency: usize = env!("RPU_READ_LATENCY").parse().unwrap();
-        let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
-        assert_gemm_exact(&mut rpu, TILE, tiles * TILE, k, &mut rng);
-        let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);
-        println!("{tiles} tiles, K = {k}: active {active} / busy {busy} cycles");
-        assert_eq!(active as usize, tiles * k);
-        // Idle array cycles: the first A + B load (2K), the last settle, drain and store
-        // (7N), and per tile the read latency of its B preload and a few cycles of host
-        // handshake, but no settle or drain per tile.
-        let idle = busy as usize - tiles * k;
-        let bound = 2 * k + latency + 7 * TILE + tiles * (latency + 8);
-        assert!(idle <= bound, "{idle} idle cycles, bound {bound}");
+        for (blocks, n_tiles) in [(1, 8), (3, 3)] {
+            let tiles = blocks * n_tiles;
+            let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
+            assert_gemm_exact(&mut rpu, blocks * TILE, n_tiles * TILE, k, &mut rng);
+            let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);
+            println!("{blocks} x {n_tiles} tiles, K = {k}: active {active} / busy {busy} cycles");
+            assert_eq!(active as usize, tiles * k);
+            // Idle array cycles: the first A + B load (2K), the last settle, drain and store
+            // (7N), and per tile the read latency of its preload and a few cycles of host
+            // handshake, but no settle or drain per tile and no B load at a row block change.
+            let idle = busy as usize - tiles * k;
+            let bound = 2 * k + latency + 7 * TILE + tiles * (latency + 8);
+            assert!(idle <= bound, "{idle} idle cycles, bound {bound}");
+        }
     }
 
     /// Plan phase 7 check: layer 1 for batch 8, streaming at least 85% of busy cycles.

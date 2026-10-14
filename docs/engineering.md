@@ -111,6 +111,8 @@ bit 1 BANK     local B bank 0 or 1
 bit 2 PRELOAD  load into the selected banks; may overlap a compute on the other banks
 bit 3 KEEP_A   the load fetches only B; the A banks keep their contents
 bit 4 A_BANK   local A bank 0 or 1: the bank a load fills and a compute reads
+bit 5 KEEP_B   the load fetches only A; B bank BANK keeps its contents and is
+               marked valid at the end (ignored with KEEP_A)
 ```
 
 There are two local A buffers and two local B buffers. A B bank is marked valid when its load ends; the A banks are not tracked. **Never load A into the A bank of a running compute** (a load without KEEP_A and with the same A_BANK): it overwrites the A the compute is reading. `preload_panel_i8` and `start` use the same number for both banks.
@@ -142,8 +144,8 @@ Rust decides where operands live. `preload_panel_i8` uses a fixed per-bank layou
 
 ```text
 load (issue and receive sides, one beat per cycle):
-  A rows (unless KEEP_A) into A bank A_BANK, then B rows into B bank BANK; the
-  B bank is marked valid at the end,
+  A rows (unless KEEP_A) into A bank A_BANK, then B rows (unless KEEP_B) into
+  B bank BANK; the B bank is marked valid at the end,
   or the compute starts if the load came from START
 
 compute:
@@ -215,11 +217,15 @@ When Verilator reports width warnings after a change, size the counter and its t
 
 ```text
 write A blocks into memory (B is already resident; host writes are slow: do them first)
-tile t = (row block r, B tile j), on B bank t % 2 and A bank r % 2
+tile t = (row block r, B tile j), on A bank r % 2; j runs forwards in even
+  row blocks and backwards in odd ones, so the last B of a block is the first
+  of the next
 START tile 0                          (loads A0 + B0, then computes)
 for each tile t:
-  if tile t+1 is in the same row block: preload B(j+1) with KEEP_A
-  else:                                 preload A(r+1) + B0 into the other A bank
+  if tile t+1 is in the same row block: preload its B with KEEP_A into the
+                                        other B bank
+  else:                                 preload A(r+1) with KEEP_B into the
+                                        other A bank; B bank stays
   (either preload overlaps compute t)
   wait until the stream of t and the preload are done
   (the settle, drain and store of t overlap the stream of t+1)
@@ -227,7 +233,7 @@ for each tile t:
 wait for DONE, read all C tiles
 ```
 
-Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 87.97% of its busy cycles at N = 8. The overhead is the first A + B load (1569 cycles), about 6 cycles per tile (the B preload's read latency and the host handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed in full; the next block's A + B load (2K cycles) overlaps the last tile of the block before (K cycles), so about K cycles per later block stay exposed. One read port moves one beat per cycle, so a B load already takes as long as a tile's stream: the A load cannot hide completely.
+Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 87.97% of its busy cycles at N = 8. The overhead is the first A + B load (1569 cycles), about 6 cycles per tile (the B preload's read latency and the host handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed: at a row block change only the next A loads (K beats, the same as a B preload), because the next block starts with the B tile the block before ended with. Before that order, the next block's A + B load (2K cycles) overlapped one tile (K cycles), and about K cycles per later block stayed exposed (`docs/perf-log.md`, item 9).
 
 K must fit in one panel (K <= KMAX). Partial sums over K are not split across jobs.
 
