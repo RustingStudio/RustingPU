@@ -42,6 +42,11 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 15 batch 256 | 16 | 97.25% | 407.0 | 98.29% | 99.8 / 8.0 | 4.9 s |
 | 15 batch 256, LOAD_BEATS 2 | 32 | 97.25% | 105.8 | 96.57% | 102.1 / 16.0 | 7.5 s |
 | 15 batch 256, LOAD_BEATS 2 | 64 | 97.25% | 33.2 | 80.26% | 106.5 / 32.2 | 21.4 s |
+| 16 read only C rows and columns that hold outputs | 8 | 97.25% | 1625.5 | 98.43% | 101.5 / 5.0 | 4.7 s |
+| 16 read only C rows and columns that hold outputs | 16 | 97.25% | 420.9 | 95.04% | 101.5 / 6.0 | 5.1 s |
+| 16 read only C rows and columns that hold outputs | 12 | 97.25% | 851.5 | 96.41% | 152.6 / 8.0 | 5.6 s |
+| 16 read only C rows and columns that hold outputs, LOAD_BEATS 2 | 32 | 97.25% | 111.2 | 91.85% | 103.7 / 8.0 | 7.8 s |
+| 16 read only C rows and columns that hold outputs, LOAD_BEATS 2 | 64 | 97.25% | 43.3 | 61.52% | 108.2 / 8.0 | 23.7 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -333,6 +338,29 @@ Host words: 115.5 written (A of both layers, 114 words, and 7 register writes pe
 - Host words written: 101.5 to 99.8 per image, fewer per-batch register and parameter writes. Wall time unchanged.
 - No RTL or driver change, so no synthesis, lint or mutation run beyond the full check. Tests: full check clean.
 - Load: `uptime` 2 to 4 (MNIST).
+- Commit: `540679f`.
+
+## Profile after item 15, 2026-10-15
+Per GEMM call, batch 64 (busy / streaming / idle cycles, from the busy and active counters around each call):
+
+| N | LOAD_BEATS | Layer 1 (784 to 128, QUANT) | Layer 2 (128 to 10, int32) |
+|---|---|---|---|
+| 16 | 1 | 26,014.5 / 24,968.2 / 1,046.4 | 792.5 / 509.6 / 283.0 |
+| 32 | 2 | 6,535.0 / 6,252.0 / 282.9 | 550.0 / 255.2 / 294.8 |
+| 64 | 2 | 2,111.0 / 1,568.0 / 543.0 | 646.0 / 128.0 / 518.0 |
+
+At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4 / 1,082.5.
+- Every tile store takes 4N cycles, int32 or requantized (4 store parts of N / 4 columns per row). The drain of the next tile waits for it. At N = 64 that is 256 cycles against a layer 2 stream of 128 (K = 128): the store, not the stream, paces layer 2, and the last store of each GEMM is exposed. Layer 2 has 10 outputs, which fit one beat of a C row at N >= 40 (two at N = 32), so 3 of the 4 beats per row are stored and read for nothing.
+- Host reads: `gemm_i32` read every C tile whole, padding rows and columns included: 32.2 words per image at N = 64 for 10 int32 (5 words).
+- Candidates: read back only the rows and columns that hold outputs (item 16, host words read); store only those beats of each C row (item 17, cycles, mostly at big N); store a requantized row in fewer than 4 parts at big N (item 18).
+
+## Item 16: read only the C rows and columns that hold outputs. Done, 2026-10-15
+- Before: `gemm_i32` read each C tile whole, 4N beats, and dropped the padding rows (past m) and columns (past n) on the host.
+- Fix (driver only): per tile, read only rows below m, and of each row only the beats that hold columns below n: ceil(4 cols / N) of the 4. The layout in RPU memory does not change.
+- Host words read per image, batch 64: 8.0 to 5.0 at N = 8 (-37.5%), 8.0 to 6.0 at N = 16 (-25%), 9.0 to 8.0 at N = 12, 16.0 to 8.0 at N = 32, 32.2 to 8.0 at N = 64. Batch 256 the same. Cycles, accuracy (97.25%, RPU equal to host int8 for every image) and host words written unchanged.
+- Tests: the read counts of `requantized_output_feeds_the_next_gemm` and `calibrated_mlp_keeps_hidden_activations_on_the_rpu` now expect m rows of ceil(4 cols / N) beats per B tile. Mutations, each caught: floor instead of ceil for the beats per row (4 tests), one row less per tile (7), a row stride of 1 beat instead of 4 (7). All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 32 and 64, and at N = 8), READ_LATENCY 1 and 10, with the brain feature; Icarus smoke test and Verilator lint (N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) clean.
+- No RTL change, so no synthesis.
+- Load: `uptime` 2 to 3.5.
 - Commit: pending.
 
 ## Questions for owner

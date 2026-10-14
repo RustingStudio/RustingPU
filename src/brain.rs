@@ -320,9 +320,11 @@ mod tests {
         let read = rpu.host_words_read();
         let host = mlp.predict_batch_host(&inputs);
         assert_eq!(mlp.predict_batch(&mut rpu, &inputs).unwrap(), host);
-        // Only the last layer's C tiles come back.
-        let tiles = inputs.len().div_ceil(crate::TILE) * 10usize.div_ceil(crate::TILE);
-        let c_words = tiles as u64 * u64::from(crate::C_BEATS * crate::BEAT_WORDS);
+        // Only the last layer's C rows come back, and of each row the beats of 10 columns.
+        let row_beats: usize = (0..10usize.div_ceil(crate::TILE))
+            .map(|j| crate::c_row_beats(crate::TILE.min(10 - j * crate::TILE)))
+            .sum();
+        let c_words = (inputs.len() * row_beats) as u64 * u64::from(crate::BEAT_WORDS);
         assert_eq!(rpu.host_words_read() - read, c_words);
 
         let float = network.predict_batch(&inputs).expect("f32 run");

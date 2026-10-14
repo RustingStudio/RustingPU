@@ -296,17 +296,17 @@ impl Rpu {
         let (mt, nt) = (a.m.div_ceil(TILE), b.n.div_ceil(TILE));
         let c_tile = |r: usize, j: usize| c_base + (r * nt + j) as u32 * C_BEATS;
         self.run_gemm(a, b, c_base, c_tile(mt, 0), CONTROL_GEMM)?;
-        let tile_words = (C_BEATS * BEAT_WORDS) as usize;
         let (m, n) = (a.m, b.n);
         let mut c = vec![0i32; m * n];
+        // Only the rows below m and the beats that hold columns below n cross the link.
         for r in 0..mt {
             for j in 0..nt {
-                let tile = unpack_i32(&self.read_words(c_tile(r, j), tile_words));
-                for (idx, v) in tile.into_iter().enumerate() {
-                    let (i, jj) = (r * TILE + idx / TILE, j * TILE + idx % TILE);
-                    if i < m && jj < n {
-                        c[i * n + jj] = v;
-                    }
+                let cols = TILE.min(n - j * TILE);
+                let words = c_row_beats(cols) * BEAT_WORDS as usize;
+                for i in 0..TILE.min(m - r * TILE) {
+                    let row = unpack_i32(&self.read_words(c_tile(r, j) + 4 * i as u32, words));
+                    let at = (r * TILE + i) * n + j * TILE;
+                    c[at..at + cols].copy_from_slice(&row[..cols]);
                 }
             }
         }
@@ -599,6 +599,11 @@ fn unpack_panels(words: &[u64], m: usize, k: usize) -> Vec<i8> {
 }
 
 /// Reads int32 values back from beats of host words: the first N bytes of each beat.
+/// Beats of a C row (4 per row) that hold its first `cols` int32.
+fn c_row_beats(cols: usize) -> usize {
+    (4 * cols).div_ceil(TILE)
+}
+
 fn unpack_i32(words: &[u64]) -> Vec<i32> {
     let bytes: Vec<u8> = words
         .chunks_exact(BEAT_WORDS as usize)
@@ -808,7 +813,10 @@ mod tests {
         let h = requant_host(&quant::matmul_nt_i8(&x, &w1, m, n1, k), n1, &params);
         assert_eq!(c, quant::matmul_nt_i8(&h, &w2, m, n2, n1));
         // Only the final C crosses the host link.
-        let c_words = m.div_ceil(TILE) * n2.div_ceil(TILE) * (C_BEATS * BEAT_WORDS) as usize;
+        let row_beats: usize = (0..n2.div_ceil(TILE))
+            .map(|j| c_row_beats(TILE.min(n2 - j * TILE)))
+            .sum();
+        let c_words = m * row_beats * BEAT_WORDS as usize;
         assert_eq!(rpu.host_words_read() - read, c_words as u64);
     }
 
