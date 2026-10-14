@@ -24,7 +24,8 @@ module rpu_top #(
     parameter int N = 8,
     parameter int KMAX = 1024,
     parameter int READ_LATENCY = 1,
-    parameter int MEM_BYTES = 1 << 20
+    // 64K beats from N = 16 on, so a bigger array gets a bigger memory.
+    parameter int MEM_BYTES = (1 << 20) * ((N > 16) ? N / 16 : 1)
 ) (
     input  logic clk,
     input  logic reset,

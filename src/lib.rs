@@ -7,7 +7,7 @@ pub const TILE: usize = parse_usize(env!("RPU_N"));
 /// Longest K of one panel job. Must match `KMAX` of `rtl/rpu_top.sv`.
 pub const KMAX: usize = 1024;
 /// Size of the RPU memory. Must match `MEM_BYTES` of `rtl/rpu_top.sv`.
-const MEM_BYTES: usize = 1 << 20;
+const MEM_BYTES: usize = (1 << 20) * if TILE > 16 { TILE / 16 } else { 1 };
 
 use quant::Requant;
 use std::cell::Cell;
@@ -863,7 +863,7 @@ mod tests {
         let mut rng = quant::XorShift(0x5bad_0005_d7a1_0001);
         // K a multiple of N, so every preload of B (or of A only, at a row block change)
         // takes exactly K beats.
-        let k = 25 * TILE;
+        let k = 25.min(KMAX / TILE) * TILE;
         let latency: usize = env!("RPU_READ_LATENCY").parse().unwrap();
         for (blocks, n_tiles) in [(1, 8), (3, 3)] {
             let tiles = blocks * n_tiles;

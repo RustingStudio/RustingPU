@@ -55,7 +55,7 @@ The MNIST example reads the four unpacked IDX files from `data/mnist/` (not in t
 - Simulation only. No FPGA bitstream, no host link.
 - INT8 matmul with bias, ReLU and requantization between layers. The input quantization, the last layer's bias and softmax run on the host. Output scales are static, calibrated on training images. No convolution, no BF16 or FP32.
 - K is at most 1024 per panel; partial sums over K are not split across jobs.
-- All operands must fit in the 1 MB RPU memory.
+- All operands must fit in the RPU memory: 1 MB up to N = 16, N / 16 MB above.
 - The first load of each GEMM is only partly hidden: the stream starts after about K + 2N beats.
 
 ## Roadmap

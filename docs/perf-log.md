@@ -32,6 +32,8 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 7 hardware requantization | 8 | 97.25% | 1625.5 | 98.43% | 101.5 / 8.0 | 4.7 s |
 | 7 hardware requantization | 16 | 97.25% | 420.9 | 95.04% | 101.5 / 8.0 | 5.0 s |
 | 7 hardware requantization | 12 | 97.25% | 851.5 | 96.41% | 152.6 / 9.0 | 5.6 s |
+| 13 big N | 32 | 97.25% | 128.2 | 79.67% | 103.7 / 16.0 | 8.4 s |
+| 13 big N | 64 | 97.25% | 59.8 | 44.49% | 108.2 / 32.2 | 26.1 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -251,6 +253,34 @@ Overhead at N = 16, per batch of 64 (busy 26,931 cycles, streaming 25,600):
 At N = 8 the whole overhead is 25.4 cycles per image (1.6%).
 
 Host words: 115.5 written (A of both layers, 114 words, and 7 register writes per GEMM) and 72.0 read (C). Reading only the columns of layer 2 that hold outputs (10 of 16) would read 69 words: -1.6% of all host words. Below 2%, not built.
+
+## Item 13: big N (N = 32 and 64). Done, 2026-10-14
+- Goal (owner, 2026-10-14): scale past the Tang Mega 60K toward a TPU class array, on FPGAs that one can buy or rent, no ASIC.
+- What did not scale:
+  - Memory: `MEM_BYTES` was 1 MB at every N, 16K beats at N = 64, so the test operands did not fit (`B does not fit in RPU memory`). Fix: 64K beats from N = 16 on, `MEM_BYTES` = 1 MB * N / 16 above N = 16 (RTL and driver). N <= 16 is unchanged, so the gowin numbers of item 7 still hold.
+  - A test used K = 25N, past KMAX = 1024 at N = 64. Fix: K = min(25, KMAX / N) * N.
+  - Nothing else: the RTL, the driver and all tests build and pass at N = 32 and 64 unchanged.
+- KMAX stays 1024 at every N. At N = 64 a panel row is only 16 beats deep, so yosys maps the A panels to LUT RAM instead of block RAM (xcup BRAM36 10 at N = 8, 0 at N = 64). K above 1024 needs partial sums split over K, which the RPU does not do (README, Limits).
+- MNIST, RPU equal to host int8 for every image, 97.25% at both sizes:
+  - N = 32: 128.2 cycles per image (busy 1,282,296), streaming 79.67%, host words 103.7 / 16.0, wall time 8.4 s (build and run 70 s).
+  - N = 64: 59.8 cycles per image (busy 598,484), streaming 44.49%, host words 108.2 / 32.2, wall time 26.1 s (build and run 244 s).
+  - Against N = 16 (420.9): 3.3x fewer cycles at N = 32, 7.0x at N = 64, for 4x and 16x the PEs. The loss is the exposed first load of each GEMM: K + 2N beats at half the stream rate (one 8N-bit port for A and B), now as long as a tile stream itself, because batch 64 is one row block (one or two tiles per GEMM). Layer 2 also uses only 10 of N columns. Items 14 (wide load path) and 15 (larger batch) target these.
+  - Host reads grow with N: layer 2's C is int32 for all N columns, of which 10 hold outputs.
+- Synthesis, `rpu_top`, `synth_xilinx -family xcup` (UltraScale+), as the reference for parts larger than the Gowin range:
+
+  | N | LUT | CARRY8 | FF | DSP48E2 | LUT RAM | BRAM36 | SRL | Time |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | 8 | 7,290 | 740 | 8,053 | 69 | 339 | 10 | 2 | |
+  | 16 | 23,043 | 2,348 | 28,941 | 265 | 645 | 36 | 4 | |
+  | 32 | 78,522 | 8,664 | 110,978 | 1,041 | 2,442 | 8 | 8 | 39 s |
+  | 64 | 305,081 | 33,574 | 438,240 | 4,129 | 5,157 | 0 | 16 | 180 s |
+
+  - One DSP per PE (N^2) plus ceil(N/4) requant lanes. N = 32 fits a Zynq UltraScale+ ZU5EV class part (Kria K26: 1,248 DSP, 117K LUT, 234K FF). N = 64 needs a Virtex UltraScale+ class part (VU9P, rentable as an AWS F1 instance). Two INT8 MACs per DSP48E2 would halve the DSPs; not built.
+  - gw2a, N = 32: 79,879 LUT, 34,951 ALU, 109,448 DFF, 1,041 MULT9X9, 272 SDPX9B, 8,704 RAM16SDP4 in 701 s; larger than any GW2A part. gw5a at N = 32 (multipliers in soft logic) had not finished after 25 min; its result goes in item 14. gowin at N = 64 not run.
+  - No STA at N = 32 and 64: the xcup flow has no timing model in yosys here.
+- Tests: all tests pass at N = 32 and 64, READ_LATENCY 1 and 10, with the brain feature (about 30 s per run at N = 64, 4 min with the build). At N = 4, 8, 12, 16 unchanged; Icarus smoke test and Verilator lint (N = 8, 12, 16, 32, 64) clean.
+- Load: `uptime` 4.5 to 5.8 (MNIST), 5 to 9 (synthesis).
+- Commit: pending.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host.

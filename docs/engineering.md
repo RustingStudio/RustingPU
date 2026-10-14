@@ -11,7 +11,8 @@ Rust API (src/lib.rs)
   -> C ABI in verilated_wrapper/
   -> Verilator model of rtl/rpu_top.sv
        register file, panel buffers, load / compute / store FSMs
-       rtl/rpu_sim_memory.sv   1 MB external memory model, 8*N-bit beats
+       rtl/rpu_sim_memory.sv   external memory model, 8*N-bit beats, 1 MB up to N = 16
+                               and N / 16 MB above
        rtl/rpu_array.sv        N x N output-stationary array + input skew
          rtl/int8_cell.sv      one PE: int8 x int8 -> int32 accumulate
          rtl/delay_cell.sv     skew registers
@@ -235,7 +236,7 @@ A STREAM may start while the drain before is pending only if its K is at least `
 
 ## 7. Changing N
 
-N is one build parameter: `RPU_N`. It does not need to be a multiple of 8 or a power of 2: a beat that does not fill its last 64-bit host word is padded in memory. Tests pass at N = 4, 8, 12, 16 and 24. Resources grow with N^2 (see `docs/resources.md`); at N = 16 the LUT-only mapping is too large for the GW5AT-LV60, so N = 16 needs DSPs.
+N is one build parameter: `RPU_N`. It does not need to be a multiple of 8 or a power of 2: a beat that does not fill its last 64-bit host word is padded in memory. Tests pass at N = 4, 8, 12, 16, 24, 32 and 64. Resources grow with N^2 (see `docs/resources.md`); at N = 16 the LUT-only mapping is too large for the GW5AT-LV60, so N = 16 needs DSPs. The memory model holds 64K beats from N = 16 on (`MEM_BYTES`, N / 16 MB above N = 16), so the beat address width, not the operands that fit, is what grows. KMAX stays 1024 at every N, so at N = 64 a panel row is only 16 beats deep (`docs/perf-log.md`, item 13).
 
 When Verilator reports width warnings after a change, size the counter and its terminal constant with the same `$clog2` width and cast explicitly. Do not disable width warnings globally.
 
