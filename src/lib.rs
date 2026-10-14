@@ -9,6 +9,7 @@ pub const KMAX: usize = 1024;
 /// Size of the RPU memory. Must match `MEM_BYTES` of `rtl/rpu_top.sv`.
 const MEM_BYTES: usize = 1 << 20;
 
+use std::cell::Cell;
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -83,6 +84,8 @@ impl std::error::Error for RpuError {}
 
 pub struct Rpu {
     inner: NonNull<sys::Rpu>,
+    words_written: u64,
+    words_read: Cell<u64>,
 }
 
 impl Rpu {
@@ -90,7 +93,11 @@ impl Rpu {
 
     pub fn new() -> Result<Self, RpuError> {
         let inner = NonNull::new(unsafe { sys::rpu_new() }).ok_or(RpuError::AllocationFailed)?;
-        let mut rpu = Self { inner };
+        let mut rpu = Self {
+            inner,
+            words_written: 0,
+            words_read: Cell::new(0),
+        };
         rpu.reset();
         Ok(rpu)
     }
@@ -112,6 +119,17 @@ impl Rpu {
     /// Free-running count of cycles the RPU was busy (load, compute or C store), since reset.
     pub fn busy_cycles(&self) -> u32 {
         self.read_reg(REG_BUSY) as u32
+    }
+
+    /// Host bus writes since `new`: memory words and registers. A UART link pays for each.
+    pub fn host_words_written(&self) -> u64 {
+        self.words_written
+    }
+
+    /// Memory words read by the host since `new`. Register reads (status polls, counters)
+    /// are not counted: how often a real host polls is up to the transport.
+    pub fn host_words_read(&self) -> u64 {
+        self.words_read.get()
     }
 
     /// One int8 NT tile: `C[i][j] = sum_k A[i][k] * B[j][k]`, all `TILE x TILE` row-major.
@@ -247,6 +265,7 @@ impl Rpu {
     }
 
     fn write_reg(&mut self, addr: u32, value: u64) {
+        self.words_written += 1;
         unsafe { sys::rpu_write(self.inner.as_ptr(), addr, value) };
     }
 
@@ -268,6 +287,7 @@ impl Rpu {
 
     fn read_words(&self, beat: u32, count: usize) -> Vec<u64> {
         let base = MEM_BASE + beat * BEAT_WORDS;
+        self.words_read.set(self.words_read.get() + count as u64);
         (0..count).map(|i| self.read_reg(base + i as u32)).collect()
     }
 
@@ -378,6 +398,23 @@ mod tests {
     use super::*;
 
     const N2: usize = TILE * TILE;
+
+    #[test]
+    fn host_word_counters_count_bus_traffic() {
+        let mut rpu = Rpu::new().expect("RPU model");
+        let panel = vec![1i8; TILE * TILE];
+        let written = rpu.host_words_written();
+        rpu.preload_panel_i8(0, &panel, &panel, TILE).unwrap();
+        // A and B: one beat per row. K_LEN, three bases and CONTROL are register writes.
+        let panel_words = (TILE * BEAT_WORDS as usize) as u64;
+        assert_eq!(rpu.host_words_written() - written, 2 * panel_words + 5);
+        let read = rpu.host_words_read();
+        rpu.read_c(0);
+        assert_eq!(
+            rpu.host_words_read() - read,
+            u64::from(C_BEATS * BEAT_WORDS)
+        );
+    }
 
     #[test]
     fn preload_overlaps_active_compute() {

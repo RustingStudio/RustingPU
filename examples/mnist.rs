@@ -82,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpu = Rpu::new()?;
     let (mut host, mut on_rpu) = (Vec::with_capacity(count), Vec::with_capacity(count));
     let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
+    let (written, read) = (rpu.host_words_written(), rpu.host_words_read());
     let start = Instant::now();
     for batch in test.inputs.chunks(BATCH) {
         let h = mlp.predict_batch_host(batch);
@@ -92,6 +93,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let wall = start.elapsed().as_secs_f64();
     let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);
+    let (written, read) = (
+        rpu.host_words_written() - written,
+        rpu.host_words_read() - read,
+    );
     let (host_correct, rpu_correct) = (correct(&host), correct(&on_rpu));
 
     let pct = |c: usize| 100.0 * c as f64 / count as f64;
@@ -107,6 +112,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "RPU busy {busy} cycles, {:.1} cycles per image, streaming {active} ({:.2}%)",
         f64::from(busy) / count as f64,
         100.0 * f64::from(active) / f64::from(busy)
+    );
+    println!(
+        "host link: {:.1} words written, {:.1} words read per image (64-bit words)",
+        written as f64 / count as f64,
+        read as f64 / count as f64
     );
     println!("simulation wall time {wall:.1} s (host int8 included)");
     Ok(())
