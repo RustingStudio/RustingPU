@@ -238,6 +238,44 @@ impl Rpu {
             }
         }
     }
+
+    /// One int8 NT tile: `C[i][j] = sum_k A[i][k] * B[j][k]`, all `TILE x TILE` row-major.
+    /// Bus layout: two int8 per 16-bit word (even index in the low byte), and each i32 of C
+    /// as two words, low half first.
+    pub fn run_tile_i8(&mut self, a: &[i8], b: &[i8]) -> Result<Vec<i32>, RpuError> {
+        assert_eq!(a.len(), TILE * TILE, "A must be one tile");
+        assert_eq!(b.len(), TILE * TILE, "B must be one tile");
+        let half = TILE_WORDS / 2;
+        let (a_base, b_base, c_base) = (0, half, 2 * half);
+
+        self.write_words(0, a_base, &pack_i8(a));
+        self.write_words(0, b_base, &pack_i8(b));
+        self.configure_bases(a_base, b_base, c_base);
+        self.write_control(0, CONTROL_START);
+        self.tick();
+        self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
+
+        let words = self.read_words(0, c_base, 2 * TILE * TILE);
+        Ok(words
+            .chunks_exact(2)
+            .map(|w| (u32::from(w[0]) | (u32::from(w[1]) << 16)) as i32)
+            .collect())
+    }
+
+    fn write_words(&mut self, bank: usize, base: u16, words: &[u16]) {
+        let ext_base = Self::ext_base(bank) + base;
+        for (i, &w) in words.iter().enumerate() {
+            unsafe { sys::rpu_write(self.inner.as_ptr(), ext_base + i as u16, w) };
+        }
+    }
+
+    fn read_words(&self, bank: usize, base: u16, count: usize) -> Vec<u16> {
+        let ext_base = Self::ext_base(bank) + base;
+        (0..count)
+            .map(|i| unsafe { sys::rpu_read(self.inner.as_ptr(), ext_base + i as u16) })
+            .collect()
+    }
+
     pub fn run_tile(&mut self, a: Bf16Tile, b: Bf16Tile) -> Result<Bf16Tile, RpuError> {
         let c_base = 2 * TILE_WORDS;
 
@@ -562,6 +600,14 @@ pub fn mat_mul<T: MatrixElement>(
     out
 }
 
+/// Two int8 per 16-bit bus word, even index in the low byte. Odd lengths pad with zero.
+fn pack_i8(values: &[i8]) -> Vec<u16> {
+    values
+        .chunks(2)
+        .map(|p| u16::from(p[0] as u8) | (u16::from(p.get(1).copied().unwrap_or(0) as u8) << 8))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,5 +767,35 @@ mod tests {
         rpu.multiply(zero, zero).unwrap();
         assert!(rpu.cycles() > 0);
         assert_eq!(rpu.status() & 0b10, 0b10);
+    }
+
+    fn assert_tile_i8_exact(rpu: &mut Rpu, a: &[i8], b: &[i8]) {
+        let got = rpu.run_tile_i8(a, b).unwrap();
+        let want = quant::matmul_nt_i8(a, b, TILE, TILE, TILE);
+        assert_eq!(got, want, "A = {a:?}\nB = {b:?}");
+    }
+
+    #[test]
+    #[ignore = "fails until the INT8 RTL of phase 3"]
+    fn int8_edge_tiles_are_bit_exact() {
+        let mut rpu = Rpu::new().unwrap();
+        let n = TILE * TILE;
+        for (a, b) in [(0, 0), (127, 127), (-127, -127), (-127, 127), (1, -1)] {
+            assert_tile_i8_exact(&mut rpu, &vec![a; n], &vec![b; n]);
+        }
+        let ramp: Vec<i8> = (0..n).map(|i| (i as i32 * 4 - 127) as i8).collect();
+        assert_tile_i8_exact(&mut rpu, &ramp, &ramp);
+    }
+
+    #[test]
+    #[ignore = "fails until the INT8 RTL of phase 3"]
+    fn int8_random_tiles_are_bit_exact() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x5eed_1234_abcd_ef01);
+        for _ in 0..1000 {
+            let a: Vec<i8> = (0..TILE * TILE).map(|_| rng.i8_sym()).collect();
+            let b: Vec<i8> = (0..TILE * TILE).map(|_| rng.i8_sym()).collect();
+            assert_tile_i8_exact(&mut rpu, &a, &b);
+        }
     }
 }
