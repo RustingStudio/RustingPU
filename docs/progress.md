@@ -46,5 +46,15 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - Rust: `run_panel_i8(a, b, k)`, `preload_panel_i8(bank, a, b, k)`, `active_cycles()`, `busy_cycles()`. `run_tile_i8` is `run_panel_i8` with k = N.
 - Check: bit-exact (`==`) for K in {1, 7, 8, 9} (20 random panels each), 64 (10), 784 and 1024 (3 each), and all -127 at K=1024 (16,516,096 per PE). Each job adds exactly K to `active_cycles`. 12 tests pass, fmt and clippy clean, Icarus PASS.
 - Cycles (`examples/baseline.rs`): 8x784 x 784x8 compute **809 = 784 + 25** (clear 1 + settle 16 + drain 8), store C 384, total 1193. The plan said 784 + ~24.
+- Commit: `6fcf3ab`.
+
+## Phase 6: wide pipelined memory. Done, 2026-10-14
+- `rpu_sim_memory`: 1 MB in `8*N`-bit beats, one read request per cycle, data `READ_LATENCY` cycles later (`rd_resp_valid`), one write beat per cycle with no stall. The host port moves 64-bit words, N/8 per beat. It requires N to be a multiple of 8 (64-bit host words), not a power of 2.
+- Host bus and ABI: 32-bit address, 64-bit data. Registers 0-7 (`CONTROL, STATUS, A_BASE, B_BASE, C_BASE, K_LEN, ACTIVE, BUSY`); memory word w is at `0x1000_0000 + w`. Base registers are beat addresses. The two external banks are gone: one flat memory, and Rust puts each local bank's A, B and C at its own addresses.
+- Load: an issue side requests one beat per cycle (A rows, then B rows, each row padded to whole beats); a receive side writes each response into the per-row panel buffer (`8*N` bits wide, 1 write and 1 read port). Stream reads lane `k mod N` of beat `k / N` with counters, no division.
+- The drain now shifts rows down (was columns right), so `mem_c[row]` holds a C row and the store writes it as 4 beats, one per cycle. C store at N=8: 32 cycles (was 384).
+- `build.rs`: `RPU_N` (default 8) and `RPU_READ_LATENCY` (default 1) set `-GN` and `-GREAD_LATENCY`; Rust `TILE` comes from `RPU_N`. The Verilator `obj_dir` is now cleared before each run: a rebuild with N=24 left `Vrpu_top___024root__1.cpp`, which the N=8 build then compiled and failed on.
+- Check: all 13 tests bit-exact (`==`) with READ_LATENCY 1 and 10, at N=8 and N=16; also at N=24 (latency 1). New test `panel_load_moves_one_beat_per_cycle`: preload busy cycles = `2 * N * ceil(K/N) + READ_LATENCY` for K in {1, 9, 784}. Verilator `--lint-only -Wall` clean at N=8, 16, 24. fmt, clippy clean, Icarus PASS.
+- Cycles (`examples/baseline.rs`, N=8): K=784 load A+B **1569** at latency 1 and **1578** at latency 10, that is 784 beats per panel + latency. Compute 809, store 32. N=16: load 1569, compute 833, store 64.
 
 ## Questions for owner

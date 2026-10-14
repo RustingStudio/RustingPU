@@ -11,8 +11,17 @@ fn main() {
         "rtl/rpu_top.sv",
     ];
 
+    // Array size and memory read latency, e.g. RPU_N=16 RPU_READ_LATENCY=10 cargo test.
+    let n = std::env::var("RPU_N").unwrap_or_else(|_| "8".into());
+    let read_latency = std::env::var("RPU_READ_LATENCY").unwrap_or_else(|_| "1".into());
+
+    // A rebuild with other parameters can emit fewer files; never compile stale ones.
+    let _ = std::fs::remove_dir_all(&obj_dir);
+
     let mut cmd = std::process::Command::new("verilator");
     cmd.args(["--cc", "-Wno-CASEINCOMPLETE", "--top-module", "rpu_top"])
+        .arg(format!("-GN={n}"))
+        .arg(format!("-GREAD_LATENCY={read_latency}"))
         .args(["-Mdir", &obj_dir]);
     for f in &rtl_files {
         cmd.arg(format!("{}/{}", base, f));
@@ -42,6 +51,10 @@ fn main() {
     build.compile("rpu_soc");
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RPU_N");
+    println!("cargo:rustc-env=RPU_N={n}");
+    println!("cargo:rerun-if-env-changed=RPU_READ_LATENCY");
+    println!("cargo:rustc-env=RPU_READ_LATENCY={read_latency}");
     for f in &rtl_files {
         println!("cargo:rerun-if-changed={}", f);
     }

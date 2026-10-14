@@ -6,8 +6,6 @@ struct rpu_t {
     Vrpu_top core;
 };
 
-static constexpr uint8_t N = 8;
-
 static void rpu_eval(rpu_t* r) {
     r->core.eval();
 }
@@ -52,7 +50,7 @@ void rpu_reset(rpu_t* r) {
     rpu_eval(r);
 }
 
-void rpu_write(rpu_t *r, uint16_t addr, uint16_t value) {
+void rpu_write(rpu_t *r, uint32_t addr, uint64_t value) {
     r->core.mem_addr = addr;
     r->core.mem_wdata = value;
     r->core.mem_we = 1;
@@ -61,7 +59,7 @@ void rpu_write(rpu_t *r, uint16_t addr, uint16_t value) {
     rpu_eval(r);
 }
 
-uint16_t rpu_read(rpu_t* r, uint16_t addr) {
+uint64_t rpu_read(rpu_t* r, uint32_t addr) {
     r->core.mem_we = 0;
     r->core.mem_addr = addr;
     rpu_eval(r);

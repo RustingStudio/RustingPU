@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 // Smoke test of the raw int8 systolic array (no registers, no memory path).
-// Streams one N x N NT tile, shifts C out one column per cycle, and compares
+// Streams one N x N NT tile, shifts C out one row per cycle, and compares
 // it with a behavioural reference.
 module tb_tpu;
     parameter int N = 4;
@@ -9,14 +9,14 @@ module tb_tpu;
     logic [N-1:0][7:0] a_flat;
     logic [N-1:0][7:0] b_flat;
     logic drain;
-    logic [N-1:0][31:0] c_col;
+    logic [N-1:0][31:0] c_row;
 
     logic signed [7:0] a [0:N-1][0:N-1];
     logic signed [7:0] b [0:N-1][0:N-1];
     int errors;
     logic signed [31:0] c [0:N-1][0:N-1];
     // Icarus cannot index a multi-dimensional packed array with variables.
-    wire [N*32-1:0] c_bits = c_col;
+    wire [N*32-1:0] c_bits = c_row;
 
     rpu_array #(.N(N)) uut (.*);
 
@@ -55,10 +55,10 @@ module tb_tpu;
         end
         repeat (2 * N) @(negedge clk);
 
-        // Column N-1 is on c_col; each drain cycle shifts the next column in.
+        // Row N-1 is on c_row; each drain cycle shifts the next row in.
         drain = 1;
         for (int t = 0; t < N; t++) begin
-            for (int i = 0; i < N; i++) c[i][N-1-t] = c_bits[i * 32 +: 32];
+            for (int j = 0; j < N; j++) c[N-1-t][j] = c_bits[j * 32 +: 32];
             @(negedge clk);
         end
         drain = 0;

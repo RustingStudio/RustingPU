@@ -1,38 +1,43 @@
 pub mod quant;
 
-/// Array size N. Must match the default `N` of `rtl/rpu_top.sv`.
-pub const TILE: usize = 8;
+/// Array size N, set at build time with `RPU_N` (default 8).
+pub const TILE: usize = parse_usize(env!("RPU_N"));
 /// Longest K of one panel job. Must match `KMAX` of `rtl/rpu_top.sv`.
 pub const KMAX: usize = 1024;
 
 use std::fmt;
 use std::ptr::NonNull;
 
-const REG_CONTROL: u16 = 0x0000;
-const REG_STATUS: u16 = 0x0001;
-const REG_A_BASE: u16 = 0x0002;
-const REG_B_BASE: u16 = 0x0003;
-const REG_C_BASE: u16 = 0x0004;
-const REG_K_LEN: u16 = 0x0005;
-const REG_ACTIVE_LO: u16 = 0x0006;
-const REG_BUSY_LO: u16 = 0x0008;
+const REG_CONTROL: u32 = 0;
+const REG_STATUS: u32 = 1;
+const REG_A_BASE: u32 = 2;
+const REG_B_BASE: u32 = 3;
+const REG_C_BASE: u32 = 4;
+const REG_K_LEN: u32 = 5;
+const REG_ACTIVE: u32 = 6;
+const REG_BUSY: u32 = 7;
+/// Host address of memory word 0. The host bus moves 64-bit words.
+const MEM_BASE: u32 = 0x1000_0000;
 
-/// Bus words per A or B panel: two int8 per 16-bit word.
-const PANEL_WORDS: u16 = (TILE * KMAX / 2) as u16;
-/// Fixed layout inside each external bank: A, then B, then C (two words per i32).
-const A_BASE: u16 = 0;
-const B_BASE: u16 = PANEL_WORDS;
-const C_BASE: u16 = 2 * PANEL_WORDS;
-const EXT_WORDS: u16 = C_BASE + (2 * TILE * TILE) as u16;
+/// A memory beat is N int8, so N/8 host words.
+const BEAT_WORDS: u32 = (TILE / 8) as u32;
+const _: () = assert!(
+    TILE.is_multiple_of(8),
+    "the 64-bit host bus needs N to be a multiple of 8"
+);
+/// Beats per panel row: each row is padded to a whole number of beats.
+const ROW_BEATS: u32 = KMAX.div_ceil(TILE) as u32;
+const PANEL_BEATS: u32 = TILE as u32 * ROW_BEATS;
+/// C is TILE x TILE int32: 4 beats per row.
+const C_BEATS: u32 = 4 * TILE as u32;
+/// Memory layout per local bank, in beats: A panel, B panel, C tile.
+const BANK_BEATS: u32 = 2 * PANEL_BEATS + C_BEATS;
 
-const EXT_BASE_BANK0: u16 = 0x1000;
-const EXT_BASE_BANK1: u16 = EXT_BASE_BANK0 + EXT_WORDS;
-
-const CONTROL_START: u16 = 0b0001;
-const CONTROL_BANK1: u16 = 0b0010;
-const CONTROL_PRELOAD: u16 = 0b0100;
-const STATUS_LOAD_BUSY: u16 = 0b0100;
-const STATUS_COMPUTE_BUSY: u16 = 0b1000;
+const CONTROL_START: u64 = 0b0001;
+const CONTROL_BANK1: u64 = 0b0010;
+const CONTROL_PRELOAD: u64 = 0b0100;
+const STATUS_LOAD_BUSY: u64 = 0b0100;
+const STATUS_COMPUTE_BUSY: u64 = 0b1000;
 
 mod sys {
     #[repr(C)]
@@ -44,8 +49,8 @@ mod sys {
         pub fn rpu_reset(r: *mut Rpu);
         pub fn rpu_tick(r: *mut Rpu);
         pub fn rpu_cycles(r: *mut Rpu) -> u32;
-        pub fn rpu_write(r: *mut Rpu, addr: u16, value: u16);
-        pub fn rpu_read(r: *mut Rpu, addr: u16) -> u16;
+        pub fn rpu_write(r: *mut Rpu, addr: u32, value: u64);
+        pub fn rpu_read(r: *mut Rpu, addr: u32) -> u64;
         pub fn rpu_busy(r: *mut Rpu) -> u8;
         pub fn rpu_done(r: *mut Rpu) -> u8;
     }
@@ -95,12 +100,12 @@ impl Rpu {
 
     /// Free-running count of cycles the array streamed, since reset.
     pub fn active_cycles(&self) -> u32 {
-        self.read_u32(REG_ACTIVE_LO)
+        self.read_reg(REG_ACTIVE) as u32
     }
 
     /// Free-running count of cycles the RPU was busy (load or compute), since reset.
     pub fn busy_cycles(&self) -> u32 {
-        self.read_u32(REG_BUSY_LO)
+        self.read_reg(REG_BUSY) as u32
     }
 
     /// One int8 NT tile: `C[i][j] = sum_k A[i][k] * B[j][k]`, all `TILE x TILE` row-major.
@@ -126,7 +131,7 @@ impl Rpu {
         k: usize,
     ) -> Result<(), RpuError> {
         self.write_panel_i8(bank, a, b, k);
-        self.configure_bases();
+        self.configure_bases(bank);
         self.write_control(bank, CONTROL_PRELOAD);
         self.tick();
         self.wait_until_load_idle(Self::MAX_WAIT_CYCLES)
@@ -134,34 +139,36 @@ impl Rpu {
 
     /// Starts the compute on local `bank`. Without a preloaded bank, the RPU loads first.
     pub fn start(&mut self, bank: usize) {
-        self.configure_bases();
+        self.configure_bases(bank);
         self.write_control(bank, CONTROL_START);
         self.tick();
     }
 
     /// Reads the C tile that the last compute on `bank` stored.
     pub fn read_c(&self, bank: usize) -> Vec<i32> {
-        self.read_words(bank, C_BASE, 2 * TILE * TILE)
-            .chunks_exact(2)
-            .map(|w| (u32::from(w[0]) | (u32::from(w[1]) << 16)) as i32)
+        self.read_words(Self::c_base(bank), (C_BEATS * BEAT_WORDS) as usize)
+            .into_iter()
+            .flat_map(|w| [w as u32 as i32, (w >> 32) as u32 as i32])
             .collect()
     }
 
-    /// Writes the panels and sets K_LEN. Each row is packed on its own, padded to even k.
+    /// Writes the panels and sets K_LEN. Each row is padded to a whole number of beats.
     fn write_panel_i8(&mut self, bank: usize, a: &[i8], b: &[i8], k: usize) {
         assert!((1..=KMAX).contains(&k), "k must be in 1..={KMAX}");
         assert_eq!(a.len(), TILE * k, "A must be TILE x k");
         assert_eq!(b.len(), TILE * k, "B must be TILE x k");
-        let pack_rows = |m: &[i8]| -> Vec<u16> { m.chunks_exact(k).flat_map(pack_i8).collect() };
-        self.write_words(bank, A_BASE, &pack_rows(a));
-        self.write_words(bank, B_BASE, &pack_rows(b));
-        unsafe { sys::rpu_write(self.inner.as_ptr(), REG_K_LEN, k as u16) };
+        let a_base = Self::a_base(bank);
+        self.write_words(a_base, &pack_rows(a, k));
+        self.write_words(a_base + PANEL_BEATS, &pack_rows(b, k));
+        self.write_reg(REG_K_LEN, k as u64);
     }
 
-    fn read_u32(&self, lo_addr: u16) -> u32 {
-        let lo = unsafe { sys::rpu_read(self.inner.as_ptr(), lo_addr) };
-        let hi = unsafe { sys::rpu_read(self.inner.as_ptr(), lo_addr + 1) };
-        u32::from(lo) | (u32::from(hi) << 16)
+    fn read_reg(&self, addr: u32) -> u64 {
+        unsafe { sys::rpu_read(self.inner.as_ptr(), addr) }
+    }
+
+    fn write_reg(&mut self, addr: u32, value: u64) {
+        unsafe { sys::rpu_write(self.inner.as_ptr(), addr, value) };
     }
 
     pub fn load_busy(&self) -> bool {
@@ -172,41 +179,38 @@ impl Rpu {
         self.status() & STATUS_COMPUTE_BUSY != 0
     }
 
-    fn write_words(&mut self, bank: usize, base: u16, words: &[u16]) {
-        let ext_base = Self::ext_base(bank) + base;
+    /// Writes host words starting at memory beat `beat`.
+    fn write_words(&mut self, beat: u32, words: &[u64]) {
+        let base = MEM_BASE + beat * BEAT_WORDS;
         for (i, &w) in words.iter().enumerate() {
-            unsafe { sys::rpu_write(self.inner.as_ptr(), ext_base + i as u16, w) };
+            self.write_reg(base + i as u32, w);
         }
     }
 
-    fn read_words(&self, bank: usize, base: u16, count: usize) -> Vec<u16> {
-        let ext_base = Self::ext_base(bank) + base;
-        (0..count)
-            .map(|i| unsafe { sys::rpu_read(self.inner.as_ptr(), ext_base + i as u16) })
-            .collect()
+    fn read_words(&self, beat: u32, count: usize) -> Vec<u64> {
+        let base = MEM_BASE + beat * BEAT_WORDS;
+        (0..count).map(|i| self.read_reg(base + i as u32)).collect()
     }
 
-    fn configure_bases(&mut self) {
-        unsafe {
-            sys::rpu_write(self.inner.as_ptr(), REG_A_BASE, A_BASE);
-            sys::rpu_write(self.inner.as_ptr(), REG_B_BASE, B_BASE);
-            sys::rpu_write(self.inner.as_ptr(), REG_C_BASE, C_BASE);
-        }
+    fn configure_bases(&mut self, bank: usize) {
+        let a_base = Self::a_base(bank);
+        self.write_reg(REG_A_BASE, a_base.into());
+        self.write_reg(REG_B_BASE, (a_base + PANEL_BEATS).into());
+        self.write_reg(REG_C_BASE, Self::c_base(bank).into());
     }
 
-    fn write_control(&mut self, bank: usize, flags: u16) {
+    fn write_control(&mut self, bank: usize, flags: u64) {
         let bank_flag = if bank == 0 { 0 } else { CONTROL_BANK1 };
-        unsafe {
-            sys::rpu_write(self.inner.as_ptr(), REG_CONTROL, flags | bank_flag);
-        }
+        self.write_reg(REG_CONTROL, flags | bank_flag);
     }
 
-    fn ext_base(bank: usize) -> u16 {
-        match bank {
-            0 => EXT_BASE_BANK0,
-            1 => EXT_BASE_BANK1,
-            _ => panic!("RPU only has two external memory banks"),
-        }
+    fn a_base(bank: usize) -> u32 {
+        assert!(bank < 2, "RPU only has two local banks");
+        bank as u32 * BANK_BEATS
+    }
+
+    fn c_base(bank: usize) -> u32 {
+        Self::a_base(bank) + 2 * PANEL_BEATS
     }
 
     fn tick(&mut self) {
@@ -221,8 +225,8 @@ impl Rpu {
         unsafe { sys::rpu_done(self.inner.as_ptr()) != 0 }
     }
 
-    pub fn status(&self) -> u16 {
-        unsafe { sys::rpu_read(self.inner.as_ptr(), REG_STATUS) }
+    pub fn status(&self) -> u64 {
+        self.read_reg(REG_STATUS)
     }
 
     fn wait_until_done(&mut self, max_cycles: usize) -> Result<(), RpuError> {
@@ -254,11 +258,33 @@ impl Drop for Rpu {
     }
 }
 
-/// Two int8 per 16-bit bus word, even index in the low byte. Odd lengths pad with zero.
-fn pack_i8(values: &[i8]) -> Vec<u16> {
-    values
-        .chunks(2)
-        .map(|p| u16::from(p[0] as u8) | (u16::from(p.get(1).copied().unwrap_or(0) as u8) << 8))
+const fn parse_usize(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut value = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii_digit(), "RPU_N must be a decimal number");
+        value = value * 10 + (bytes[i] - b'0') as usize;
+        i += 1;
+    }
+    value
+}
+
+/// Packs `k`-long rows into 64-bit host words, each row zero-padded to whole beats.
+/// Value 0 of a word is its low byte.
+fn pack_rows(m: &[i8], k: usize) -> Vec<u64> {
+    let row_bytes = k.div_ceil(TILE) * TILE;
+    m.chunks_exact(k)
+        .flat_map(|row| {
+            let mut bytes = vec![0u8; row_bytes];
+            for (dst, &v) in bytes.iter_mut().zip(row) {
+                *dst = v as u8;
+            }
+            bytes
+                .chunks_exact(8)
+                .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -276,7 +302,7 @@ mod tests {
         assert!(rpu.compute_busy());
 
         rpu.write_panel_i8(1, &[3; N2], &[-4; N2], TILE);
-        rpu.configure_bases();
+        rpu.configure_bases(1);
         rpu.write_control(1, CONTROL_PRELOAD);
         rpu.tick();
         assert!(rpu.compute_busy());
@@ -361,6 +387,19 @@ mod tests {
         let a = vec![-127i8; TILE * KMAX];
         let got = rpu.run_panel_i8(&a, &a, KMAX).unwrap();
         assert_eq!(got, vec![127 * 127 * KMAX as i32; N2]);
+    }
+
+    #[test]
+    fn panel_load_moves_one_beat_per_cycle() {
+        let latency: u32 = env!("RPU_READ_LATENCY").parse().unwrap();
+        let mut rpu = Rpu::new().unwrap();
+        for k in [1, 9, 784] {
+            let panel = vec![1i8; TILE * k];
+            let busy = rpu.busy_cycles();
+            rpu.preload_panel_i8(0, &panel, &panel, k).unwrap();
+            let beats = 2 * TILE as u32 * k.div_ceil(TILE) as u32;
+            assert_eq!(rpu.busy_cycles() - busy, beats + latency, "k = {k}");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // INT8 x INT8 + INT32 processing element, 2 stages.
 // Stage 1 registers the product (the DSP output register on an FPGA).
 // Stage 2 accumulates: a single 32-bit carry chain.
-// drain: load acc_in (the left neighbour) instead, so the array shifts out one column per cycle.
+// drain: load acc_in (the PE above) instead, so the array shifts out one row per cycle.
 module int8_cell (
     input  logic clk,
     input  logic reset,
