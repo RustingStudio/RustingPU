@@ -68,6 +68,7 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - `preload_overlaps_active_compute` now preloads with `KEEP_A` and writes bank 1's data before START. At N=16 the 64 host-write cycles were longer than the 63-cycle compute, so the test failed once the store left `compute_busy`.
 - 15 tests pass at N=8 (latency 1 and 10), N=16 (latency 1 and 10) and N=24. fmt and clippy clean, Icarus PASS. Correction to phase 6: `verilator --lint-only -Wall` was not clean. It flagged `wire_b[N]` as unused (B leaves the bottom row unused). Now silenced with a lint pragma; clean at N=8, 16, 24.
 - `examples/baseline.rs` prints the layer 1 line.
+- Commit: `2bda64a`.
 
 ## Phase 8: `brain` feature. Done, 2026-10-14
 - `rusting_brain = "4"` (crates.io) is an optional dependency behind the `brain` feature (owner approved Q3). The default build has no runtime dependency.
@@ -75,12 +76,14 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - Check: 64 random inputs through a seeded 784-128-10 network (ReLU, softmax) give outputs equal with `==` on the RPU and host int8 paths, at N = 8 and N = 16. Mutation: adding 1 to the last RPU accumulator fails the test.
 - Sanity against f32 (untrained network, inputs in [0, 1)): argmax agrees on 63/64, max probability difference 0.0013.
 - `data/` (the MNIST download for phase 9) is gitignored.
+- Commit: `da4e054`.
 
 ## Phase 9: MNIST end to end. Done, 2026-10-14
 - `examples/mnist.rs` (needs `--features brain`): trains 784-128-10 with RustingBrain on the CPU (3 epochs, Adam, seeded, 20 s), saves `data/mnist/mnist-784-128-10.json`, and evaluates the 10k test images in f32, host int8 and on the RPU in batches of 64.
 - N = 8: 97.26% on all three paths, 1890.6 cycles per image, 84.63% utilization. N = 16 (same JSON): 97.26% on all three, 545.0 cycles per image, 73.39%. RPU outputs equal host int8 with `==` for every batch. f32 minus int8 is 0.00 pp.
 - Contradiction with the plan: N = 16 is 545 cycles per image, not ~430. The plan's N = 16 estimate leaves out the unoverlapped A + first B load of each row block (1824 cycles per block, 114 per image). Details and the N = 8 breakdown are in `docs/m1-results.md`.
 - Training is reproducible: a second run from scratch wrote a byte-identical JSON.
+- Commit: `e19eef7`.
 
 ## Phase 10: org readiness. Done, 2026-10-14
 - Dead RTL deleted (Q5): `bf16_adder`, `bf16_multiplier`, `bf16_systolic_cell`, `dma_streamer`, `rpu_core_2x2/3x3/NxN`, `rpu_orchestrator`, `rpu_orchestrator_3x3/NxN`, `rpu_soc`, `sram`, `systolic_cell`, and testbenches `tb_orch_3x3`, `tb_orchestrator`, `tb_rpu`, `tb_soc`. None were in `build.rs` or the Icarus smoke test. Left: 5 RTL files and `sim/tb_tpu.sv`.
@@ -88,6 +91,7 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - `docs/engineering.md` tracked (Q6). Hint.md is left as it is. The guide keeps Hint.md's sections, but Hint.md describes the deleted BF16 design (`rpu_bf16_soc.sv`, 16-bit bus, BF16 contract). So each section was rewritten for the current int8 design and is not a verbatim copy.
 - README written from the section 5 outline. Every number in it is copied from `docs/m1-results.md`. `docs/engineering.md` now lists `src/brain.rs`, `examples/mnist.rs` and the `brain` feature.
 - Check: 15 tests pass, fmt and clippy clean, Icarus PASS, lint clean at N=8, 16, 24. A fresh `git clone --branch milestone-1` passes `cargo test --release` (15 tests) and `cargo test --release --features brain` (16 tests), checked again after the README commit; the clone has no `data/`.
+- Commits: `16cdbb1` (dead RTL, rename, guide), `b2f3279` (README).
 
 ## Questions for owner
 None open. Q3 answered 2026-10-14: `rusting_brain` from crates.io, approved. Q4 answered 2026-10-14: download a dataset; MNIST is in the gitignored `data/mnist/`.
