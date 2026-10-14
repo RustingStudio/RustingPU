@@ -1,9 +1,9 @@
-#include "Vrpu_bf16_soc.h"
+#include "Vrpu_top.h"
 #include <cstdint>
 #include "wrapper.h"
 
 struct rpu_t {
-    Vrpu_bf16_soc core;
+    Vrpu_top core;
 };
 
 static constexpr uint8_t N = 8;

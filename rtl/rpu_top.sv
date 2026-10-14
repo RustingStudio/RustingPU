@@ -1,4 +1,7 @@
-module rpu_bf16_soc #(
+// RPU top: register file, int8 tile buffers, DMA FSMs and the systolic array.
+// Bus words are 16 bits. A and B tiles hold two int8 per word (even element in the
+// low byte); C holds each int32 as two words, low half first. C = A * B^T (NT GEMM).
+module rpu_top #(
     parameter int N = 8,
     parameter int ADDR_W = 16
 ) (
@@ -17,16 +20,20 @@ module rpu_bf16_soc #(
 );
 
     localparam int EXT_WORDS = 4096;
-    localparam int TILE_WORDS = N * N;
-    localparam int STREAM_STEPS = N;
-    localparam int DRAIN_STEPS = 2 * N;
+    localparam int TILE_ELEMS = N * N;
+    localparam int AB_WORDS = TILE_ELEMS / 2;  // two int8 per word; N must be even
+    localparam int C_WORDS = TILE_ELEMS * 2;   // one int32 is two words
+    localparam int PE_LATENCY = 2;             // product register + accumulator
+    // Last product reaches PE (N-1, N-1) after 2N-2 skew cycles, then PE_LATENCY.
+    localparam int DRAIN_STEPS = 2 * N - 2 + PE_LATENCY;
     localparam int STREAM_W = (N > 1) ? $clog2(N) : 1;
     localparam int DRAIN_W = (DRAIN_STEPS > 1) ? $clog2(DRAIN_STEPS + 1) : 1;
-    localparam int DMA_W = (TILE_WORDS > 1) ? $clog2(TILE_WORDS) : 1;
+    localparam int DMA_W = $clog2(C_WORDS);
     localparam int EXT_ADDR_W = (EXT_WORDS > 1) ? $clog2(EXT_WORDS) : 1;
     localparam logic [STREAM_W-1:0] STREAM_LAST = STREAM_W'(N - 1);
     localparam logic [DRAIN_W-1:0] DRAIN_LAST = DRAIN_W'(DRAIN_STEPS - 1);
-    localparam logic [DMA_W-1:0] DMA_LAST = DMA_W'(TILE_WORDS - 1);
+    localparam logic [DMA_W-1:0] LOAD_LAST = DMA_W'(AB_WORDS - 1);
+    localparam logic [DMA_W-1:0] STORE_LAST = DMA_W'(C_WORDS - 1);
     localparam int unsigned REG_CONTROL_ADDR = 0;
     localparam int unsigned REG_STATUS_ADDR = 1;
     localparam int unsigned REG_A_BASE_ADDR = 2;
@@ -34,9 +41,9 @@ module rpu_bf16_soc #(
     localparam int unsigned REG_C_BASE_ADDR = 4;
     localparam int unsigned EXT_BASE_ADDR = 4096;
 
-    logic [15:0] mem_a [0:1][0:TILE_WORDS-1];
-    logic [15:0] mem_b [0:1][0:TILE_WORDS-1];
-    logic [15:0] mem_c [0:TILE_WORDS-1];
+    logic [7:0] mem_a [0:1][0:TILE_ELEMS-1];
+    logic [7:0] mem_b [0:1][0:TILE_ELEMS-1];
+    logic [31:0] mem_c [0:TILE_ELEMS-1];
 
     logic [15:0] reg_a_base;
     logic [15:0] reg_b_base;
@@ -80,9 +87,9 @@ module rpu_bf16_soc #(
     logic [15:0] compute_c_base;
     logic local_valid [0:1];
 
-    logic [15:0] a_flat [0:N-1];
-    logic [15:0] b_flat [0:N-1];
-    logic [15:0] c [0:N-1][0:N-1];
+    logic [N-1:0][7:0] a_flat;
+    logic [N-1:0][7:0] b_flat;
+    logic [N-1:0][N-1:0][31:0] c;
     logic core_reset;
     logic load_busy;
     logic compute_busy;
@@ -115,14 +122,14 @@ module rpu_bf16_soc #(
         for (i = 0; i < N; i++) begin : input_flatten
             assign a_flat[i] = (compute_state == COMPUTE_STREAM)
                 ? mem_a[compute_local_bank][i * N + int'(stream_idx)]
-                : 16'd0;
+                : 8'd0;
             assign b_flat[i] = (compute_state == COMPUTE_STREAM)
-                ? mem_b[compute_local_bank][int'(stream_idx) * N + i]
-                : 16'd0;
+                ? mem_b[compute_local_bank][i * N + int'(stream_idx)]
+                : 8'd0;
         end
     endgenerate
 
-    rpu_orchestrator_bf16 #(.N(N)) math_core (
+    rpu_array #(.N(N)) math_core (
         .clk(clk),
         .reset(core_reset),
         .a_flat(a_flat),
@@ -139,7 +146,7 @@ module rpu_bf16_soc #(
     assign dma_wr_valid = (compute_state == COMPUTE_STORE_C);
     assign dma_wr_bank = compute_ext_bank;
     assign dma_wr_addr = EXT_ADDR_W'(int'(compute_c_base) + int'(store_idx));
-    assign dma_wr_data = mem_c[store_idx];
+    assign dma_wr_data = store_idx[0] ? mem_c[store_idx[DMA_W-1:1]][31:16] : mem_c[store_idx[DMA_W-1:1]][15:0];
 
     rpu_sim_memory #(
         .WORDS(EXT_WORDS),
@@ -262,9 +269,10 @@ module rpu_bf16_soc #(
                 end
                 LOAD_A: begin
                     if (dma_rd_ready) begin
-                        mem_a[load_local_bank][load_idx] <= dma_rd_data;
+                        mem_a[load_local_bank][int'(load_idx) * 2] <= dma_rd_data[7:0];
+                        mem_a[load_local_bank][int'(load_idx) * 2 + 1] <= dma_rd_data[15:8];
 
-                        if (load_idx == DMA_LAST) begin
+                        if (load_idx == LOAD_LAST) begin
                             load_idx <= '0;
                             load_state <= LOAD_B;
                         end else begin
@@ -274,9 +282,10 @@ module rpu_bf16_soc #(
                 end
                 LOAD_B: begin
                     if (dma_rd_ready) begin
-                        mem_b[load_local_bank][load_idx] <= dma_rd_data;
+                        mem_b[load_local_bank][int'(load_idx) * 2] <= dma_rd_data[7:0];
+                        mem_b[load_local_bank][int'(load_idx) * 2 + 1] <= dma_rd_data[15:8];
 
-                        if (load_idx == DMA_LAST) begin
+                        if (load_idx == LOAD_LAST) begin
                             load_idx <= '0;
                             load_state <= LOAD_IDLE;
 
@@ -335,7 +344,7 @@ module rpu_bf16_soc #(
                 end
                 COMPUTE_STORE_C: begin
                     if (dma_wr_ready) begin
-                        if (store_idx == DMA_LAST) begin
+                        if (store_idx == STORE_LAST) begin
                             store_idx <= '0;
                             compute_state <= COMPUTE_FINISH;
                         end else begin

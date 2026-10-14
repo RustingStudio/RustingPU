@@ -5,22 +5,15 @@ fn main() {
 
     let rtl_files = [
         "rtl/delay_cell.sv",
-        "rtl/bf16_multiplier.sv",
-        "rtl/bf16_adder.sv",
-        "rtl/bf16_systolic_cell.sv",
-        "rtl/rpu_orchestrator_bf16.sv",
+        "rtl/int8_cell.sv",
+        "rtl/rpu_array.sv",
         "rtl/rpu_sim_memory.sv",
-        "rtl/rpu_bf16_soc.sv",
+        "rtl/rpu_top.sv",
     ];
 
     let mut cmd = std::process::Command::new("verilator");
-    cmd.args([
-        "--cc",
-        "-Wno-CASEINCOMPLETE",
-        "--top-module",
-        "rpu_bf16_soc",
-    ])
-    .args(["-Mdir", &obj_dir]);
+    cmd.args(["--cc", "-Wno-CASEINCOMPLETE", "--top-module", "rpu_top"])
+        .args(["-Mdir", &obj_dir]);
     for f in &rtl_files {
         cmd.arg(format!("{}/{}", base, f));
     }
@@ -36,7 +29,7 @@ fn main() {
             continue;
         };
 
-        if file_name.starts_with("Vrpu_bf16_soc") && file_name.ends_with(".cpp") {
+        if file_name.starts_with("Vrpu_top") && file_name.ends_with(".cpp") {
             build.file(path);
         }
     }

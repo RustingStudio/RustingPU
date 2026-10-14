@@ -1,61 +1,72 @@
 `timescale 1ns / 1ps
 
+// Smoke test of the raw int8 systolic array (no registers, no memory path).
+// Streams one N x N NT tile and compares C with a behavioural reference.
 module tb_tpu;
-    parameter N = 2;
+    parameter int N = 4;
     logic clk, reset;
-    logic [15:0] a_flat [0:N-1];
-    logic [15:0] b_flat [0:N-1];
-    logic [15:0] c [0:N-1][0:N-1];
+    logic [N-1:0][7:0] a_flat;
+    logic [N-1:0][7:0] b_flat;
+    logic [N-1:0][N-1:0][31:0] c;
 
-    rpu_orchestrator_bf16 #(.N(N)) uut (.*);
+    logic signed [7:0] a [0:N-1][0:N-1];
+    logic signed [7:0] b [0:N-1][0:N-1];
+    int errors;
+    // Icarus cannot index a multi-dimensional packed array with variables.
+    wire [N*N*32-1:0] c_bits = c;
+
+    rpu_array #(.N(N)) uut (.*);
 
     initial begin
         clk = 0;
         forever #5 clk = ~clk;
     end
 
-    function real bf16_to_real(input logic [15:0] bf);
-        real res;
-        int exp;
-        real fract;
-        if (bf == 16'd0) return 0.0;
-        exp = bf[14:7] - 127;
-        fract = 1.0 + (bf[6:0] / 128.0);
-        res = fract * (2.0 ** exp);
-        if (bf[15]) res = -res;
-        return res;
-    endfunction
-
     initial begin
+        for (int i = 0; i < N; i++) begin
+            for (int k = 0; k < N; k++) begin
+                a[i][k] = 8'((i * 37 + k * 11) % 255 - 127);
+                b[i][k] = 8'((i * 53 + k * 29 + 5) % 255 - 127);
+            end
+            a_flat[i] = 0;
+            b_flat[i] = 0;
+        end
+        a[0][0] = -127;
+        b[0][0] = -127;
+
         reset = 1;
-        a_flat[0]=0; a_flat[1]=0; b_flat[0]=0; b_flat[1]=0;
-        #10;
+        @(negedge clk);
         reset = 0;
 
-        $display("STARTING TENSOR PROCESSING");
+        for (int k = 0; k < N; k++) begin
+            for (int i = 0; i < N; i++) begin
+                a_flat[i] = a[i][k];
+                b_flat[i] = b[i][k];
+            end
+            @(negedge clk);
+        end
+        for (int i = 0; i < N; i++) begin
+            a_flat[i] = 0;
+            b_flat[i] = 0;
+        end
+        repeat (2 * N) @(negedge clk);
 
-
-        a_flat[0] = 16'h3FC0; // 1.5
-        a_flat[1] = 16'h0000; // 0.0
-        b_flat[0] = 16'h4000; // 2.0
-        b_flat[1] = 16'h0000; // 0.0
-        #10;
-
-        a_flat[0] = 16'h4000; // 2.0
-        a_flat[1] = 16'h3F80; // 1.0
-        b_flat[0] = 16'h0000; // 0.0
-        b_flat[1] = 16'h4040; // 3.0
-        #10;
-
-        a_flat[0]=0; a_flat[1]=0; b_flat[0]=0; b_flat[1]=0;
-
-        #40;
-
-        $display("\nMATRIX C");
-        $display("[ %f   %f ]", bf16_to_real(c[0][0]), bf16_to_real(c[0][1]));
-        $display("[ %f   %f ]", bf16_to_real(c[1][0]), bf16_to_real(c[1][1]));
-        $display("");
-
+        errors = 0;
+        for (int i = 0; i < N; i++) begin
+            for (int j = 0; j < N; j++) begin
+                int want;
+                logic signed [31:0] got;
+                got = c_bits[(i * N + j) * 32 +: 32];
+                want = 0;
+                for (int k = 0; k < N; k++) want += int'(a[i][k]) * int'(b[j][k]);
+                if (got !== want) begin
+                    $display("MISMATCH c[%0d][%0d] = %0d, want %0d", i, j, got, want);
+                    errors++;
+                end
+            end
+        end
+        if (errors == 0) $display("PASS: %0dx%0d int8 tile bit-exact", N, N);
+        else $fatal(1, "FAIL: %0d mismatches", errors);
         $finish;
     end
 endmodule

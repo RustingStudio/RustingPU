@@ -19,4 +19,14 @@ Spec: `docs/plan-milestone-1.md`, section 3. One entry per phase or sub-step.
 - Tests `int8_edge_tiles_are_bit_exact` (0, 127, -127, mixed signs, ramp) and `int8_random_tiles_are_bit_exact` (1000 seeded tiles, -127/0/127 forced 3/16 of the time). Both compare with `==`.
 - They are `#[ignore]` so the full check stays green. Check: `cargo test --release -- --ignored` runs both and **both fail** against the BF16 RTL (first mismatch: all-127 tile). Normal test run: 10 passed, 2 ignored.
 
+## Phase 3: INT8 PE and array. Done, 2026-10-14
+- `rtl/int8_cell.sv`: 2-stage PE (registered `a*b`, then `acc + p`). `rtl/rpu_array.sv` (was `rpu_orchestrator_bf16.sv`): int8 array with packed ports (Yosys does not take unpacked array ports). `rtl/rpu_top.sv` (was `rpu_bf16_soc.sv`): int8 A/B buffers (two int8 per 16-bit word), 32-bit `mem_c`, C stored as lo/hi words, NT stream order for B. `delay_cell` has a width parameter.
+- Drain is `2N - 2 + PE_LATENCY` = 16 cycles at N=8, exact: with one cycle less, both bit-exact tests fail (checked by mutation).
+- `build.rs` compiles only `delay_cell`, `int8_cell`, `rpu_array`, `rpu_sim_memory`, `rpu_top`. All BF16 Rust API removed; `Rpu::run_tile_i8`, `preload_tile_i8`, `start`, `read_c` remain.
+- `sim/tb_tpu.sv` is now a self-checking int8 array test (N=4, includes -127 x -127). Run:
+  `iverilog -g2012 -o tpu_sim rtl/delay_cell.sv rtl/int8_cell.sv rtl/rpu_array.sv sim/tb_tpu.sv && vvp -n tpu_sim` prints `PASS: 4x4 int8 tile bit-exact`. With the drain wait 2 cycles short it fails.
+- Check: 1000 random tiles + edge tiles bit-exact (`==`). 10 tests pass. fmt, clippy clean.
+- Cycles (`examples/baseline.rs`): load A+B **192** (64 words x 3), compute+store **409** (clear 1 + stream 8 + drain 16 + store 128 words x 3).
+- Synthesis (yosys `synth_gowin`, `docs/resources.md`): gw5a LUT-only N=8 24,258 LUT+ALU, N=16 97,056 (162% of GW5AT-LV60, so N=16 needs DSPs); gw2a N=8 64 MULT9X9 + 2,048 ALU + 0 LUT, N=16 256 MULT9X9 + 8,192 ALU. GW5A DSP count deferred to milestone 2 (Gowin EDA not installed).
+
 ## Questions for owner
