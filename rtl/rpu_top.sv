@@ -35,8 +35,12 @@ module rpu_top #(
     localparam int C_ROW_BEATS = 4;                  // N int32 = 4 beats of N bytes
     localparam int C_BEATS = C_ROW_BEATS * N;
     localparam int PE_LATENCY = 2;                   // product register + accumulator
-    // Last product reaches PE (N-1, N-1) after 2N-2 skew cycles, then PE_LATENCY.
-    localparam int SETTLE_STEPS = 2 * N - 2 + PE_LATENCY;
+    // Operand register between the panel read and the array, so that the edge PEs'
+    // multipliers start from a flip-flop and not from the panel read multiplexer.
+    localparam int OPERAND_STAGES = 1;
+    // The last k reaches PE (N-1, N-1) after the operand register and 2N-2 skew cycles;
+    // the shadow takes the sum with the last product, PE_LATENCY - 1 cycles later.
+    localparam int SETTLE_STEPS = OPERAND_STAGES + 2 * N - 2 + PE_LATENCY - 1;
     // A stream may start during the drain of the tile before only if it is long enough:
     // the drain must end before PE (0, 0) takes the new sum, K cycles after the start.
     localparam int OVERLAP_K_MIN = SETTLE_STEPS + N;
@@ -146,6 +150,9 @@ module rpu_top #(
 
     logic [N-1:0][7:0] a_flat;
     logic [N-1:0][7:0] b_flat;
+    logic [N-1:0][7:0] a_operand;
+    logic [N-1:0][7:0] b_operand;
+    logic last_operand;
     logic [N-1:0][31:0] c_row;
     logic compute_busy;
     logic host_mem_we;
@@ -190,12 +197,24 @@ module rpu_top #(
         end
     endgenerate
 
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            a_operand <= '0;
+            b_operand <= '0;
+            last_operand <= 1'b0;
+        end else begin
+            a_operand <= a_flat;
+            b_operand <= b_flat;
+            last_operand <= stream_last_k;
+        end
+    end
+
     rpu_array #(.N(N)) math_core (
         .clk(clk),
         .reset(reset),
-        .a_flat(a_flat),
-        .b_flat(b_flat),
-        .last(stream_last_k),
+        .a_flat(a_operand),
+        .b_flat(b_operand),
+        .last(last_operand),
         .drain(drain_state == DRAIN_SHIFT),
         .c_row(c_row)
     );

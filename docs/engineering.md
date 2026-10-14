@@ -154,8 +154,9 @@ compute:
        -> FINISH  (the next START is accepted from here)
 
 drain (separate, starts when a STREAM ends):
-  IDLE -> SETTLE  2N - 2 + PE_LATENCY cycles until the last sum lands in the
-                  shadow registers, then wait for the C store of the tile before
+  IDLE -> SETTLE  OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1 cycles (2N) until the
+                  last sum lands in the shadow registers, then wait for the C
+                  store of the tile before
        -> SHIFT   N cycles, the shadows shift one row down per cycle into mem_c
        -> IDLE
 
@@ -165,7 +166,7 @@ store (separate, starts when SHIFT ends):
 
 ## 4. Systolic dataflow
 
-During stream cycle k, row i of the array gets `A[i][k]` and column j gets `B[j][k]`. `rpu_array.sv` skews row i and column j by i and j cycles so matching values meet at PE (i, j).
+During stream cycle k, row i of the array gets `A[i][k]` and column j gets `B[j][k]`, one cycle later: the bytes picked from the panel beats go through an operand register (`OPERAND_STAGES = 1`) first, together with the last flag. Without it, the multipliers of the PEs in row 0 and column 0 (no skew register in front) would start from the panel read and lane multiplexer, the deepest logic in the design (see `docs/perf-log.md`, item 6). `rpu_array.sv` skews row i and column j by i and j cycles so matching values meet at PE (i, j).
 
 Each `int8_cell` is two stages (`PE_LATENCY = 2`):
 
@@ -180,9 +181,9 @@ a_out <= a_in;  b_out <= b_in;  last_out <= last_in
 
 The last flag enters with the last k of a tile and goes through the same skew as row i of A, so it reaches each PE with that PE's last product. The PE then moves the finished sum into the shadow register and restarts its running sum at zero, and the next tile's first product can arrive the cycle after. Outside STREAM the array gets zeros, so the running sums stay zero between tiles; the array is reset only with the RPU.
 
-The settle time `2N - 2 + PE_LATENCY` is exact: one cycle shorter loses the last sum of PE (N-1, N-1). The tests include a case where only the last k is nonzero to catch that. During SHIFT each shadow loads the shadow of the PE above, so the bottom row `c_row` delivers C row N-1, then N-2, ..., one per cycle.
+The settle time `OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1` is exact: the last k reaches PE (N-1, N-1) after the operand register and 2N - 2 skew cycles, and its shadow takes the sum with the last product, one cycle later. One cycle shorter loses the last sum of PE (N-1, N-1); the tests include a case where only the last k is nonzero to catch that. During SHIFT each shadow loads the shadow of the PE above, so the bottom row `c_row` delivers C row N-1, then N-2, ..., one per cycle.
 
-A STREAM may start while the drain before is pending only if its K is at least `OVERLAP_K_MIN = SETTLE_STEPS + N` (3N) and no C store is running (a running store could delay the drain). Otherwise CLEAR waits until the drain is done. The drain shifts must end before PE (0, 0) takes the new tile's sum, K + 1 cycles after the new stream starts. A STREAM starts at the earliest 3 cycles after the one before ends (FINISH, then CLEAR), so 3N - 2 would be enough; a host that polls COMPUTE_BUSY starts one cycle later. `start_right_after_stream_end` runs that case and fails once the threshold is 3N - 4.
+A STREAM may start while the drain before is pending only if its K is at least `OVERLAP_K_MIN = SETTLE_STEPS + N` (3N) and no C store is running (a running store could delay the drain). Otherwise CLEAR waits until the drain is done. The drain shifts must end before PE (0, 0) takes the new tile's sum. A STREAM starts at the earliest 3 cycles after the one before ends (FINISH, then CLEAR); a host that polls COMPUTE_BUSY starts one cycle later. `start_right_after_stream_end` runs that case: it passes with the threshold at 3N - 3 and fails at 3N - 4, so 3N keeps a margin of 3 cycles.
 
 ## 5. File overview
 

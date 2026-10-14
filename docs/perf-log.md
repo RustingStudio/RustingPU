@@ -16,6 +16,8 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 5 shadow accumulator | 8 | 97.26% | 1743.2 | 91.78% | 124.5 / 72.0 | 14.5 s |
 | 5 shadow accumulator | 16 | 97.26% | 478.0 | 83.68% | 117.7 / 72.0 | 17.6 s |
 | 5 shadow accumulator | 12 | 97.26% | 939.7 | 87.36% | 179.8 / 108.1 | 19.7 s |
+| 6 operand register | 8 | 97.26% | 1743.2 | 91.78% | 124.5 / 72.0 | 14.6 s |
+| 6 operand register | 16 | 97.26% | 478.0 | 83.68% | 117.7 / 72.0 | 17.7 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -85,3 +87,33 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
   - Longest combinational path of the PE (`synth_gowin -noiopads`, `delete t:DFF*`, `ltp`; `ltp -noff` does not know the Gowin DFF cells and walks through them): 33 cells before and after, the 32-bit ALU carry chain plus one LUT, at gw5a and gw2a. The shadow does not lengthen it.
 - Tests: `next_tile_streams_during_drain` (8 tiles, K = 25N, bit-exact, and the idle cycles are at most the first load, the last settle, drain and store, and read latency + 8 per tile); `start_right_after_stream_end`; `gemm_with_ragged_shapes_is_bit_exact` adds 2N x 4N GEMMs with K = 3N - 1, 3N and 3N + 1. The Icarus smoke test drives the last flag. Mutations: threshold N fails the ragged test; no overlap at all fails `next_tile_streams_during_drain`; ignoring a running store fails the ragged test; no restart of the running sum fails 8 tests; threshold 3N - 4 fails `start_right_after_stream_end`. Thresholds 3N - 1 to 3N - 3 pass, which is correct by the timing above. All tests pass at N = 4, 8, 12, 16 and 24 (READ_LATENCY 1) and at N = 4, 8, 12 and 16 with READ_LATENCY 10, and with the brain feature at N = 8, 12 and 16. Verilator lint is clean at N = 8, 12 and 16.
 - Load: `uptime` 2.80.
+- Commit: `45a1c32`.
+
+## Item 6: Fmax proxy. Done, 2026-10-14
+- Method. Two proxies, both on `rpu_top` after `synth_gowin -noiopads` with `rpu_sim_memory` as a black box:
+  - `ltp` after deleting every sequential cell (`delete t:DFF* t:SDPX9B t:RAM16SDP* t:*rpu_sim_memory*`), so that paths start and end at registers and memories. `ltp` counts cells, so a 32-cell carry chain looks longest even though carry cells are fast; a script also counts LUT and MUX2 levels on the deepest path.
+  - `sta` after `read_verilog -lib -specify +/gowin/cells_sim.v`: arrival times in ps from the specify blocks of the yosys Gowin cell models. ALU, MULT9X9 and SDPX9B have no timing arcs there, so carry chains, gw2a multipliers and BSRAM reads count as zero. This is a proxy, not Gowin timing.
+- Before (`45a1c32`):
+  - `ltp`: 33 cells at N = 8 and 16, gw5a and gw2a: the PE's 32-bit accumulate (32 ALU + 1 LUT), as the backlog guessed. By logic levels it is not the longest: the deepest paths start at the panel read and end in the edge PEs' multipliers, which took their operands straight from the panel read multiplexer (row 0 and column 0 have no skew register). 12 LUT/MUX2 levels + MULT9X9 at N = 8 gw2a, 23 levels + 4 ALU at N = 8 gw5a (soft multiplier), 20 + 8 ALU at N = 16 gw5a, 13 at N = 16 gw2a.
+  - `sta`, gw5a: 12,443 ps at N = 4, 12,607 ps at N = 8, on the panel read, the lane multiplexer and the soft multiplier of PE (0, 0).
+- Fix: an operand register (`OPERAND_STAGES = 1`) between the panel read and the array for A, B and the last flag. Every PE multiplier now starts from a flip-flop. The settle is one cycle longer (`SETTLE_STEPS = OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1`). Writing that down showed the settle had one cycle of slack since item 5 (the shadow takes the sum PE_LATENCY - 1 cycles after the last product enters, not PE_LATENCY); it is now exact, so the drain did not get longer. `OVERLAP_K_MIN` stays 3N.
+- After:
+  - LUT/MUX2 levels on the deepest path: 12 (N = 8 gw2a), 12 (N = 8 gw5a), 11 (N = 16 gw5a), 13 (N = 16 gw2a), all ending at a register; no multiplier on any of them. `ltp` is still 33 (the accumulate).
+  - `sta`, gw5a: 8,155 ps at N = 4 (-34%), 7,936 ps at N = 8 (-37%). The critical path is now the B panel read: `stream_beat` register, RAM16SDP4 (LUT RAM) read, 4 LUT4 and the MUX2_LUT5/6 lane tree into `b_operand`.
+  - `sta`, gw2a, N = 8: 7,910 to 8,300 ps. Not a regression: MULT9X9 has no timing arcs, so gw2a `sta` never saw the multiplier path the register removes. Its longest timed path before and after is the same B panel read and multiplexer, ending at the first skew register before and at `b_operand` after; the 390 ps are a different LUT mapping of that multiplexer.
+- So the 32-bit accumulate is not the critical path; the panel read into the multiplier was, and now the B panel read alone is. PE_LATENCY stays 2.
+- Cycles and accuracy are unchanged, as expected (the settle is as long as before): 97.26%, RPU equal to host int8 for every image, 1743.2 and 478.0 cycles per image, 91.78% and 83.68%, 124.5 / 72.0 and 117.7 / 72.0 host words. Wall time 14.6 s (N = 8) and 17.7 s (N = 16).
+- Synthesis, `rpu_top` (same command as item 3, default flow), before / after:
+
+  | N | Family | LUT | ALU | DFF | MULT9X9 | SDPX9B (BSRAM) | RAM16SDP4 (LUT RAM) |
+  |---|---|---:|---:|---:|---:|---:|---:|
+  | 8 | gw5a | 22,091 / 35,155 | 3,347 / 3,347 | 6,954 / 7,083 | 0 / 0 | 16 / 16 | 2,112 / 2,112 |
+  | 8 | gw2a | 12,506 / 12,762 | 2,323 / 2,323 | 6,954 / 7,083 | 64 / 64 | 16 / 16 | 2,112 / 2,112 |
+  | 16 | gw5a | 68,634 / 117,706 | 12,562 / 12,562 | 26,810 / 27,067 | 0 / 0 | 64 / 64 | 4,224 / 4,224 |
+  | 16 | gw2a | 30,814 / 29,851 | 8,466 / 8,466 | 26,810 / 27,067 | 256 / 256 | 64 / 64 | 4,224 / 4,224 |
+
+  - The register costs +129 DFF at N = 8 and +257 at N = 16 (16N + 1). On gw2a, which maps the multipliers to MULT9X9 as the board's DSPs would, LUT changes by +256 and -963.
+  - The gw5a LUT growth is not the register. Yosys has no DSP mapping for gw5a, so every multiplier is soft logic, and ABC9 maps for delay: once the multiplier no longer sits behind the panel multiplexer, the critical path is shorter, and ABC9 spends area to make every multiplier faster too. With a fixed delay target (`synth_gowin -run :map_luts; abc9 -maxlut 8 -W 500 -D 50000; synth_gowin -run map_cells:`) the LUT count is unchanged: 20,855 / 20,828 at N = 8, 67,490 / 67,477 at N = 16. gw5a LUT counts here are only an upper bound anyway (`docs/resources.md`: N = 16 needs DSP multipliers on the board).
+- Next path, not changed in this item: the B panels are in LUT RAM (item 3), so the read is a LUT RAM read plus a multiplexer tree. Moving them to BSRAM (a single linear address register, as for A) would put a registered read there and free about 2,048 RAM16SDP4 at N = 8, but it needs 128 SDPX9B at N = 16, more than the 118 on the GW5AT-LV60. It changes speed only on the board (no cycle gain in simulation), so it is a question for milestone 2, not a loop item.
+- Tests: the whole suite covers the new timing; mutations: the last flag not registered with the operands fails 9 tests at N = 8 and 16; the settle one cycle shorter fails 9 tests. The overlap threshold passes at 3N - 1 and 3N - 3 and fails at 3N - 4 (`start_right_after_stream_end`), the same boundary as item 5. All pass at N = 8 and 16, READ_LATENCY 1 and 10; Icarus smoke test and Verilator lint clean.
+- Load: `uptime` 4.5 (MNIST), 3.9 (synthesis).
