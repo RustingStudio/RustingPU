@@ -27,7 +27,7 @@ RPU_N=16 cargo run --release --features brain --example mnist # N = 16
 ```text
 host (Rust)                          RPU (SystemVerilog, simulated by Verilator)
   RpuMlp: quantize the input           register file: CONTROL, STATUS, A/B/C base, K
-  write A, B, layer parameters ---bus--> 1 MB memory, 8*N-bit beats
+  write A, B, parameters -bus-->      1 MB memory, 8*N-bit beats
   start each GEMM                      load FSM: two A and two B local banks
   read the last layer's C,             N x N array of int8 x int8 -> int32 PEs,
   dequantize, bias, softmax            output-stationary, K streamed one per cycle
