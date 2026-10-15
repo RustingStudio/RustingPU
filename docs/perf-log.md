@@ -651,7 +651,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
   - Slack not covered by a test, kept by the argument above: row q shifting for q + 1 cycles passes (the captures have one cycle to spare); `STORE_BOUND` passes down to 26 of 36 at N = 8, because no test reaches CLEAR at the first cycle of a full requantized store (in the new test C's CLEAR comes at about row 3 of A's store); the `drain_state == DRAIN_IDLE` term in the hand-over never decides: a settle reaches its last step SETTLE_STEPS > N cycles after its stream ends, which is no earlier than the hand-over before it, so that shift is over by then. It stays as the safe form.
 - All 38 tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10 (8, 16, 64), with the brain feature (41), at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16, 64) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check (fmt, clippy, Icarus, Verilator lint at N = 8 to 64) is clean.
 - Load: `uptime` 1.4 to 3.3 (synthesis, tests and MNIST in parallel).
-- Commit: HASH.
+- Commit: `204efbd`. N = 16, batch 64, at this commit: 404.6 busy and 406.6 wall cycles per image.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
