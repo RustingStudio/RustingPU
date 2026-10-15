@@ -65,3 +65,11 @@ The MNIST example reads the four unpacked IDX files from `data/mnist/` (not in t
 
 1. Milestone 2: the RPU on a Sipeed Tang Mega 60K (Gowin GW5AT-60), with the same predictions bit for bit as Verilator.
 2. DDR3 for models larger than on-chip BSRAM.
+
+## License
+
+RustingPU is released under the [RustingPU License 1.0](LICENSE.md). You may
+use, modify and distribute it, and sell boards, products and services built on
+it, as long as you keep the license and credit Vasyl Trefilov as the original
+author. You may not sell RustingPU itself. Changes are listed in
+[CHANGELOG.md](CHANGELOG.md).

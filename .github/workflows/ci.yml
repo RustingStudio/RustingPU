@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  # The version the README numbers were measured with. Distro packages are
+  # older, so CI builds it once and caches it.
+  VERILATOR_VERSION: v5.052
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - n: 8
+            load_beats: 1
+          - n: 16
+            load_beats: 1
+          - n: 64
+            load_beats: 2
+    env:
+      RPU_N: ${{ matrix.n }}
+      RPU_LOAD_BEATS: ${{ matrix.load_beats }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: verilator-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/verilator
+          key: verilator-${{ env.VERILATOR_VERSION }}-${{ runner.os }}
+      - if: steps.verilator-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git help2man perl python3 make autoconf g++ flex bison ccache libfl2 libfl-dev zlib1g zlib1g-dev
+          git clone --depth 1 --branch "$VERILATOR_VERSION" https://github.com/verilator/verilator /tmp/verilator
+          cd /tmp/verilator
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          make install
+      - run: echo /opt/verilator/bin >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: n${{ matrix.n }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --features brain -- -D warnings
+      # The MNIST data is not in the repository; the tests need none of it.
+      - run: cargo test --release --features brain
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: verilator-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/verilator
+          key: verilator-${{ env.VERILATOR_VERSION }}-${{ runner.os }}
+      - if: steps.verilator-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git help2man perl python3 make autoconf g++ flex bison ccache libfl2 libfl-dev zlib1g zlib1g-dev
+          git clone --depth 1 --branch "$VERILATOR_VERSION" https://github.com/verilator/verilator /tmp/verilator
+          cd /tmp/verilator
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          make install
+      - run: echo /opt/verilator/bin >> "$GITHUB_PATH"
+      # `rust-version` in Cargo.toml: `is_multiple_of` needs 1.87, RustingBrain 1.88.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets --features brain

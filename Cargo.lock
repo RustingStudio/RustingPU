@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "rusting_pu"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cc",
  "rusting_brain",

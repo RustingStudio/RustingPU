@@ -1,7 +1,15 @@
 [package]
 name = "rusting_pu"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "An INT8 systolic-array accelerator in SystemVerilog, simulated by Verilator and driven from Rust, that runs RustingBrain models bit-exact with a host reference."
+readme = "README.md"
+license-file = "LICENSE.md"
+rust-version = "1.88"
+homepage = "https://github.com/RustingStudio/RustingPU"
+repository = "https://github.com/RustingStudio/RustingPU.git"
+keywords = ["systolic-array", "accelerator", "verilator", "int8", "hardware"]
+categories = ["simulation", "science", "hardware-support"]
 
 [dependencies]
 rusting_brain = { version = "4", optional = true }

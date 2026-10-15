@@ -1,7 +1,13 @@
 fn main() {
     let base = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let obj_dir = format!("{}/obj_dir", std::env::var("OUT_DIR").unwrap());
-    let verilator_inc = "/usr/share/verilator/include".to_string();
+    // Ask Verilator where it lives: /usr/share/verilator from a distro package,
+    // /usr/local/share/verilator from a source build.
+    let root = std::process::Command::new("verilator")
+        .args(["--getenv", "VERILATOR_ROOT"])
+        .output()
+        .expect("verilator not found");
+    let verilator_inc = format!("{}/include", String::from_utf8(root.stdout).unwrap().trim());
 
     let rtl_files = [
         "rtl/delay_cell.sv",
