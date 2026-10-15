@@ -186,10 +186,12 @@ drain (separate, starts when a STREAM ends):
   IDLE -> SETTLE  OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1 cycles (2N) until the
                   last sum lands in the shadow registers, then wait for the C
                   store of the tile before
-       -> SHIFT   N cycles, the shadows shift one row down per cycle into mem_c
+       -> SHIFT   N cycles, the shadows shift one row down per cycle into mem_c,
+                  row N-1 first
        -> IDLE
 
-store (separate, starts when SHIFT ends):
+store (separate, starts with SHIFT and follows it from row N-1 down to row 0, at
+most one row per cycle, so it reads each row of mem_c after the drain wrote it):
   4N beats, one per cycle; the memory never stalls a write. The last B tile of
   a GEMM stores 4 - TILES[33:32] beats per row, so (4 - skip)N cycles. With QUANT,
   QUANT_PARTS cycles per row: each cycle reads the parameters of L columns and requantizes

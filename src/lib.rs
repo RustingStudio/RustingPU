@@ -973,7 +973,7 @@ mod tests {
             assert_eq!(active as usize, tiles * k);
             // Idle array cycles: the part of the first A + B load that the first stream does
             // not overlap (K + 2N, or 2N / LOAD_BEATS + 1 when the load keeps up with the
-            // stream), the last settle, drain and store (7N), and per tile the
+            // stream), the last settle and store (6N; the store follows the drain), and per tile the
             // read latency of its load and a few cycles of START handshake, but no settle or
             // drain per tile and no B load at a row block change.
             let idle = busy as usize - tiles * k;
@@ -982,7 +982,7 @@ mod tests {
             } else {
                 2 * TILE / LOAD_BEATS + 1
             };
-            let bound = first + latency + 7 * TILE + tiles * (latency + 8);
+            let bound = first + latency + 6 * TILE + tiles * (latency + 8);
             assert!(idle <= bound, "{idle} idle cycles, bound {bound}");
         }
     }

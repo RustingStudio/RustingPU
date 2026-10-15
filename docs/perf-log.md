@@ -54,6 +54,11 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 17 store only the C beats that hold outputs, LOAD_BEATS 2 | 64 | 97.25% | 40.3 | 66.12% | 108.2 / 8.0 | 23.1 s |
 | 18 QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 108.2 | 94.39% | 103.7 / 8.0 | 7.9 s |
 | 18 QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 37.3 | 71.47% | 108.2 / 8.0 | 23.5 s |
+| 19 store each C tile while it drains | 8 | 97.25% | 1625.2 | 98.45% | 101.5 / 5.0 | 4.9 s |
+| 19 store each C tile while it drains | 16 | 97.25% | 420.1 | 95.20% | 101.5 / 6.0 | 5.1 s |
+| 19 store each C tile while it drains | 12 | 97.25% | 851.2 | 96.44% | 152.6 / 8.0 | 5.6 s |
+| 19 store each C tile while it drains, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 107.3 | 95.24% | 103.7 / 8.0 | 8.0 s |
+| 19 store each C tile while it drains, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 35.3 | 75.48% | 108.2 / 8.0 | 22.9 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -409,6 +414,28 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
   - xcup N = 32, LOAD_BEATS 2, QUANT_PARTS 1: 87,132 LUT (79,581, +9.5%), 117,365 FF (+5.8%), 1,089 DSP (+48). The 8 RAMB36E2 of the 8 parameter memories (128 words each) become 128 more LUT RAM cells (32 memories of 32 words).
 - Tests: new `requantized_store_takes_quant_parts_cycles_per_row` checks that a QUANT tile is busy QUANT_PARTS N + 5 cycles where the same int32 tile is busy 4N (5 requantization stages). All tests pass at QUANT_PARTS 1, 2 and 3 at N = 4, 8 (LOAD_BEATS 2), 12, 16, and 1 and 2 at N = 32 and 64 (LOAD_BEATS 2), READ_LATENCY 1 and 10, with the brain feature; QUANT_PARTS 4 passes the full check. Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2, at QUANT_PARTS 4 and 1, clean. Mutations at N = 8, QUANT_PARTS 1, each caught: row written at part 3 instead of the last part (3 tests), the store still 4 parts per row (the new test), the parameter address j*4 + part in the RTL (2) and in the driver (2), L = ceil(N/4) in the RTL (2), the driver lane count ceil(N/4) (2).
 - Load: `uptime` 3.7 to 4.3 (tests, MNIST and synthesis in parallel).
+- Commit: `4f0112e`.
+
+## Item 19: store each C tile while it drains. Done, 2026-10-15
+- Before: the store of a C tile started after the drain had shifted all N rows into mem_c, so every GEMM ended with settle (2N), drain (N) and then the whole store. The profile after item 18 showed this tail in every GEMM: at N = 64, QUANT_PARTS 1, 351 idle cycles in layer 1 and 326 in layer 2 per call.
+- Fix: the store starts in the first SHIFT cycle and walks mem_c from row N-1 down to row 0, the order in which the drain writes it. It takes at least one cycle per row, so it always reads a row after the drain wrote it. The store end moved to row 0. The compute clear condition is unchanged; relaxing it to let the next drain start during the store gave no cycles.
+- Profile, idle cycles per call, layer 1 / layer 2, item 18 to item 19: N = 64 QUANT_PARTS 1 351 / 326 to 288 / 263; N = 64 QUANT_PARTS 4 543 / 326 to 480 / 263; N = 32 QUANT_PARTS 1 187 / 200 to 156 / 169; N = 16 1047 / 267 to 1032 / 252. Exactly N cycles saved per GEMM.
+- MNIST, cycles per image, RPU equal to host int8 for every image, 97.25%, host words unchanged:
+
+  | N | LOAD_BEATS | QUANT_PARTS | Batch 64 | Batch 256 |
+  |---|---|---|---:|---:|
+  | 8 | 1 | 4 | 1625.5 to 1625.2 | 1613.2 to 1613.1 |
+  | 16 | 1 | 4 | 420.6 to 420.1 (-0.1%) | 406.9 to 406.8 |
+  | 12 | 1 | 4 | 851.5 to 851.2 | 769.1 |
+  | 32 | 2 | 4 | 109.7 to 108.8 (-0.8%) | 104.7 to 104.1 (-0.6%) |
+  | 32 | 2 | 1 | 108.2 to 107.3 (-0.8%) | 104.3 to 103.7 (-0.6%) |
+  | 64 | 2 | 4 | 40.3 to 38.3 (-5.0%) | 32.4 to 31.9 (-1.5%) |
+  | 64 | 2 | 1 | 37.3 to 35.3 (-5.4%) | 31.6 to 31.1 (-1.6%) |
+
+  At N = 64, batch 64, the 2 GEMMs per batch save 2N = 128 cycles, 2.0 per image, as predicted.
+- Synthesis, `rpu_top`, against item 18: gw5a N = 8 31,223 LUT (31,237), 4,080 ALU (3,982); gw5a N = 16 87,755 LUT (87,772); gw2a N = 8 12,519 LUT (12,635); gw2a N = 16 29,250 LUT (29,092), 9,487 ALU (9,586); xcup N = 8 7,350 LUT (7,392); xcup N = 32, LOAD_BEATS 2, QUANT_PARTS 1 87,199 LUT (87,132); xcup N = 64, LOAD_BEATS 2, QUANT_PARTS 1 321,543 LUT (320,466, +0.3%). DFF, FF, DSP, MULT and RAM equal everywhere. Within abc noise.
+- Tests: `next_tile_streams_during_drain` now bounds the busy time with 6N for the last settle and store instead of 7N. Mutations, each caught: the store walking up from row N-1 (14 tests), the store starting at row N-2 (14), the store ending at row 1 (14), at N = 8; the store starting after the last SHIFT cycle (the old timing), at N = 64, by `next_tile_streams_during_drain`. Not caught: the same late start at N = 8, where the 4N int32 store of the last tile hides it inside the 6N bound; the store starting one SHIFT cycle later (1 cycle per GEMM, function unchanged). All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, QUANT_PARTS 4, and at QUANT_PARTS 1 at N = 8, 16, 32 and 64, with the brain feature; the full check (fmt, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) is clean.
+- Load: `uptime` 2.3 to 3.2 (MNIST and synthesis in parallel).
 - Commit: pending.
 
 ## Questions for owner

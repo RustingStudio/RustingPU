@@ -748,14 +748,18 @@ module rpu_top #(
                 DRAIN_SHIFT: begin
                     // The shadows shift down each cycle; c_row is row N-1-drain_count.
                     mem_c[COL_LAST - drain_count[COL_W-1:0]] <= c_row;
-                    if (drain_count == DRAIN_LAST) begin
+                    // The store follows the drain from row N-1 down, at most one row per
+                    // cycle, so it reads each row after the drain wrote it.
+                    if (drain_count == '0) begin
                         store_busy <= 1'b1;
                         store_c_base <= drain_c_base;
                         store_quant <= drain_quant;
                         store_part_last <= drain_quant ? QUANT_PART_LAST : C_ROW_LAST - drain_skip;
                         store_j <= drain_j;
-                        store_row <= '0;
+                        store_row <= COL_LAST;
                         store_part <= '0;
+                    end
+                    if (drain_count == DRAIN_LAST) begin
                         drain_state <= DRAIN_IDLE;
                     end else begin
                         drain_count <= drain_count + 1'b1;
@@ -831,12 +835,12 @@ module rpu_top #(
 
             // C store, one beat per cycle: the memory never stalls a write.
             if (store_busy) begin
-                if (store_row == COL_LAST && store_part == store_part_last) begin
+                if (store_row == '0 && store_part == store_part_last) begin
                     store_busy <= 1'b0;
                 end
                 if (store_part == store_part_last) begin
                     store_part <= '0;
-                    store_row <= store_row + 1'b1;
+                    store_row <= store_row - 1'b1;
                 end else begin
                     store_part <= store_part + 1'b1;
                 end
