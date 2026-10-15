@@ -579,7 +579,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Tests: the new test passes at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 16, 32 and 64), READ_LATENCY 1 and 10. Mutation: leaving q3 out of `store_pipe_busy` trips the one-write-port check.
 - MNIST, RPU equal to host int8 for every image, 97.25%: busy and wall cycles equal to item 25 (N = 8: 1624.4 and 1626.5, N = 16: 406.3 and 408.4, N = 64, LOAD_BEATS 2: 31.3 and 31.7 per image, batch 64).
 - No synthesis run: the change is one OR of three flags; item 27 synthesizes on top of it.
-- Commit: see the next docs commit.
+- Commit: `250c24e`. N = 16, batch 64, at this commit: 406.3 busy and 408.4 wall cycles per image.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
