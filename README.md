@@ -6,7 +6,7 @@ This will not beat a GPU or your CPU on speed, and the simulation is far slower 
 
 ## Numbers
 
-MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-15 at commit `2b8598f`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
+MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-15 at commit `93c8f39`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
 
 | | N = 8 | N = 16 |
 |---|---:|---:|
@@ -15,7 +15,7 @@ MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBr
 | RPU accuracy | 97.25% | 97.25% |
 | Cycles per image | 1624.4 | 406.3 |
 | Array utilization | 98.50% | 98.44% |
-| Wall cycles per image (host writes and waits included) | 1723.2 | 505.1 |
+| Wall cycles per image (host writes and waits included) | 1626.5 | 408.4 |
 | Host words per image, written / read | 101.5 / 5.0 | 101.5 / 6.0 |
 
 ```bash
