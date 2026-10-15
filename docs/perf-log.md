@@ -72,7 +72,7 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 23 wide host write path, HOST_WORDS 4, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 104.7 | 97.61% | 103.7 / 8.0 | 5.5 s |
 | 23 wide host write path, HOST_WORDS 8, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 31.3 | 84.94% | 108.2 / 8.0 | 7.8 s |
 
-Wall cycles per image, from item 23 on: every simulated clock cycle from the first GEMM to the last read, busy or not, so host writes and waits count too (host reads do not tick the model). Batch 64:
+Wall cycles per image, from item 23 on: every simulated clock cycle from the first GEMM to the last read, busy or not, so host writes and waits count too (host reads from item 29 on; before it they did not tick the model). Batch 64:
 
 | Item | N | Wall cycles per image | Cycles per image (busy) |
 |---|---:|---:|---:|
@@ -93,6 +93,11 @@ Wall cycles per image, from item 23 on: every simulated clock cycle from the fir
 | 27, HOST_WORDS 4 | 32 | 103.0 | 102.5 |
 | 27, HOST_WORDS 8 | 64 | 28.0 | 27.8 |
 | 28 settle while the tile before shifts (other N equal to 27), HOST_WORDS 8 | 64 | 27.0 | 26.8 |
+| 29 host reads through the read port | 8 | 1631.4 | 1624.3 |
+| 29 | 16 | 414.3 | 406.2 |
+| 29 | 12 | 848.9 | 837.7 |
+| 29, HOST_WORDS 4 | 32 | 103.0 | 102.5 |
+| 29, HOST_WORDS 8 | 64 | 27.0 | 26.8 |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -653,6 +658,27 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Load: `uptime` 1.4 to 3.3 (synthesis, tests and MNIST in parallel).
 - Commit: `204efbd`. N = 16, batch 64, at this commit: 404.6 busy and 406.6 wall cycles per image.
 
+## Item 29: host reads through the memory's read port. Done, 2026-10-15
+- Owner decision 12 (left to the agent): an arbiter, no second port. Built now in the simulation rather than with the milestone 2 bridge, so the wall cycles stop leaving the reads out. Like item 25 this is a fidelity item: it adds time the model left out, and its target is that the wall cycles stay put.
+- RTL: `rpu_top` gets `mem_re`, `mem_rvalid` and `mem_rwords` (HOST_WORDS words, as for writes). A memory read is taken in a cycle with `mem_re` and `mem_ready` high; `mem_ready` is low while a load issues a read (`issue_active`), so loads keep the port. The words come READ_LATENCY cycles later with `mem_rvalid`, and the host may send one read per cycle. `mem_rdata` keeps only the registers, which stay combinational. `rpu_sim_memory` gets a host read pipeline beside the DMA one and stops the simulation (`$fatal`, left out of synthesis) if the host and a load read in one cycle. The wrapper's `rpu_read_words` sends the reads of one `read_words` call back to back and returns the cycles until the last data; `read_words` adds them to the wall cycles.
+- MNIST, RPU equal to host int8 for every image, 97.25%. Busy / wall cycles per image, item 28 to item 29:
+
+  | N | LOAD_BEATS | HOST_WORDS | Batch 64 busy | Batch 64 wall | Batch 256 busy | Batch 256 wall |
+  |---|---|---|---:|---:|---:|---:|
+  | 8 | 1 | 1 | 1623.5 to 1624.3 | 1625.5 to 1631.4 (+0.4%) | 1612.9 | 1616.5 to 1621.0 |
+  | 12 | 1 | 1 | 836.5 to 837.7 | 839.3 to 848.9 (+1.1%) | 765.8 | 771.0 to 778.9 |
+  | 16 | 1 | 1 | 404.6 to 406.2 | 406.6 to 414.3 (+1.9%) | 403.3 | 406.8 to 413.0 |
+  | 32 | 2 | 4 | 102.5 to 102.5 | 103.0 to 103.0 | 102.5 | 103.5 to 103.5 |
+  | 64 | 2 | 8 | 26.8 to 26.8 | 27.0 to 27.0 | 27.2 | 27.8 to 27.8 |
+
+  Utilization at batch 64: N = 8 98.55% to 98.50%, N = 16 98.85% to 98.47%. Host words per image are unchanged. The target is missed at N = 8 to 16, and the old numbers were the optimistic ones: with LOAD_BEATS 1 the loads hold the read port in almost every cycle, so a read waits. Measured with a probe counter: at N = 8, 50,000 reads took 387,920 cycles (7.8 per read, 38.8 per image, of which the wall shows 5.9 since the RPU runs meanwhile); at N = 16, 60,000 reads took 159,456 cycles. Busy rises too, by 0.8 and 1.6 cycles per image: while the host waits on a read it does not queue the next GEMM. At N = 32 and 64 a read moves a whole beat and the wide loads leave gaps, so nothing moves.
+- Ablation, the other priority (a host read goes first and the load issue waits that cycle), batch 64, busy / wall: N = 8 1628.5 / 1630.4, N = 12 844.5 / 847.2, N = 16 410.6 / 412.5, N = 64 26.8 / 27.0. It saves at most 0.4% wall (N = 16) and costs up to 1.1% busy, the main metric, so loads keep the port as decided.
+- Synthesis, `rpu_top` (the memory is a black box), item 28 to item 29: gw5a N = 8 31,530 to 31,448 LUT, 4,271 ALU, 8,151 DFF; gw5a N = 16 88,200 to 88,170 LUT, 13,989 to 13,984 ALU, 28,646 DFF; gw2a N = 8 12,593 to 12,563 LUT, 3,225 to 3,226 ALU; xcup N = 8 7,558 to 7,409 LUT, 8,226 FF. The memory window leaves the register read mux; the read pipeline is in the memory model. DSP, MULT and block RAM equal.
+- Tests: `host_reads_wait_for_the_loads` (reads of 16N host reads take exactly reads + READ_LATENCY - 1 cycles with the RPU idle, and exactly one cycle more per load read, 2N / LOAD_BEATS, while a tile GEMM loads; the words and C are right). Mutations, each caught: the host read not held while a load issues (the one-read-port check stops the simulation, both with `mem_ready` high and with it low but the read not masked); `mem_rvalid` one stage early at READ_LATENCY 10 (at least 12 tests fail, the new one among them).
+- All 39 tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10 (8, 16, 64), with the brain feature (42), at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16, 64) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check (fmt, clippy, Icarus, Verilator lint at N = 8 to 64) is clean.
+- Load: `uptime` 1.2 to 1.7.
+- Commit: see git log. N = 16, batch 64, at this commit: 406.2 busy and 414.3 wall cycles per image.
+
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
 2. Milestone 2 at N = 16: the two B banks use 4,224 RAM16SDP4 (LUT RAM). Moving them to BSRAM would need 128 SDPX9B with the A banks, more than the 118 that the GW5AT-LV60 has. Keep N = 8 for the first bitstream, or keep B in LUT RAM at N = 16? Answered 2026-10-15: N = 8 for the first bitstream.
@@ -665,4 +691,4 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 9. Second QPARAM set (item 27): its QPARAM memory goes from 4 SDPX9B to 8 DPX9B at N = 8 (20 to 24 of the 118 block RAMs on the GW5AT-LV60) and gains nothing measurable at N = 32 (ablation); at N = 64 it is worth 31.3 to 27.8 cycles per image. Keep it at every N, or make it a parameter that is off at the board sizes? Answered 2026-10-15 (owner left it to the agent): keep it at every N. 24 of 118 blocks leaves the board plenty, and a parameter would add a second driver path to test for no measured gain.
 10. After item 28 every N is at 98.1% utilization or more at batch 64 (N = 64: 99.49%), so the loop stops. The largest lever left at N = 64 is layer 2: its 10 outputs use 10 of the 64 columns, and its stream is 128 of the 1,696 stream cycles per batch (7.5%). Splitting K over column groups (6 groups of 10 columns, the partial sums added after the array) would recover most of it, but needs an adder stage in hardware or 6 times the int32 reads summed on the host, and it helps only narrow layers. Worth doing for TPU class, or out of scope? Answered 2026-10-15 (owner left it to the agent): out of scope for now. It pays only for layers narrower than N, needs new hardware or more host reads, and the 7.5% is specific to this 10-output MNIST layer. Revisit with a real target network whose layers are known.
 11. At N = 64, batch 256, utilization is 97.73% (busy 27.2, wall 27.8 cycles per image), against 99.49% at batch 64; the gap was not traced, since batch 64 is the baseline. Trace it? Answered 2026-10-15 (owner left it to the agent): no. The whole gap is 1.8% of busy cycles at a non-baseline batch, below the 2% bar even if all of it were recovered.
-12. Host reads: in the simulation a host read of RPU memory takes no cycle and never meets RPU traffic. On the board the bridge of milestone 2 reads the same memory the C store writes, so it needs a second read port or an arbiter like the one of item 25 for writes. Plan it with the milestone 2 bridge? Answered 2026-10-15 (owner left it to the agent): yes, an arbiter, built with the milestone 2 bridge. It is the same choice as question 7: no second port, host reads wait while a load reads the memory.
+12. Host reads: in the simulation a host read of RPU memory takes no cycle and never meets RPU traffic. On the board the bridge of milestone 2 reads the same memory the C store writes, so it needs a second read port or an arbiter like the one of item 25 for writes. Plan it with the milestone 2 bridge? Answered 2026-10-15 (owner left it to the agent): yes, an arbiter, built with the milestone 2 bridge. It is the same choice as question 7: no second port, host reads wait while a load reads the memory. Built in the simulation as item 29.

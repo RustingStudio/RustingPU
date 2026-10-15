@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         read as f64 / count as f64
     );
     println!(
-        "wall clock: {clock} cycles, {:.1} per image (host writes and waits; reads do not tick)",
+        "wall clock: {clock} cycles, {:.1} per image (host writes, reads and waits)",
         clock as f64 / count as f64
     );
     println!("simulation wall time {wall:.1} s (host int8 included)");

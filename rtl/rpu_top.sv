@@ -50,9 +50,16 @@ module rpu_top #(
     input  logic mem_we,
     input  logic [31:0] mem_addr,
     input  logic [64*HOST_WORDS-1:0] mem_wdata,
+    // Register reads: combinational, from mem_addr.
     output logic [63:0] mem_rdata,
-    // Low while a C store holds the memory's one write port: a host memory write waits,
-    // holding mem_we and its address and data, until a cycle with mem_ready high.
+    // A host memory read: mem_re with mem_addr, a multiple of HOST_WORDS, reads HOST_WORDS
+    // words, which come READ_LATENCY cycles after the cycle it is taken in, with mem_rvalid.
+    input  logic mem_re,
+    output logic mem_rvalid,
+    output logic [64*HOST_WORDS-1:0] mem_rwords,
+    // Low while a C store holds the memory's one write port (for a write) or a load holds
+    // its one read port (for mem_re): the host holds mem_we or mem_re, the address and the
+    // data until a cycle with mem_ready high, which takes the access.
     output logic mem_ready,
 
     output logic [31:0] cycles,
@@ -313,8 +320,8 @@ module rpu_top #(
     logic [N-1:0][31:0] c_row;
     logic compute_busy;
     logic host_mem_we;
+    logic host_mem_re;
     logic [HOST_ADDR_W-1:0] host_mem_addr;
-    logic [63:0] host_mem_rdata;
     logic dma_rd_resp_valid;
     logic [LOAD_BEATS*BEAT_W-1:0] dma_rd_data;
     logic dma_wr_valid;
@@ -476,7 +483,9 @@ module rpu_top #(
         .host_we(host_mem_we),
         .host_addr(host_mem_addr),
         .host_wdata(mem_wdata),
-        .host_rdata(host_mem_rdata),
+        .host_re(host_mem_re),
+        .host_rvalid(mem_rvalid),
+        .host_rdata(mem_rwords),
         .rd_valid(issue_active),
         .rd_addr(issue_panel ? issue_b_addr : issue_a_addr),
         .rd_resp_valid(dma_rd_resp_valid),
@@ -1001,11 +1010,15 @@ module rpu_top #(
 
     always_comb begin
         host_mem_we = 1'b0;
+        host_mem_re = 1'b0;
         host_mem_addr = HOST_ADDR_W'(mem_addr - MEM_BASE_ADDR);
         mem_ready = 1'b1;
         if (mem_addr >= MEM_BASE_ADDR && mem_addr < MEM_BASE_ADDR + MEM_WORDS) begin
+            // Loads keep the read port: a load issues in bursts, and the host's reads are
+            // a few words per image.
             host_mem_we = mem_we && !dma_wr_valid;
-            mem_ready = !dma_wr_valid;
+            host_mem_re = mem_re && !issue_active;
+            mem_ready = mem_re ? !issue_active : !dma_wr_valid;
         end
     end
 
@@ -1020,8 +1033,7 @@ module rpu_top #(
             REG_ACTIVE_ADDR: mem_rdata = 64'(active_cycles);
             REG_BUSY_ADDR: mem_rdata = 64'(busy_cycles);
             REG_TILES_DONE_ADDR: mem_rdata = 64'(tiles_done);
-            default: mem_rdata = (mem_addr >= MEM_BASE_ADDR && mem_addr < MEM_BASE_ADDR + MEM_WORDS)
-                ? host_mem_rdata : 64'd0;
+            default: mem_rdata = 64'd0;
         endcase
     end
 

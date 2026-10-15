@@ -21,6 +21,7 @@ void rpu_write(rpu_t* r, uint32_t addr, uint64_t value);
 // One bus write of up to HOST_WORDS words (count of them, the rest zero). Returns the
 // cycles it took: one, plus one for each cycle a C store held the memory write port.
 uint32_t rpu_write_words(rpu_t* r, uint32_t addr, const uint64_t* words, uint32_t count);
+uint32_t rpu_read_words(rpu_t* r, uint32_t addr, uint64_t* words, uint32_t reads, uint32_t step);
 uint64_t rpu_read(rpu_t* r, uint32_t addr);
 void rpu_start(rpu_t* r);
 

@@ -25,6 +25,18 @@ static void set_wdata(VlWide<W>& port, const uint64_t* words, uint32_t count) {
     }
 }
 
+// mem_rwords, the same widths: copies its words to `words`.
+static void get_rdata(const QData& port, uint64_t* words) {
+    words[0] = port;
+}
+
+template <std::size_t W>
+static void get_rdata(const VlWide<W>& port, uint64_t* words) {
+    for (std::size_t i = 0; i < W; i += 2) {
+        words[i / 2] = static_cast<uint64_t>(port[i]) | static_cast<uint64_t>(port[i + 1]) << 32;
+    }
+}
+
 extern "C" {
 
 rpu_t* rpu_new(void) {
@@ -34,6 +46,7 @@ rpu_t* rpu_new(void) {
     r->core.reset = 0;
     r->core.start = 0;
     r->core.mem_we = 0;
+    r->core.mem_re = 0;
     r->core.mem_addr = 0;
     set_wdata(r->core.mem_wdata, nullptr, 0);
     rpu_eval(r);
@@ -59,6 +72,7 @@ uint32_t rpu_cycles(rpu_t *r) {
 void rpu_reset(rpu_t* r) {
     r->core.start = 0;
     r->core.mem_we = 0;
+    r->core.mem_re = 0;
     r->core.reset = 1;
     rpu_tick(r);
     r->core.reset = 0;
@@ -82,6 +96,28 @@ uint32_t rpu_write_words(rpu_t* r, uint32_t addr, const uint64_t* words, uint32_
 
 void rpu_write(rpu_t *r, uint32_t addr, uint64_t value) {
     rpu_write_words(r, addr, &value, 1);
+}
+
+// `reads` memory reads of `step` words each from addr, one per cycle while mem_ready is
+// high; returns the cycles until the last data came.
+uint32_t rpu_read_words(rpu_t* r, uint32_t addr, uint64_t* words, uint32_t reads, uint32_t step) {
+    uint32_t sent = 0, got = 0, ticks = 0;
+    while (got < reads) {
+        r->core.mem_re = sent < reads;
+        r->core.mem_addr = addr + sent * step;
+        rpu_eval(r);
+        bool taken = r->core.mem_re && r->core.mem_ready;
+        rpu_tick(r);
+        ticks++;
+        sent += taken;
+        if (r->core.mem_rvalid) {
+            get_rdata(r->core.mem_rwords, words + got * step);
+            got++;
+        }
+    }
+    r->core.mem_re = 0;
+    rpu_eval(r);
+    return ticks;
 }
 
 uint64_t rpu_read(rpu_t* r, uint32_t addr) {

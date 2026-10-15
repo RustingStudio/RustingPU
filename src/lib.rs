@@ -31,7 +31,6 @@ pub const KMAX: usize = 1024;
 const MEM_BYTES: usize = (1 << 20) * if TILE > 16 { TILE / 16 } else { 1 };
 
 use quant::Requant;
-use std::cell::Cell;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,6 +108,13 @@ mod sys {
         pub fn rpu_cycles(r: *mut Rpu) -> u32;
         pub fn rpu_write(r: *mut Rpu, addr: u32, value: u64);
         pub fn rpu_write_words(r: *mut Rpu, addr: u32, words: *const u64, count: u32) -> u32;
+        pub fn rpu_read_words(
+            r: *mut Rpu,
+            addr: u32,
+            words: *mut u64,
+            reads: u32,
+            step: u32,
+        ) -> u32;
         pub fn rpu_read(r: *mut Rpu, addr: u32) -> u64;
         pub fn rpu_busy(r: *mut Rpu) -> u8;
         pub fn rpu_done(r: *mut Rpu) -> u8;
@@ -137,7 +143,7 @@ impl std::error::Error for RpuError {}
 pub struct Rpu {
     inner: NonNull<sys::Rpu>,
     words_written: u64,
-    words_read: Cell<u64>,
+    words_read: u64,
     /// Clock cycles since `new`: host writes, waits and resets each tick the model.
     wall_cycles: u64,
     /// Unique per model, so a [`ResidentB`] cannot be used with another RPU.
@@ -216,7 +222,7 @@ impl Rpu {
         let mut rpu = Self {
             inner,
             words_written: 0,
-            words_read: Cell::new(0),
+            words_read: 0,
             wall_cycles: 0,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pending: Vec::new(),
@@ -308,7 +314,7 @@ impl Rpu {
     /// Memory words read by the host since `new`. Register reads (status polls, counters)
     /// are not counted: how often a real host polls is up to the transport.
     pub fn host_words_read(&self) -> u64 {
-        self.words_read.get()
+        self.words_read
     }
 
     /// One int8 NT tile: `C[i][j] = sum_k A[i][k] * B[j][k]`, all `TILE x TILE` row-major.
@@ -654,9 +660,22 @@ impl Rpu {
         let end = beat + (count as u32).div_ceil(BEAT_WORDS);
         self.sync_if_pending(&[(beat, end)], &[])
             .expect("a started GEMM never finished");
-        let base = MEM_BASE + beat * BEAT_WORDS;
-        self.words_read.set(self.words_read.get() + count as u64);
-        (0..count).map(|i| self.read_reg(base + i as u32)).collect()
+        self.words_read += count as u64;
+        // A beat starts at a whole host read, so the last read stays in the beat.
+        let reads = count.div_ceil(HOST_WORDS);
+        let mut words = vec![0; reads * HOST_WORDS];
+        let ticks = unsafe {
+            sys::rpu_read_words(
+                self.inner.as_ptr(),
+                MEM_BASE + beat * BEAT_WORDS,
+                words.as_mut_ptr(),
+                reads as u32,
+                HOST_WORDS as u32,
+            )
+        };
+        self.wall_cycles += u64::from(ticks);
+        words.truncate(count);
+        words
     }
 
     fn configure_bases(&mut self, bank: usize) {
@@ -1591,6 +1610,35 @@ mod tests {
         let stalls = rpu.wall_cycles() - wall - (words.len() / HOST_WORDS) as u64;
         assert_eq!(stalls, u64::from(C_BEATS), "one stall per stored C beat");
         assert_eq!(rpu.read_words(c.end(), words.len()), words);
+        let want = quant::matmul_nt_i8(&a, &a, TILE, TILE, TILE);
+        assert_eq!(rpu.read_i32(&c).unwrap(), want);
+    }
+
+    /// A load holds the memory's one read port: host memory reads meanwhile wait one cycle
+    /// per issued load read, and still return the right words.
+    #[test]
+    fn host_reads_wait_for_the_loads() {
+        let mut rpu = Rpu::new().unwrap();
+        let a: Vec<i8> = (0..N2).map(|i| (i % 7) as i8 - 3).collect();
+        let ah = rpu.upload_a(0, &a, TILE, TILE);
+        let bh = rpu.upload_b(ah.end(), &a, TILE, TILE);
+        // Enough reads to outlast the loads, away from the GEMM's beats.
+        let at = bh.end() + C_BEATS;
+        let words: Vec<u64> = (0..(16 * TILE * HOST_WORDS) as u64).collect();
+        rpu.write_words(at, &words);
+        let reads = (words.len() / HOST_WORDS) as u64;
+        let latency = parse_usize(env!("RPU_READ_LATENCY")) as u64;
+        let wall = rpu.wall_cycles();
+        assert_eq!(rpu.read_words(at, words.len()), words);
+        let idle = rpu.wall_cycles() - wall;
+        assert_eq!(idle, reads + latency - 1, "one read per cycle");
+        let c = rpu.start_gemm_i32(&ah, &bh, bh.end()).unwrap();
+        let wall = rpu.wall_cycles();
+        assert_eq!(rpu.read_words(at, words.len()), words);
+        let stalls = rpu.wall_cycles() - wall - idle;
+        // A, then B: one read per LOAD_BEATS beats of each.
+        let loads = 2 * (TILE as u64).div_ceil(LOAD_BEATS as u64);
+        assert_eq!(stalls, loads, "one stall per load read");
         let want = quant::matmul_nt_i8(&a, &a, TILE, TILE, TILE);
         assert_eq!(rpu.read_i32(&c).unwrap(), want);
     }
