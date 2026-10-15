@@ -48,12 +48,17 @@ const REG_ACTIVE: u32 = 6;
 const REG_BUSY: u32 = 7;
 const REG_PANEL: u32 = 8;
 const REG_TILES: u32 = 9;
+/// C tiles stored since reset, in START order.
+const REG_TILES_DONE: u32 = 10;
 /// Host address of memory word 0. The host bus moves 64-bit words.
 const MEM_BASE: u32 = 0x1000_0000;
 
 /// A memory beat is N int8 in N/8 host words, rounded up: the last word of a beat is
 /// zero-padded when N is not a multiple of 8.
 const BEAT_WORDS: u32 = TILE.div_ceil(8) as u32;
+/// RPU memory beats.
+#[cfg(feature = "brain")]
+pub(crate) const MEM_BEATS: u32 = (MEM_BYTES / 8) as u32 / BEAT_WORDS;
 /// Beats per panel row: each row is padded to a whole number of beats.
 const ROW_BEATS: u32 = KMAX.div_ceil(TILE) as u32;
 const PANEL_BEATS: u32 = TILE as u32 * ROW_BEATS;
@@ -76,6 +81,8 @@ const CONTROL_GEMM: u64 = 0b100_0000;
 const CONTROL_QUANT: u64 = 0b1000_0000;
 /// Host address of requantization parameter word 0.
 const QPARAM_BASE: u32 = 0x0800_0000;
+/// CONTROL bit 8, with QUANT: requantize with parameter set 1 instead of 0.
+const CONTROL_QSET1: u64 = 1 << 8;
 /// Columns that one store cycle requantizes (QUANT_PARTS cycles per C row), and the width
 /// of the lane field in a parameter address.
 const QP_LANES: usize = TILE.div_ceil(QUANT_PARTS);
@@ -84,6 +91,8 @@ const QP_LANE_W: u32 = if QP_LANES > 1 {
 } else {
     1
 };
+/// Host words of one requantization parameter set.
+const QPARAM_SET_WORDS: u32 = ((QUANT_PARTS * ROW_BEATS as usize) << QP_LANE_W) as u32;
 const STATUS_LOAD_BUSY: u64 = 0b0100;
 const STATUS_COMPUTE_BUSY: u64 = 0b1000;
 const STATUS_GEMM_READY: u64 = 1 << 7;
@@ -133,11 +142,21 @@ pub struct Rpu {
     wall_cycles: u64,
     /// Unique per model, so a [`ResidentB`] cannot be used with another RPU.
     id: u64,
-    /// Memory beats `start..end` that the GEMMs started since the last observed DONE may
-    /// still read or write, and whether one of them requantizes.
-    pending_reads: Vec<(u32, u32)>,
-    pending_writes: Vec<(u32, u32)>,
-    pending_quant: bool,
+    /// The GEMMs started and not seen done, oldest first.
+    pending: Vec<Pending>,
+    /// C tiles of the GEMMs started so far, counted like TILES_DONE.
+    tiles_started: u32,
+    /// Requantization parameter set of the next requantized GEMM.
+    qset: usize,
+}
+
+/// A started GEMM: done once TILES_DONE reaches `tiles`. Until then it may read beats
+/// `reads` and write beats `write` (`start..end`), and requantize with set `qset`.
+struct Pending {
+    tiles: u32,
+    reads: [(u32, u32); 2],
+    write: (u32, u32),
+    qset: Option<usize>,
 }
 
 /// B (`n x k`) in RPU memory, written by [`Rpu::upload_b`].
@@ -200,9 +219,9 @@ impl Rpu {
             words_read: Cell::new(0),
             wall_cycles: 0,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            pending_reads: Vec::new(),
-            pending_writes: Vec::new(),
-            pending_quant: false,
+            pending: Vec::new(),
+            tiles_started: 0,
+            qset: 0,
         };
         rpu.reset();
         Ok(rpu)
@@ -211,45 +230,52 @@ impl Rpu {
     pub fn reset(&mut self) {
         self.wall_cycles += 1;
         unsafe { sys::rpu_reset(self.inner.as_ptr()) };
-        self.retire();
+        self.pending.clear();
+        self.tiles_started = 0;
     }
 
     /// Waits until every started GEMM is done. Reads of their output wait by themselves.
     pub fn sync(&mut self) -> Result<(), RpuError> {
-        if !self.pending_writes.is_empty() {
+        if !self.pending.is_empty() {
             self.wait_until(Self::done)?;
         }
-        self.retire();
+        self.pending.clear();
         Ok(())
     }
 
-    fn retire(&mut self) {
-        self.pending_reads.clear();
-        self.pending_writes.clear();
-        self.pending_quant = false;
+    /// Waits until the first `count` pending GEMMs are done, and forgets every done one.
+    fn wait_gemms(&mut self, count: usize) -> Result<(), RpuError> {
+        if let Some(tiles) = count.checked_sub(1).map(|i| self.pending[i].tiles) {
+            // TILES_DONE wraps; a GEMM is done once it is no more than 2^31 tiles behind.
+            self.wait_until(|rpu| tiles.wrapping_sub(rpu.tiles_done()) as i32 <= 0)?;
+        }
+        let done = self.tiles_done();
+        self.pending
+            .retain(|p| p.tiles.wrapping_sub(done) as i32 > 0);
+        Ok(())
     }
 
-    /// Syncs if `reads` or `writes` touch memory that a started GEMM may still write, or
-    /// `writes` touch memory it may still read.
+    fn tiles_done(&self) -> u32 {
+        self.read_reg(REG_TILES_DONE) as u32
+    }
+
+    /// Waits for the started GEMMs that may still write memory `reads` or `writes` touch,
+    /// or still read memory `writes` touch.
     fn sync_if_pending(
         &mut self,
         reads: &[(u32, u32)],
         writes: &[(u32, u32)],
     ) -> Result<(), RpuError> {
-        if self.done() {
-            self.retire();
-        }
-        let hit =
-            |pending: &[(u32, u32)], r: &(u32, u32)| pending.iter().any(|p| p.0 < r.1 && r.0 < p.1);
-        if reads
+        let hit = |p: &(u32, u32), r: &(u32, u32)| p.0 < r.1 && r.0 < p.1;
+        let count = self
+            .pending
             .iter()
-            .chain(writes)
-            .any(|r| hit(&self.pending_writes, r))
-            || writes.iter().any(|r| hit(&self.pending_reads, r))
-        {
-            self.sync()?;
-        }
-        Ok(())
+            .rposition(|p| {
+                reads.iter().chain(writes).any(|r| hit(&p.write, r))
+                    || writes.iter().any(|w| p.reads.iter().any(|r| hit(r, w)))
+            })
+            .map_or(0, |i| i + 1);
+        self.wait_gemms(count)
     }
 
     /// Cycles the RPU was busy since the last START (or reset).
@@ -446,10 +472,15 @@ impl Rpu {
             k: b.n,
         };
         assert!(out.k <= KMAX, "the output must fit a panel row");
-        // A started GEMM may still requantize with the parameters.
-        if self.pending_quant {
-            self.sync()?;
-        }
+        // Two parameter sets: wait only for a started GEMM that requantizes with this one.
+        let set = self.qset;
+        self.qset ^= 1;
+        let count = self
+            .pending
+            .iter()
+            .rposition(|p| p.qset == Some(set))
+            .map_or(0, |i| i + 1);
+        self.wait_gemms(count)?;
         // Padding columns keep stale parameters: the next GEMM streams only k < n.
         for (col, q) in params.iter().enumerate() {
             assert!(q.shift <= 48, "shift must be at most 48");
@@ -459,9 +490,16 @@ impl Rpu {
                 | u64::from(q.mult) << 32
                 | u64::from(q.shift) << 48
                 | u64::from(q.relu) << 54;
-            self.write_reg(QPARAM_BASE + lane, word);
+            self.write_reg(QPARAM_BASE + set as u32 * QPARAM_SET_WORDS + lane, word);
         }
-        self.run_gemm(a, b, out_base, out.end(), CONTROL_GEMM | CONTROL_QUANT)?;
+        let qset = if set == 0 { 0 } else { CONTROL_QSET1 };
+        self.run_gemm(
+            a,
+            b,
+            out_base,
+            out.end(),
+            CONTROL_GEMM | CONTROL_QUANT | qset,
+        )?;
         Ok(out)
     }
 
@@ -493,8 +531,13 @@ impl Rpu {
                 && (b.base as usize).is_multiple_of(LOAD_BEATS),
             "A and B must start at a multiple of {LOAD_BEATS} beats"
         );
-        let (reads, writes) = ([(a.base, a.end()), (b.base, b.end())], [(c_base, c_end)]);
-        self.sync_if_pending(&reads, &writes)?;
+        let (reads, write) = ([(a.base, a.end()), (b.base, b.end())], (c_base, c_end));
+        self.sync_if_pending(&reads, &[write])?;
+        if self.pending.is_empty() {
+            // A manual START may still store its tile; TILES_DONE counts it too.
+            self.wait_until(|rpu| !rpu.busy())?;
+            self.tiles_started = self.tiles_done();
+        }
         // The registers are free once the last GEMM has loaded every tile.
         self.wait_until(|rpu| rpu.status() & STATUS_GEMM_READY != 0)?;
         self.write_reg(REG_K_LEN, a.k as u64);
@@ -516,9 +559,13 @@ impl Rpu {
             (mt as u64) | (nt as u64) << 16 | (skip as u64) << 32,
         );
         self.write_reg(REG_CONTROL, control);
-        self.pending_reads.extend(reads);
-        self.pending_writes.extend(writes);
-        self.pending_quant |= control & CONTROL_QUANT != 0;
+        self.tiles_started = self.tiles_started.wrapping_add((mt * nt) as u32);
+        self.pending.push(Pending {
+            tiles: self.tiles_started,
+            reads,
+            write,
+            qset: (control & CONTROL_QUANT != 0).then_some((control & CONTROL_QSET1 != 0) as usize),
+        });
         Ok(())
     }
 
@@ -1122,6 +1169,81 @@ mod tests {
     /// With a short K, the last tile of a GEMM can wait to stream behind the drain and
     /// store of the tile before it, long after GEMM_READY. The next GEMM must not load
     /// into its banks meanwhile, for either parity of B tiles and row blocks.
+    /// A one-tile GEMM of any K right after a long one, of either kind: its stream starts
+    /// once the long GEMM's drain ends before PE (0, 0) takes the new sum, the earliest
+    /// cycle that keeps every sum. Back-to-back requantized GEMMs keep their own
+    /// parameters, and the GEMMs of the next K start before those are read.
+    #[test]
+    fn next_gemm_of_any_k_overlaps_the_drain() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x0e4e_0000_0000_0027);
+        let mat = |rng: &mut quant::XorShift, rows: usize, k: usize| -> Vec<i8> {
+            (0..rows * k).map(|_| rng.i8_sym()).collect()
+        };
+        // Long enough that the loads of the short GEMM hide behind its stream.
+        let k0 = 8 * TILE;
+        let (a0, b0) = (mat(&mut rng, TILE, k0), mat(&mut rng, TILE, k0));
+        let p0: Vec<Requant> = (0..TILE).map(|_| random_requant(&mut rng)).collect();
+        let want0 = quant::matmul_nt_i8(&a0, &b0, TILE, TILE, k0);
+        let want0_q = requant_host(&want0, TILE, &p0);
+        let bh0 = rpu.upload_b(0, &b0, TILE, k0);
+        let ah0 = rpu.upload_a(bh0.end(), &a0, TILE, k0);
+        for k in 1..=3 * TILE + 2 {
+            let (a, b) = (mat(&mut rng, TILE, k), mat(&mut rng, TILE, k));
+            let p: Vec<Requant> = (0..TILE).map(|_| random_requant(&mut rng)).collect();
+            let want = quant::matmul_nt_i8(&a, &b, TILE, TILE, k);
+            let want_q = requant_host(&want, TILE, &p);
+            rpu.sync().unwrap();
+            let bh = rpu.upload_b(ah0.end(), &b, TILE, k);
+            let ah = rpu.upload_a(bh.end(), &a, TILE, k);
+            let mut at = ah.end();
+            let mut outs = Vec::new();
+            for (quant0, quant) in [(false, false), (false, true), (true, false), (true, true)] {
+                let run = |rpu: &mut Rpu, quant, ah, bh, p, at| {
+                    if quant {
+                        let out = rpu.gemm_requant(ah, bh, p, at).unwrap();
+                        (out.end(), Ok(out))
+                    } else {
+                        let c = rpu.start_gemm_i32(ah, bh, at).unwrap();
+                        (c.end(), Err(c))
+                    }
+                };
+                let (end, first) = run(&mut rpu, quant0, &ah0, &bh0, &p0, at);
+                let (end, second) = run(&mut rpu, quant, &ah, &bh, &p, end);
+                at = end;
+                outs.push((first, second));
+            }
+            for (first, second) in outs {
+                for (got, want, want_q) in [(first, &want0, &want0_q), (second, &want, &want_q)] {
+                    match got {
+                        Ok(out) => assert_eq!(&rpu.read_a(&out), want_q, "k {k}"),
+                        Err(c) => assert_eq!(&rpu.read_i32(&c).unwrap(), want, "k {k}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// TILES_DONE counts the C tiles of every GEMM, int32 or requantized, in START order.
+    #[test]
+    fn tiles_done_counts_the_c_tiles() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x0e4e_0000_0000_0127);
+        let (m, n, k) = (2 * TILE, 3 * TILE - 1, 20);
+        let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
+        let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
+        let params: Vec<Requant> = (0..n).map(|_| random_requant(&mut rng)).collect();
+        let bh = rpu.upload_b(0, &b, n, k);
+        let ah = rpu.upload_a(bh.end(), &a, m, k);
+        let before = rpu.tiles_done();
+        let out = rpu.gemm_requant(&ah, &bh, &params, ah.end()).unwrap();
+        let c = rpu.start_gemm_i32(&ah, &bh, out.end()).unwrap();
+        assert!(rpu.tiles_done() - before < 12);
+        rpu.sync().unwrap();
+        assert_eq!(rpu.tiles_done() - before, 12);
+        rpu.read_i32(&c).unwrap();
+    }
+
     #[test]
     fn next_gemm_leaves_the_banks_of_a_waiting_tile_alone() {
         let mut rpu = Rpu::new().unwrap();

@@ -21,8 +21,11 @@
 // overlap the stream of the next one. A compute is busy only while it streams.
 // CONTROL GEMM with QUANT stores each C row as N int8 instead of N int32: per column j,
 // y = clamp(round((acc + bias[j]) * mult[j] / 2^shift[j]), relu[j] ? 0 : -127, 127), from
-// a parameter memory that the host writes. Row i of tile (r, j) goes to beat
+// one of two parameter sets (CONTROL bit 8) that the host writes, so it can write the
+// next GEMM's set while a GEMM requantizes with the other. Row i of tile (r, j) goes to beat
 // C_BASE + r * n_tiles * N + j * N + i, which is the column-major A panel of the next layer.
+// TILES_DONE counts the C tiles whose last beat is written, in START order, so the host
+// can wait for one GEMM while the next ones run.
 module rpu_top #(
     parameter int N = 8,
     parameter int KMAX = 1024,
@@ -68,9 +71,6 @@ module rpu_top #(
     // The last k reaches PE (N-1, N-1) after the operand register and 2N-2 skew cycles;
     // the shadow takes the sum with the last product, PE_LATENCY - 1 cycles later.
     localparam int SETTLE_STEPS = OPERAND_STAGES + 2 * N - 2 + PE_LATENCY - 1;
-    // A stream may start during the drain of the tile before only if it is long enough:
-    // the drain must end before PE (0, 0) takes the new sum, K cycles after the start.
-    localparam int OVERLAP_K_MIN = SETTLE_STEPS + N;
     localparam int BEAT_ADDR_W = $clog2(MEM_BYTES / N);
     localparam int HOST_ADDR_W = $clog2(MEM_BYTES / 8);
     localparam int BEAT_WORDS = (N + 7) / 8;  // host words per beat
@@ -95,19 +95,20 @@ module rpu_top #(
     localparam int unsigned REG_BUSY_ADDR = 7;
     localparam int unsigned REG_PANEL_ADDR = 8;
     localparam int unsigned REG_TILES_ADDR = 9;
+    localparam int unsigned REG_TILES_DONE_ADDR = 10;
     localparam int unsigned MEM_BASE_ADDR = 32'h1000_0000;  // in 64-bit words
     // Requantization: each store cycle (QUANT_PARTS per C row) takes L columns of the row.
     localparam int L = (N + QUANT_PARTS - 1) / QUANT_PARTS;
     localparam int LANE_W = (L > 1) ? $clog2(L) : 1;
     localparam int QP_DEPTH = QUANT_PARTS * ROW_BEATS;  // (tile column, store part) per lane
     localparam logic [1:0] QUANT_PART_LAST = 2'(QUANT_PARTS - 1);
-    localparam int QP_AW = $clog2(QP_DEPTH);
+    localparam int QP_AW = $clog2(2 * QP_DEPTH);  // two parameter sets
     // Parameter word: bias [31:0] (int32), mult [47:32], shift [53:48], relu [54].
     localparam int QP_W = 55;
-    // Host word QPARAM_BASE + ((j * QUANT_PARTS + part) << LANE_W) + lane holds column
-    // j * N + part * L + lane.
+    // Host word QPARAM_BASE + ((set * QP_DEPTH + j * QUANT_PARTS + part) << LANE_W) + lane
+    // holds column j * N + part * L + lane of parameter set `set`.
     localparam int unsigned QPARAM_BASE_ADDR = 32'h0800_0000;
-    localparam int unsigned QPARAM_WORDS = QP_DEPTH << LANE_W;
+    localparam int unsigned QPARAM_WORDS = (2 * QP_DEPTH) << LANE_W;
     localparam int unsigned MEM_WORDS = MEM_BYTES / 8;
 
     // C buffer: one wide word per array row, written by the shift drain one row per
@@ -121,6 +122,7 @@ module rpu_top #(
     // Free-running since reset: cycles the array streams, and cycles busy.
     logic [31:0] active_cycles;
     logic [31:0] busy_cycles;
+    logic [31:0] tiles_done;
     logic start_request;
     logic preload_request;
     logic control_bank;
@@ -128,6 +130,7 @@ module rpu_top #(
     logic control_keep_b;
     logic control_a_bank;
     logic control_quant;
+    logic control_qset;
     // GEMM sequencer. A blocks at A_BASE + r * PANEL, B tiles at B_BASE + j * PANEL, C tile
     // (r, j) at C_BASE + (r * n_tiles + j) * C_BEATS. The base registers move with it.
     typedef enum logic [1:0] {
@@ -208,6 +211,7 @@ module rpu_top #(
     logic [K_W-1:0] launch_k_len;
     logic [BEAT_ADDR_W-1:0] launch_c_base;
     logic launch_quant;
+    logic launch_qset;
     logic [1:0] launch_skip;
     logic [RB_W-1:0] launch_j;  // tile column, for the requantization parameters
 
@@ -235,6 +239,19 @@ module rpu_top #(
     logic drain_quant;
     logic [1:0] drain_skip;
     logic store_quant;
+    logic compute_qset;
+    logic drain_qset;
+    logic store_qset;
+    // The store reads the last part of row 0: its tile is stored (int32) or its last
+    // row enters the requantization stages, which carry the flag to the write.
+    logic store_tile_end;
+    logic q1_last;
+    logic q2_last;
+    logic q3_last;
+    logic q4_last;
+    logic q_wr_last;
+    // Cycles until the drain is idle, counted while it cannot stall.
+    int drain_left;
     logic [RB_W-1:0] compute_j;
     logic [RB_W-1:0] drain_j;
     logic [RB_W-1:0] store_j;
@@ -299,6 +316,9 @@ module rpu_top #(
     // A drain enters DRAIN_SHIFT one cycle after its wait and stores from the cycle after
     // that: a row still in q1 to q3 would reach the write port with that store.
     assign store_pipe_busy = store_busy || q1_valid || q2_valid || q3_valid;
+    assign store_tile_end = store_busy && store_row == '0 && store_part == store_part_last;
+    assign drain_left = (drain_state == DRAIN_SETTLE) ? SETTLE_STEPS - int'(drain_count) + N
+                      : (drain_state == DRAIN_SHIFT) ? N - int'(drain_count) : 0;
     assign busy = load_busy || launch_valid || compute_busy || drain_busy || store_busy ||
                   q1_valid || q2_valid || q3_valid || q4_valid || q_wr_valid || seq_state != SEQ_IDLE;
     assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy &&
@@ -382,10 +402,11 @@ module rpu_top #(
 `endif
 
     // Requantization parameters: one memory per lane, one read port each.
-    assign qp_read_addr = QP_AW'(int'(store_j) * QUANT_PARTS + int'(store_part));
+    assign qp_read_addr =
+        QP_AW'((store_qset ? QP_DEPTH : 0) + int'(store_j) * QUANT_PARTS + int'(store_part));
     generate
         for (i = 0; i < L; i++) begin : qparam_lane
-            logic [QP_W-1:0] qp_mem [0:QP_DEPTH-1];
+            logic [QP_W-1:0] qp_mem [0:2*QP_DEPTH-1];
             always_ff @(posedge clk) begin
                 if (mem_we && mem_addr >= QPARAM_BASE_ADDR &&
                     mem_addr < QPARAM_BASE_ADDR + QPARAM_WORDS &&
@@ -459,6 +480,7 @@ module rpu_top #(
             control_keep_b <= 1'b0;
             control_a_bank <= 1'b0;
             control_quant <= 1'b0;
+            control_qset <= 1'b0;
             seq_state <= SEQ_IDLE;
             reg_panel <= '0;
             reg_m_blocks <= '0;
@@ -521,6 +543,7 @@ module rpu_top #(
                         control_a_bank <= mem_wdata[4];
                         control_keep_b <= mem_wdata[5];
                         control_quant <= mem_wdata[7];
+                        control_qset <= mem_wdata[8];
                         if (mem_wdata[6]) begin
                             // Tile 0 loads A and B into the banks that the last tile
                             // did not use: that tile may still wait to stream behind a drain.
@@ -559,6 +582,7 @@ module rpu_top #(
             cycles <= 32'd0;
             active_cycles <= 32'd0;
             busy_cycles <= 32'd0;
+            tiles_done <= 32'd0;
             load_busy <= 1'b0;
             issue_active <= 1'b0;
             issue_panel <= 1'b0;
@@ -590,6 +614,7 @@ module rpu_top #(
             launch_k_len <= '0;
             launch_c_base <= '0;
             launch_quant <= 1'b0;
+            launch_qset <= 1'b0;
             launch_skip <= '0;
             launch_j <= '0;
             compute_quant <= 1'b0;
@@ -597,6 +622,14 @@ module rpu_top #(
             drain_quant <= 1'b0;
             drain_skip <= '0;
             store_quant <= 1'b0;
+            compute_qset <= 1'b0;
+            drain_qset <= 1'b0;
+            store_qset <= 1'b0;
+            q1_last <= 1'b0;
+            q2_last <= 1'b0;
+            q3_last <= 1'b0;
+            q4_last <= 1'b0;
+            q_wr_last <= 1'b0;
             compute_j <= '0;
             drain_j <= '0;
             store_j <= '0;
@@ -692,6 +725,7 @@ module rpu_top #(
                     launch_k_len <= reg_k_len;
                     launch_c_base <= reg_c_base;
                     launch_quant <= control_quant;
+                    launch_qset <= control_qset;
                     launch_skip <= tile_skip;
                     launch_j <= RB_W'(seq_j);
                 end
@@ -705,6 +739,7 @@ module rpu_top #(
                     compute_a_bank <= control_a_bank;
                     compute_c_base <= reg_c_base;
                     compute_quant <= control_quant;
+                    compute_qset <= control_qset;
                     compute_skip <= tile_skip;
                     compute_j <= RB_W'(seq_j);
                 end else begin
@@ -715,6 +750,7 @@ module rpu_top #(
                     launch_k_len <= local_k_len[control_bank];
                     launch_c_base <= reg_c_base;
                     launch_quant <= control_quant;
+                    launch_qset <= control_qset;
                     launch_skip <= tile_skip;
                     launch_j <= RB_W'(seq_j);
                 end
@@ -741,6 +777,7 @@ module rpu_top #(
                 compute_a_bank <= launch_a_bank;
                 compute_c_base <= launch_c_base;
                 compute_quant <= launch_quant;
+                compute_qset <= launch_qset;
                 compute_skip <= launch_skip;
                 compute_j <= launch_j;
             end
@@ -815,6 +852,7 @@ module rpu_top #(
                         store_busy <= 1'b1;
                         store_c_base <= drain_c_base;
                         store_quant <= drain_quant;
+                        store_qset <= drain_qset;
                         store_part_last <= drain_quant ? QUANT_PART_LAST : C_ROW_LAST - drain_skip;
                         store_j <= drain_j;
                         store_row <= COL_LAST;
@@ -839,9 +877,12 @@ module rpu_top #(
                     stream_beat <= '0;
                     stream_a_addr <= compute_a_bank ? A_BANK1_BEAT : '0;
                     stream_lane <= '0;
-                    // While a drain is pending, a store still busy could delay it.
-                    if (!drain_busy ||
-                        (!store_pipe_busy && stream_last >= K_W'(OVERLAP_K_MIN - 1))) begin
+                    // The stream may start once the drain ends before PE (0, 0) takes the new
+                    // sum: the last k leaves the PE OPERAND_STAGES + PE_LATENCY - 1 cycles
+                    // after it enters, K - 1 cycles after the start; one cycle earlier loses
+                    // sums. A store still busy could delay the drain.
+                    if (!drain_busy || (!store_pipe_busy
+                            && int'(stream_last) + OPERAND_STAGES + PE_LATENCY - 1 >= drain_left)) begin
                         compute_state <= COMPUTE_STREAM;
                     end
                 end
@@ -852,6 +893,7 @@ module rpu_top #(
                         drain_count <= '0;
                         drain_c_base <= compute_c_base;
                         drain_quant <= compute_quant;
+                        drain_qset <= compute_qset;
                         drain_skip <= compute_skip;
                         drain_j <= compute_j;
                     end else begin
@@ -873,6 +915,10 @@ module rpu_top #(
             // Requantized store: stages 1 to 4 are in q1_* to q4_*, stage 5 builds the row
             // in q_bytes.
             q1_valid <= store_busy && store_quant;
+            q1_last <= store_tile_end && store_quant;
+            q2_last <= q1_last;
+            q3_last <= q2_last;
+            q4_last <= q3_last;
             q1_part <= store_part;
             q1_addr <= store_c_base + BEAT_ADDR_W'(store_row);
             q2_valid <= q1_valid;
@@ -889,14 +935,19 @@ module rpu_top #(
                 q_bytes <= q_next;
                 if (q4_part == QUANT_PART_LAST) begin
                     q_wr_valid <= 1'b1;
+                    q_wr_last <= q4_last;
                     q_wr_addr <= q4_addr;
                     q_wr_data <= q_next;
                 end
             end
 
+            if ((store_tile_end && !store_quant) || (q_wr_valid && q_wr_last)) begin
+                tiles_done <= tiles_done + 32'd1;
+            end
+
             // C store, one beat per cycle: the memory never stalls a write.
             if (store_busy) begin
-                if (store_row == '0 && store_part == store_part_last) begin
+                if (store_tile_end) begin
                     store_busy <= 1'b0;
                 end
                 if (store_part == store_part_last) begin
@@ -929,6 +980,7 @@ module rpu_top #(
             REG_K_LEN_ADDR: mem_rdata = 64'(reg_k_len);
             REG_ACTIVE_ADDR: mem_rdata = 64'(active_cycles);
             REG_BUSY_ADDR: mem_rdata = 64'(busy_cycles);
+            REG_TILES_DONE_ADDR: mem_rdata = 64'(tiles_done);
             default: mem_rdata = (mem_addr >= MEM_BASE_ADDR && mem_addr < MEM_BASE_ADDR + MEM_WORDS)
                 ? host_mem_rdata : 64'd0;
         endcase

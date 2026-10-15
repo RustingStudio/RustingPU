@@ -87,6 +87,11 @@ Wall cycles per image, from item 23 on: every simulated clock cycle from the fir
 | 24 | 12 | 840.5 | 837.7 |
 | 24, HOST_WORDS 4 | 32 | 105.3 | 104.7 |
 | 24, HOST_WORDS 8 | 64 | 31.7 | 31.3 |
+| 27 start the next GEMM as late in the drain as the sums allow | 8 | 1625.5 | 1623.5 |
+| 27 | 16 | 406.6 | 404.6 |
+| 27 | 12 | 839.3 | 836.5 |
+| 27, HOST_WORDS 4 | 32 | 103.0 | 102.5 |
+| 27, HOST_WORDS 8 | 64 | 28.0 | 27.8 |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -580,6 +585,46 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - MNIST, RPU equal to host int8 for every image, 97.25%: busy and wall cycles equal to item 25 (N = 8: 1624.4 and 1626.5, N = 16: 406.3 and 408.4, N = 64, LOAD_BEATS 2: 31.3 and 31.7 per image, batch 64).
 - No synthesis run: the change is one OR of three flags; item 27 synthesizes on top of it.
 - Commit: `250c24e`. N = 16, batch 64, at this commit: 406.3 busy and 408.4 wall cycles per image.
+
+## Item 27: start the next GEMM as late in the drain as the sums allow. Done, 2026-10-15
+- Owner context: the goal is TPU class, so N = 64 counts most. At item 26, N = 64 was 31.3 busy cycles per image against 27.8 streaming cycles (84.94%): the array waited between GEMMs. Three causes, each measured below: the next stream started early only when its K was 3N or more, so the short layer 2 (K = 128 at N = 64) waited for the whole drain; the host waited for DONE before it changed the requantization parameters; and with two input slots the input of batch b + 2 waited for the GEMMs of batch b.
+- RTL, three parts:
+  - Graded overlap. CLEAR starts the next stream when the drain is idle, or when the store pipeline is idle and the last k of the new stream reaches PE (0, 0) no earlier than the drain has shifted the old sums out: `stream_last + OPERAND_STAGES + PE_LATENCY - 1 >= drain_left`, with `drain_left` the cycles to the end of SHIFT. This replaces the fixed K >= 3N rule of item 20. The rule is exact: one cycle earlier loses sums (see the tests).
+  - `TILES_DONE` (register 10): a 32-bit count of the C tiles stored since reset, in START order. A raw tile counts at the end of its store, a requantized tile when its last row leaves the write stage.
+  - Two QPARAM sets. CONTROL bit 8 (QSET) picks the set a GEMM uses; the bit travels with the GEMM from launch to its store. Set 1 starts at `QPARAM_BASE + (P * ceil(KMAX / N) << LANE_W)`.
+- Driver: the host keeps a list of started GEMMs and waits for one by its tile count in `TILES_DONE` (a wrapping compare), not for DONE. Requantized GEMMs alternate the QPARAM sets, so the host writes the parameters of the next GEMM while the last one runs. `predict_batches` runs the hidden layer of batch t + 1, writes the input of batch t + 2, runs layer 2 of batch t, then reads batch t - 1. It uses three input slots; where three do not fit (N = 12, batch 256) it falls back to two, and the input of batch b + 2 then waits for the first GEMM of batch b.
+- MNIST, RPU equal to host int8 for every image, 97.25%. Busy / wall cycles per image, item 26 to item 27:
+
+  | N | LOAD_BEATS | HOST_WORDS | Batch 64 busy | Batch 64 wall | Batch 256 wall |
+  |---|---|---|---:|---:|---:|
+  | 8 | 1 | 1 | 1624.4 to 1623.5 (-0.1%) | 1626.5 to 1625.5 (-0.1%) | 1616.8 to 1616.5 (0.0%) |
+  | 12 | 1 | 1 | 837.7 to 836.5 (-0.1%) | 840.5 to 839.3 (-0.1%) | 771.0 to 771.0 (two slots) |
+  | 16 | 1 | 1 | 406.3 to 404.6 (-0.4%) | 408.4 to 406.6 (-0.4%) | 407.2 to 406.8 (-0.1%) |
+  | 32 | 2 | 4 | 104.7 to 102.5 (-2.1%) | 105.3 to 103.0 (-2.2%) | 104.1 to 103.5 (-0.6%) |
+  | 64 | 2 | 8 | 31.3 to 27.8 (-11.2%) | 31.7 to 28.0 (-11.7%) | 30.6 to 28.2 (-7.8%) |
+
+  N = 64 streams 95.88% of its busy cycles at batch 64 (96.05% at batch 256), N = 32 99.68%.
+- Ablations, batch 64, each part taken out alone (busy / wall per image):
+
+  | Taken out | N = 64 | N = 32 |
+  |---|---:|---:|
+  | none (item 27) | 27.8 / 28.0 | 102.5 / 103.0 |
+  | graded overlap (no early start at all) | 35.7 / 36.0 | 117.4 / 117.9 |
+  | second QPARAM set (always set 0) | 31.3 / 31.6 | 102.5 / 103.0 |
+  | third input slot | 32.0 / 32.4 | 104.8 / 105.4 |
+
+  Every part pays at N = 64. At N = 32 the second QPARAM set gains nothing measurable.
+- Synthesis, `rpu_top` (the memory is a black box), item 26 to item 27: gw5a N = 8 31,432 to 31,426 LUT, 4,127 to 4,247 ALU, 8,075 to 8,118 DFF, block RAM 20 SDPX9B to 20 SDPX9B + 8 DPX9B (the second QPARAM set); gw2a N = 8 12,630 to 12,615 LUT, 3,179 to 3,201 ALU, 8,075 to 8,118 DFF; gw5a N = 16 87,941 to 87,986 LUT, 13,792 to 13,918 ALU, 28,571 to 28,614 DFF, 72 SDPX9B both; xcup N = 8 10 to 12 RAMB36E2, DSP48E2 equal. The QPARAM memory doubles; at N = 16 it fits the blocks it already had.
+- Tests:
+  - `next_gemm_of_any_k_overlaps_the_drain`: a long GEMM (K = 8N), then for every K from 1 to 3N + 2 four GEMMs (requantized and int32, two QPARAM sets) started back-to-back without reads; all four C bit-exact.
+  - `tiles_done_counts_the_c_tiles`: a requantized and an int32 GEMM of 2N x (3N - 1), K = 20: fewer than 12 tiles right after START, exactly 12 after the wait.
+  - Mutations, each caught: no early start (`next_tile_streams_during_drain`); the stream one cycle earlier than the rule (4 tests fail at N = 8, 8 at N = 16); a requantized tile counted at the end of its store, not of its write stage (`gemm_requant_matches_the_host_rule` and the any-K test); QSET not carried to the store (3 tests).
+  - The rule first had slack: the stream could start two cycles earlier than it did and still pass, and three earlier failed. So the rule was moved to the earliest passing cycle, written in the pipeline parameters.
+  - A check that cycles per pair stay flat over K was dropped, not tuned: an int32 pair is bound by its 4N-cycle C store on the one write port, so it is flat even without the graded overlap, and the check proved nothing.
+  - Not tested: the wrapping compare on `TILES_DONE` (it needs 2^32 tiles). One QPARAM set and two slots change only speed, and the driver waits keep them right.
+- All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10 (8, 16, 64), with the brain feature, at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check is clean.
+- Load: `uptime` 3.9 to 4.0 (synthesis, tests and MNIST in parallel).
+- Commit: see the next docs commit.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.

@@ -12,7 +12,8 @@
 //! of a batch runs.
 use crate::quant::{self, QuantRows, Requant};
 use crate::{
-    panel_beats, ResidentA, ResidentB, ResidentC, Rpu, RpuError, C_BEATS, LOAD_BEATS, TILE,
+    panel_beats, ResidentA, ResidentB, ResidentC, Rpu, RpuError, C_BEATS, LOAD_BEATS, MEM_BEATS,
+    TILE,
 };
 use rusting_brain::{Activation, Network};
 
@@ -83,14 +84,16 @@ impl Backend for Host<'_> {
     }
 }
 
-/// The activations of batch `b` go to RPU memory from beat `slots[b % 2]` on, each GEMM
-/// output right after its input, so one batch may start while the last GEMM of the batch
-/// before runs. The input of batch b + 2 lands on the input of batch b, which no running
-/// GEMM reads unless the network has one layer; then the write waits for that GEMM.
+/// The activations of batch `b` go to RPU memory from beat `slots[b % slots.len()]` on,
+/// each GEMM output right after its input. Batch b + 1 runs its first layer before the
+/// last layer of batch b, while the host still has to read batch b - 1; with three slots
+/// the input of batch b + 2 then lands on that of batch b - 1, which no running GEMM reads
+/// unless the network has one layer; then the write waits for that GEMM. When three slots
+/// do not fit, two do: the input of batch b + 2 then waits for the first GEMM of batch b.
 struct OnRpu<'a> {
     rpu: &'a mut Rpu,
     weights: &'a [ResidentB],
-    slots: [u32; 2],
+    slots: Vec<u32>,
     next: u32,
 }
 
@@ -99,7 +102,7 @@ impl Backend for OnRpu<'_> {
     type Acc = ResidentC;
 
     fn batch(&mut self, b: usize) {
-        self.next = self.slots[b % 2];
+        self.next = self.slots[b % self.slots.len()];
     }
 
     fn upload(&mut self, x: Vec<i8>, m: usize, k: usize) -> ResidentA {
@@ -221,12 +224,15 @@ impl RpuMlp {
         }
         let batch = batch.max(1);
         let slot0 = self.resident.last().map_or(0, ResidentB::end);
-        let slot1 =
-            (slot0 + self.batch_beats(batch.min(inputs.len()))).next_multiple_of(LOAD_BEATS as u32);
+        let beats = self
+            .batch_beats(batch.min(inputs.len()))
+            .next_multiple_of(LOAD_BEATS as u32);
         let mut backend = OnRpu {
             rpu,
             weights: &self.resident,
-            slots: [slot0, slot1],
+            slots: (0..if slot0 + 3 * beats <= MEM_BEATS { 3 } else { 2 })
+                .map(|i| slot0 + i * beats)
+                .collect(),
             next: slot0,
         };
         self.forward(&mut backend, inputs, batch, &mut |_, _| {})
@@ -252,9 +258,9 @@ impl RpuMlp {
     }
 
     /// Runs `inputs` in batches of `batch`, each quantized with its own scale. The host
-    /// starts the last GEMM of batch b, then the first GEMM of batch b + 1, and writes the
-    /// input of batch b + 2 while they run. `observe(l, y)` sees the float output of each
-    /// unfused layer.
+    /// starts the first GEMM of batch b + 1, writes the input of batch b + 2, starts the
+    /// last GEMM of batch b and then reads batch b - 1, so no GEMM waits for the one
+    /// started just before it. `observe(l, y)` sees the float output of each unfused layer.
     fn forward<B: Backend>(
         &self,
         backend: &mut B,
@@ -281,26 +287,30 @@ impl RpuMlp {
             return Ok(Vec::new());
         };
         let first = upload(backend, first);
-        let mut staged = self.hidden(backend, first, observe)?;
+        let mut staged = Some(self.hidden(backend, first, observe)?);
         let mut uploaded = batches.next().map(|x| upload(backend, x));
+        let mut started = None;
         let mut out = Vec::with_capacity(inputs.len());
-        loop {
-            let acc = backend.matmul(last, &staged.a)?;
+        while staged.is_some() || started.is_some() {
             let next = uploaded
                 .take()
                 .map(|s| self.hidden(backend, s, observe))
                 .transpose()?;
             uploaded = batches.next().map(|x| upload(backend, x));
-            let y = self.output(backend, last, acc, &staged, observe)?;
-            out.extend(
-                y.chunks_exact(self.layers[last].weights.rows)
-                    .map(<[f32]>::to_vec),
-            );
-            match next {
-                Some(s) => staged = s,
-                None => return Ok(out),
+            let now = staged
+                .take()
+                .map(|s| Ok::<_, RpuError>((backend.matmul(last, &s.a)?, s)))
+                .transpose()?;
+            if let Some((acc, s)) = std::mem::replace(&mut started, now) {
+                let y = self.output(backend, last, acc, &s, observe)?;
+                out.extend(
+                    y.chunks_exact(self.layers[last].weights.rows)
+                        .map(<[f32]>::to_vec),
+                );
             }
+            staged = next;
         }
+        Ok(out)
     }
 
     /// Runs every layer but the last one.
