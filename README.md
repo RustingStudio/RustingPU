@@ -1,6 +1,6 @@
 # RustingPU
 
-RustingPU is an 8x8 INT8 systolic-array accelerator in SystemVerilog, driven from Rust. It runs a RustingBrain MNIST MLP at **97.25% test accuracy**, identical to the CPU int8 reference and 0.01 pp from f32, in **1623.5 cycles per image** at **98.55% array utilization**. The array size is a build parameter; at 16x16 the same network takes 404.6 cycles per image at 98.85%.
+RustingPU is an 8x8 INT8 systolic-array accelerator in SystemVerilog, driven from Rust. It runs a RustingBrain MNIST MLP at **97.25% test accuracy**, identical to the CPU int8 reference and 0.01 pp from f32, in **1624.3 cycles per image** at **98.50% array utilization**. The array size is a build parameter; at 16x16 the same network takes 406.2 cycles per image at 98.47%.
 
 This will not beat a GPU or your CPU on speed, and the simulation is far slower than either. The point is a complete chip design, from PE to DMA to driver, running a model trained by its own framework, with every result checked bit for bit against a software reference. The RPU does matrix multiplication and, between layers, bias, ReLU and requantization to int8; the host quantizes the input and finishes the last layer. Until milestone 2 every number comes from Verilator, not silicon.
 
@@ -13,9 +13,9 @@ MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBr
 | f32 accuracy | 97.26% | 97.26% |
 | Host int8 accuracy | 97.25% | 97.25% |
 | RPU accuracy | 97.25% | 97.25% |
-| Cycles per image | 1623.5 | 404.6 |
-| Array utilization | 98.55% | 98.85% |
-| Wall cycles per image (host writes and waits included) | 1625.5 | 406.6 |
+| Cycles per image | 1624.3 | 406.2 |
+| Array utilization | 98.50% | 98.47% |
+| Wall cycles per image (host writes, reads and waits included) | 1631.4 | 414.3 |
 | Host words per image, written / read | 101.5 / 5.0 | 101.5 / 6.0 |
 
 ```bash

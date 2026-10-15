@@ -677,7 +677,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Tests: `host_reads_wait_for_the_loads` (reads of 16N host reads take exactly reads + READ_LATENCY - 1 cycles with the RPU idle, and exactly one cycle more per load read, 2N / LOAD_BEATS, while a tile GEMM loads; the words and C are right). Mutations, each caught: the host read not held while a load issues (the one-read-port check stops the simulation, both with `mem_ready` high and with it low but the read not masked); `mem_rvalid` one stage early at READ_LATENCY 10 (at least 12 tests fail, the new one among them).
 - All 39 tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10 (8, 16, 64), with the brain feature (42), at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16, 64) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check (fmt, clippy, Icarus, Verilator lint at N = 8 to 64) is clean.
 - Load: `uptime` 1.2 to 1.7.
-- Commit: see git log. N = 16, batch 64, at this commit: 406.2 busy and 414.3 wall cycles per image.
+- Commit: `2087f5d`. N = 16, batch 64, at this commit: 406.2 busy and 414.3 wall cycles per image.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
