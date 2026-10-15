@@ -1,21 +1,21 @@
 # RustingPU
 
-RustingPU is an 8x8 INT8 systolic-array accelerator in SystemVerilog, driven from Rust. It runs a RustingBrain MNIST MLP at **97.25% test accuracy**, identical to the CPU int8 reference and 0.01 pp from f32, in **1624.4 cycles per image** at **98.50% array utilization**. The array size is a build parameter; at 16x16 the same network takes 406.3 cycles per image at 98.44%.
+RustingPU is an 8x8 INT8 systolic-array accelerator in SystemVerilog, driven from Rust. It runs a RustingBrain MNIST MLP at **97.25% test accuracy**, identical to the CPU int8 reference and 0.01 pp from f32, in **1623.5 cycles per image** at **98.55% array utilization**. The array size is a build parameter; at 16x16 the same network takes 404.6 cycles per image at 98.85%.
 
 This will not beat a GPU or your CPU on speed, and the simulation is far slower than either. The point is a complete chip design, from PE to DMA to driver, running a model trained by its own framework, with every result checked bit for bit against a software reference. The RPU does matrix multiplication and, between layers, bias, ReLU and requantization to int8; the host quantizes the input and finishes the last layer. Until milestone 2 every number comes from Verilator, not silicon.
 
 ## Numbers
 
-MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-15 at commit `93c8f39`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
+MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-15 at commit `af4bcd3`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
 
 | | N = 8 | N = 16 |
 |---|---:|---:|
 | f32 accuracy | 97.26% | 97.26% |
 | Host int8 accuracy | 97.25% | 97.25% |
 | RPU accuracy | 97.25% | 97.25% |
-| Cycles per image | 1624.4 | 406.3 |
-| Array utilization | 98.50% | 98.44% |
-| Wall cycles per image (host writes and waits included) | 1626.5 | 408.4 |
+| Cycles per image | 1623.5 | 404.6 |
+| Array utilization | 98.55% | 98.85% |
+| Wall cycles per image (host writes and waits included) | 1625.5 | 406.6 |
 | Host words per image, written / read | 101.5 / 5.0 | 101.5 / 6.0 |
 
 ```bash

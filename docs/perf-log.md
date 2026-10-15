@@ -603,7 +603,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
   | 32 | 2 | 4 | 104.7 to 102.5 (-2.1%) | 105.3 to 103.0 (-2.2%) | 104.1 to 103.5 (-0.6%) |
   | 64 | 2 | 8 | 31.3 to 27.8 (-11.2%) | 31.7 to 28.0 (-11.7%) | 30.6 to 28.2 (-7.8%) |
 
-  N = 64 streams 95.88% of its busy cycles at batch 64 (96.05% at batch 256), N = 32 99.68%.
+  Utilization at batch 64: N = 8 98.55%, N = 16 98.85%, N = 32 99.68%, N = 64 95.88% (96.05% at batch 256). Host words per image are unchanged: 101.5 written, 5.0 (N = 8) and 6.0 (N = 16) read.
 - Ablations, batch 64, each part taken out alone (busy / wall per image):
 
   | Taken out | N = 64 | N = 32 |
