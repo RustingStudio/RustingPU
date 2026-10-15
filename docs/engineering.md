@@ -77,9 +77,10 @@ RPU_N=16 cargo test --release            # array size (default 8)
 RPU_READ_LATENCY=10 cargo test --release # memory read latency in cycles (default 1)
 RPU_LOAD_BEATS=2 cargo test --release    # beats per load request (default 1, must divide N)
 RPU_QUANT_PARTS=1 cargo test --release   # store cycles per requantized C row (1 to 4, default 1 above N = 16, else 4)
+RPU_HOST_WORDS=2 cargo test --release    # 64-bit words per host memory write (divides ceil(N / 8), default a whole beat above N = 16, else 1)
 ```
 
-They become `-GN` / `-GREAD_LATENCY` / `-GLOAD_BEATS` / `-GQUANT_PARTS` for Verilator and are re-exported to Rust, so `TILE` always equals the RTL `N`. `build.rs` clears the Verilator `obj_dir` before each run; stale generated files from another N do not compile.
+They become `-GN` / `-GREAD_LATENCY` / `-GLOAD_BEATS` / `-GQUANT_PARTS` / `-GHOST_WORDS` for Verilator and are re-exported to Rust, so `TILE` always equals the RTL `N`. `build.rs` clears the Verilator `obj_dir` before each run; stale generated files from another N do not compile.
 
 Icarus smoke test of the array alone (N = 4):
 
@@ -159,7 +160,7 @@ bit 7 GEMM_READY      no GEMM sequencer running and no load pending: the
 
 ### Memory layout
 
-Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest word first; when N is not a multiple of 8, the top bytes of a beat's last word are padding). Base registers hold beat addresses. A load request reads LOAD_BEATS consecutive beats from an address rounded down to a multiple of LOAD_BEATS, so A_BASE and B_BASE must be multiples of LOAD_BEATS (`run_gemm` checks it). The board keeps LOAD_BEATS = 1; 2 is the wide read port of a bigger part (`docs/perf-log.md`, item 14).
+Memory moves 8*N-bit beats (N int8 values in N/8 host words rounded up, lowest word first; when N is not a multiple of 8, the top bytes of a beat's last word are padding). Base registers hold beat addresses. A load request reads LOAD_BEATS consecutive beats from an address rounded down to a multiple of LOAD_BEATS, so A_BASE and B_BASE must be multiples of LOAD_BEATS (`run_gemm` checks it). The board keeps LOAD_BEATS = 1; 2 is the wide read port of a bigger part (`docs/perf-log.md`, item 14). A host memory write moves HOST_WORDS words from a multiple of HOST_WORDS in one cycle: one on the board, a whole beat above N = 16 (item 23).
 
 - A and B panels: N rows of `ceil(K/N)` beats each, stored column by column: beat c of rows 0..N-1, then beat c + 1 (`pack_panels`). Beat c of a row holds k = cN .. cN + N - 1, k = cN in the lowest byte, zero padded past K. A load reads one column of A and then the same column of B, so the stream can read column c before the later columns arrive.
 - C tile: row-major int32, 4 beats per row (two int32 per host word, low half first). In a GEMM without QUANT, the last B tile stores only the first 4 - TILES[33:32] beats of each row, and the other beats keep what was there; `run_gemm` sets TILES[33:32] so that these are the beats that hold columns below n. `gemm_i32` reads back only the rows below m and, per row, the beats that hold the columns below n.

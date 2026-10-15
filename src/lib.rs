@@ -18,6 +18,13 @@ const _: () = assert!(
     QUANT_PARTS >= 1 && QUANT_PARTS <= 4,
     "RPU_QUANT_PARTS must be 1 to 4"
 );
+/// 64-bit words per host memory write, set at build time with `RPU_HOST_WORDS` (default 1,
+/// a whole beat above N = 16): the width of the host write path.
+pub const HOST_WORDS: usize = parse_usize(env!("RPU_HOST_WORDS"));
+const _: () = assert!(
+    HOST_WORDS >= 1 && TILE.div_ceil(8).is_multiple_of(HOST_WORDS),
+    "RPU_HOST_WORDS must divide the words of a beat, ceil(RPU_N / 8)"
+);
 /// Longest K of one panel job. Must match `KMAX` of `rtl/rpu_top.sv`.
 pub const KMAX: usize = 1024;
 /// Size of the RPU memory. Must match `MEM_BYTES` of `rtl/rpu_top.sv`.
@@ -92,6 +99,7 @@ mod sys {
         pub fn rpu_tick(r: *mut Rpu);
         pub fn rpu_cycles(r: *mut Rpu) -> u32;
         pub fn rpu_write(r: *mut Rpu, addr: u32, value: u64);
+        pub fn rpu_write_words(r: *mut Rpu, addr: u32, words: *const u64, count: u32);
         pub fn rpu_read(r: *mut Rpu, addr: u32) -> u64;
         pub fn rpu_busy(r: *mut Rpu) -> u8;
         pub fn rpu_done(r: *mut Rpu) -> u8;
@@ -121,6 +129,8 @@ pub struct Rpu {
     inner: NonNull<sys::Rpu>,
     words_written: u64,
     words_read: Cell<u64>,
+    /// Clock cycles since `new`: host writes, waits and resets each tick the model.
+    wall_cycles: u64,
     /// Unique per model, so a [`ResidentB`] cannot be used with another RPU.
     id: u64,
     /// Memory beats `start..end` that the GEMMs started since the last observed DONE may
@@ -188,6 +198,7 @@ impl Rpu {
             inner,
             words_written: 0,
             words_read: Cell::new(0),
+            wall_cycles: 0,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pending_reads: Vec::new(),
             pending_writes: Vec::new(),
@@ -198,6 +209,7 @@ impl Rpu {
     }
 
     pub fn reset(&mut self) {
+        self.wall_cycles += 1;
         unsafe { sys::rpu_reset(self.inner.as_ptr()) };
         self.retire();
     }
@@ -255,7 +267,14 @@ impl Rpu {
         self.read_reg(REG_BUSY) as u32
     }
 
-    /// Host bus writes since `new`: memory words and registers. A UART link pays for each.
+    /// Clock cycles since `new`, busy or not: the time the host link and the RPU take
+    /// together.
+    pub fn wall_cycles(&self) -> u64 {
+        self.wall_cycles
+    }
+
+    /// 64-bit words the host wrote since `new`: memory words and registers. A memory write
+    /// moves HOST_WORDS of them in one cycle.
     pub fn host_words_written(&self) -> u64 {
         self.words_written
     }
@@ -552,6 +571,7 @@ impl Rpu {
 
     fn write_reg(&mut self, addr: u32, value: u64) {
         self.words_written += 1;
+        self.wall_cycles += 1;
         unsafe { sys::rpu_write(self.inner.as_ptr(), addr, value) };
     }
 
@@ -563,14 +583,23 @@ impl Rpu {
         self.status() & STATUS_COMPUTE_BUSY != 0
     }
 
-    /// Writes host words starting at memory beat `beat`.
+    /// Writes host words starting at memory beat `beat`, HOST_WORDS of them per bus write.
     fn write_words(&mut self, beat: u32, words: &[u64]) {
+        assert!(
+            words.len().is_multiple_of(HOST_WORDS),
+            "memory writes move whole host writes of {HOST_WORDS} words"
+        );
         let end = beat + (words.len() as u32).div_ceil(BEAT_WORDS);
         self.sync_if_pending(&[], &[(beat, end)])
             .expect("a started GEMM never finished");
         let base = MEM_BASE + beat * BEAT_WORDS;
-        for (i, &w) in words.iter().enumerate() {
-            self.write_reg(base + i as u32, w);
+        for (i, chunk) in words.chunks(HOST_WORDS).enumerate() {
+            self.words_written += HOST_WORDS as u64;
+            self.wall_cycles += 1;
+            let addr = base + (i * HOST_WORDS) as u32;
+            unsafe {
+                sys::rpu_write_words(self.inner.as_ptr(), addr, chunk.as_ptr(), HOST_WORDS as u32)
+            };
         }
     }
 
@@ -607,6 +636,7 @@ impl Rpu {
     }
 
     fn tick(&mut self) {
+        self.wall_cycles += 1;
         unsafe { sys::rpu_tick(self.inner.as_ptr()) };
     }
 
@@ -1330,6 +1360,24 @@ mod tests {
                 "active {active}, busy {busy}"
             );
         }
+    }
+
+    #[test]
+    fn wall_cycles_count_writes_and_waits() {
+        let mut rpu = Rpu::new().unwrap();
+        assert_eq!(rpu.wall_cycles(), 1, "reset is one cycle");
+        rpu.write_words(0, &[0; 5 * HOST_WORDS]);
+        assert_eq!(rpu.wall_cycles(), 6, "one cycle per host write");
+        assert_eq!(rpu.host_words_written(), 5 * HOST_WORDS as u64);
+        let (wall, busy, written) = (
+            rpu.wall_cycles(),
+            rpu.busy_cycles(),
+            rpu.host_words_written(),
+        );
+        rpu.run_tile_i8(&[0; N2], &[0; N2]).unwrap();
+        let wall = rpu.wall_cycles() - wall;
+        assert!(wall >= u64::from(rpu.busy_cycles() - busy));
+        assert!(wall > (rpu.host_words_written() - written) / HOST_WORDS as u64);
     }
 
     #[test]

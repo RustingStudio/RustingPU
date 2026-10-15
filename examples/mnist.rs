@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpu = Rpu::new()?;
     let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
     let (written, read) = (rpu.host_words_written(), rpu.host_words_read());
+    let clock = rpu.wall_cycles();
     let start = Instant::now();
     let host: Vec<_> = test
         .inputs
@@ -115,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpu.host_words_written() - written,
         rpu.host_words_read() - read,
     );
+    let clock = rpu.wall_cycles() - clock;
     let (host_correct, rpu_correct) = (correct(&host), correct(&on_rpu));
 
     let pct = |c: usize| 100.0 * c as f64 / count as f64;
@@ -137,6 +139,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "host link: {:.1} words written, {:.1} words read per image (64-bit words)",
         written as f64 / count as f64,
         read as f64 / count as f64
+    );
+    println!(
+        "wall clock: {clock} cycles, {:.1} per image (host writes and waits; reads do not tick)",
+        clock as f64 / count as f64
     );
     println!("simulation wall time {wall:.1} s (host int8 included)");
     Ok(())

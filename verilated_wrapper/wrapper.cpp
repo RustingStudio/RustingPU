@@ -12,6 +12,19 @@ static void rpu_eval(rpu_t* r) {
     r->core.eval();
 }
 
+// mem_wdata is HOST_WORDS 64-bit words wide: a QData for one word, a VlWide of 32-bit
+// words above. Words from `count` on are zero.
+static void set_wdata(QData& port, const uint64_t* words, uint32_t count) {
+    port = count > 0 ? words[0] : 0;
+}
+
+template <std::size_t W>
+static void set_wdata(VlWide<W>& port, const uint64_t* words, uint32_t count) {
+    for (std::size_t i = 0; i < W; i++) {
+        port[i] = i / 2 < count ? static_cast<uint32_t>(words[i / 2] >> (32 * (i % 2))) : 0;
+    }
+}
+
 extern "C" {
 
 rpu_t* rpu_new(void) {
@@ -22,7 +35,7 @@ rpu_t* rpu_new(void) {
     r->core.start = 0;
     r->core.mem_we = 0;
     r->core.mem_addr = 0;
-    r->core.mem_wdata = 0;
+    set_wdata(r->core.mem_wdata, nullptr, 0);
     rpu_eval(r);
     return r;
 }
@@ -52,13 +65,17 @@ void rpu_reset(rpu_t* r) {
     rpu_eval(r);
 }
 
-void rpu_write(rpu_t *r, uint32_t addr, uint64_t value) {
+void rpu_write_words(rpu_t* r, uint32_t addr, const uint64_t* words, uint32_t count) {
     r->core.mem_addr = addr;
-    r->core.mem_wdata = value;
+    set_wdata(r->core.mem_wdata, words, count);
     r->core.mem_we = 1;
     rpu_tick(r);
     r->core.mem_we = 0;
     rpu_eval(r);
+}
+
+void rpu_write(rpu_t *r, uint32_t addr, uint64_t value) {
+    rpu_write_words(r, addr, &value, 1);
 }
 
 uint64_t rpu_read(rpu_t* r, uint32_t addr) {

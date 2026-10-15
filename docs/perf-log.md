@@ -69,6 +69,19 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 22 reuse the first B panel of a GEMM | 12 | 97.25% | 837.7 | 98.00% | 152.6 / 8.0 | 5.5 s |
 | 22 reuse the first B panel of a GEMM, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 104.7 | 97.61% | 103.7 / 8.0 | 7.6 s |
 | 22 reuse the first B panel of a GEMM, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 31.3 | 84.94% | 108.2 / 8.0 | 22.3 s |
+| 23 wide host write path, HOST_WORDS 4, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 104.7 | 97.61% | 103.7 / 8.0 | 5.5 s |
+| 23 wide host write path, HOST_WORDS 8, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 31.3 | 84.94% | 108.2 / 8.0 | 7.8 s |
+
+Wall cycles per image, from item 23 on: every simulated clock cycle from the first GEMM to the last read, busy or not, so host writes and waits count too (host reads do not tick the model). Batch 64:
+
+| Item | N | Wall cycles per image | Cycles per image (busy) |
+|---|---:|---:|---:|
+| 22 (measured with the item 23 counter) | 8 | 1723.2 | 1624.4 |
+| 22 | 16 | 505.1 | 406.3 |
+| 22, LOAD_BEATS 2, QUANT_PARTS 1 | 32 | 205.6 | 104.7 |
+| 22, LOAD_BEATS 2, QUANT_PARTS 1 | 64 | 137.2 | 31.3 |
+| 23 wide host write path, HOST_WORDS 4 | 32 | 130.0 | 104.7 |
+| 23 wide host write path, HOST_WORDS 8 | 64 | 44.6 | 31.3 |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -501,6 +514,27 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, QUANT_PARTS 4, and at QUANT_PARTS 1 at N = 8, 16, 32 and 64, with the brain feature; the full check (fmt, clippy with and without brain, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) is clean.
 - Load: `uptime` 3.6 (MNIST, synthesis and mutations in parallel).
 - Commit: `756b957`.
+
+## Item 23: wall cycles and a wide host write path. Done, 2026-10-15
+- Owner answer to question 8: count wall cycles as a second metric, and give big configs a wider host write path first.
+- Wall cycles: `Rpu::wall_cycles()` counts every simulated clock cycle since `new` (each host write, wait tick and reset); the MNIST example prints wall cycles per image. Host reads are combinational in the model and do not tick, so they are left out, as before for status polls. At item 22 the wall cycles are about the busy cycles plus one per host word written (N = 8: 1723.2 = 1624.4 + 98.8, with 101.5 words written): the next batch's input is written after DONE, while the RPU is idle, so host writes and compute do not overlap.
+- Fix, RTL parameter HOST_WORDS (`RPU_HOST_WORDS`): one host memory write moves HOST_WORDS 64-bit words in one cycle, from a multiple of HOST_WORDS. It must divide the words of a beat, ceil(N / 8). The default is a whole beat above N = 16 (4 words at N = 32, 8 at N = 64) and 1 on the board sizes, so N = 8 and 16 are unchanged. `mem_wdata` is 64 * HOST_WORDS bits; register writes use the low word. The wrapper gets `rpu_write_words`, and `write_words` sends HOST_WORDS words per write. `host_words_written` still counts 64-bit words, so the host words per image do not change.
+- MNIST, RPU equal to host int8 for every image, 97.25%, busy cycles unchanged:
+
+  | N | LOAD_BEATS | HOST_WORDS | Wall cycles per image, batch 64 | Batch 256 |
+  |---|---|---|---:|---:|
+  | 8 | 1 | 1 (default) | 1723.2 to 1723.2 | 1709.8 to 1709.8 |
+  | 32 | 2 | 4 (default) | 205.6 to 130.0 (-36.8%) | 202.0 to 127.8 (-36.7%) |
+  | 64 | 2 | 8 (default) | 137.2 to 44.6 (-67.5%) | 135.4 to 43.0 (-68.2%) |
+  | 16 | 1 | 2 (not the default) | 505.1 to 455.8 (-9.8%) | 500.2 to 451.8 (-9.7%) |
+  | 12 | 1 | 2 (not the default) | | 900.2 to 833.0 (-7.5%) |
+
+  Simulation time at N = 64, batch 64: 26.5 s to 7.8 s. The wall cycles still sit above the busy cycles by about the write cycles, because the writes still do not overlap the compute (next candidate).
+- Synthesis, `rpu_top` (the memory is a black box), against item 22: no logic change at HOST_WORDS 1, and the counts move within yosys run-to-run noise: gw5a N = 8 31,410 LUT (31,399), 4,176 ALU (4,225), 8,075 DFF; gw5a N = 16 87,900 LUT (87,962), 13,846 ALU (13,797), 28,571 DFF; gw2a N = 8 12,536 LUT (12,522); gw2a N = 16 29,141 LUT (29,357); xcup N = 8 7,446 LUT (7,391), 8,151 FF. With the wide port: xcup N = 32, LOAD_BEATS 2, QUANT_PARTS 1 88,294 LUT (88,178), 117,454 FF; xcup N = 64 319,730 LUT (319,212), 450,235 FF. DSP, MULT and RAM equal. On a real part the width goes to the memory's write port, which this count does not include.
+- Tests: `wall_cycles_count_writes_and_waits` (reset is one cycle, one cycle per host write of HOST_WORDS words, wall cycles at least the busy cycles of a tile). The existing bit-exact tests run at N = 32 and 64 with the wide path by default.
+- Mutations at N = 32, each caught: the memory writes only the first word of a host write; the wrapper sets only the first word; no wall cycle per memory write; no wall cycle per tick; one host word counted per memory write.
+- All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10, with the brain feature, at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16) and 4 (N = 32, 64), and at HOST_WORDS 1, 2 and 4 where they divide the beat; the full check (fmt, clippy with and without brain, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2, and HOST_WORDS 1, 2, 8) is clean.
+- Load: `uptime` 3.4 (MNIST, synthesis, mutations and tests in parallel).
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.

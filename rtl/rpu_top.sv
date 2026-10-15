@@ -33,6 +33,10 @@ module rpu_top #(
     // Store cycles per requantized C row, 1 to 4: 4 for the board, 1 above N = 16; fewer
     // cycles take more requantization lanes, ceil(N / QUANT_PARTS).
     parameter int QUANT_PARTS = (N > 16) ? 1 : 4,
+    // 64-bit words per host memory write: 1 for the board, a whole beat ((N + 7) / 8) above
+    // N = 16. Must divide (N + 7) / 8. A memory write starts at a multiple of it; register
+    // writes use the low word.
+    parameter int HOST_WORDS = (N > 16) ? (N + 7) / 8 : 1,
     // 64K beats from N = 16 on, so a bigger array gets a bigger memory.
     parameter int MEM_BYTES = (1 << 20) * ((N > 16) ? N / 16 : 1)
 ) (
@@ -42,7 +46,7 @@ module rpu_top #(
 
     input  logic mem_we,
     input  logic [31:0] mem_addr,
-    input  logic [63:0] mem_wdata,
+    input  logic [64*HOST_WORDS-1:0] mem_wdata,
     output logic [63:0] mem_rdata,
 
     output logic [31:0] cycles,
@@ -408,7 +412,8 @@ module rpu_top #(
         .N(N),
         .BYTES(MEM_BYTES),
         .READ_LATENCY(READ_LATENCY),
-        .LOAD_BEATS(LOAD_BEATS)
+        .LOAD_BEATS(LOAD_BEATS),
+        .HOST_WORDS(HOST_WORDS)
     ) external_memory (
         .clk(clk),
         .reset(reset),

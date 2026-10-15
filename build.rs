@@ -11,8 +11,8 @@ fn main() {
         "rtl/rpu_top.sv",
     ];
 
-    // Array size, memory read latency, beats per load request and store cycles per
-    // requantized row, e.g. RPU_N=16 RPU_READ_LATENCY=10 RPU_LOAD_BEATS=2 cargo test.
+    // Array size, memory read latency, beats per load request, store cycles per
+    // requantized row and host words per memory write, e.g. RPU_N=16 RPU_READ_LATENCY=10 RPU_LOAD_BEATS=2 cargo test.
     let n = std::env::var("RPU_N").unwrap_or_else(|_| "8".into());
     let read_latency = std::env::var("RPU_READ_LATENCY").unwrap_or_else(|_| "1".into());
     let load_beats = std::env::var("RPU_LOAD_BEATS").unwrap_or_else(|_| "1".into());
@@ -25,6 +25,10 @@ fn main() {
         }
         .into()
     });
+    // Host words per memory write: a whole beat above N = 16, one 64-bit word on the board.
+    let n_value: usize = n.parse().expect("RPU_N must be a number");
+    let host_words = std::env::var("RPU_HOST_WORDS")
+        .unwrap_or_else(|_| if n_value > 16 { n_value.div_ceil(8) } else { 1 }.to_string());
 
     // A rebuild with other parameters can emit fewer files; never compile stale ones.
     let _ = std::fs::remove_dir_all(&obj_dir);
@@ -35,6 +39,7 @@ fn main() {
         .arg(format!("-GREAD_LATENCY={read_latency}"))
         .arg(format!("-GLOAD_BEATS={load_beats}"))
         .arg(format!("-GQUANT_PARTS={quant_parts}"))
+        .arg(format!("-GHOST_WORDS={host_words}"))
         .args(["-Mdir", &obj_dir]);
     for f in &rtl_files {
         cmd.arg(format!("{}/{}", base, f));
@@ -72,6 +77,8 @@ fn main() {
     println!("cargo:rustc-env=RPU_LOAD_BEATS={load_beats}");
     println!("cargo:rerun-if-env-changed=RPU_QUANT_PARTS");
     println!("cargo:rustc-env=RPU_QUANT_PARTS={quant_parts}");
+    println!("cargo:rerun-if-env-changed=RPU_HOST_WORDS");
+    println!("cargo:rustc-env=RPU_HOST_WORDS={host_words}");
     for f in &rtl_files {
         println!("cargo:rerun-if-changed={}", f);
     }
