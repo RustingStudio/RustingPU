@@ -85,7 +85,8 @@ impl Backend for Host<'_> {
 
 /// The activations of batch `b` go to RPU memory from beat `slots[b % 2]` on, each GEMM
 /// output right after its input, so one batch may start while the last GEMM of the batch
-/// before runs.
+/// before runs. The input of batch b + 2 lands on the input of batch b, which no running
+/// GEMM reads unless the network has one layer; then the write waits for that GEMM.
 struct OnRpu<'a> {
     rpu: &'a mut Rpu,
     weights: &'a [ResidentB],
@@ -251,8 +252,9 @@ impl RpuMlp {
     }
 
     /// Runs `inputs` in batches of `batch`, each quantized with its own scale. The host
-    /// prepares batch b + 1 and starts its first GEMM before it reads the last layer of
-    /// batch b. `observe(l, y)` sees the float output of each unfused layer.
+    /// starts the last GEMM of batch b, then the first GEMM of batch b + 1, and writes the
+    /// input of batch b + 2 while they run. `observe(l, y)` sees the float output of each
+    /// unfused layer.
     fn forward<B: Backend>(
         &self,
         backend: &mut B,
@@ -280,11 +282,15 @@ impl RpuMlp {
         };
         let first = upload(backend, first);
         let mut staged = self.hidden(backend, first, observe)?;
+        let mut uploaded = batches.next().map(|x| upload(backend, x));
         let mut out = Vec::with_capacity(inputs.len());
         loop {
-            let next = batches.next().map(|x| upload(backend, x));
             let acc = backend.matmul(last, &staged.a)?;
-            let next = next.map(|s| self.hidden(backend, s, observe)).transpose()?;
+            let next = uploaded
+                .take()
+                .map(|s| self.hidden(backend, s, observe))
+                .transpose()?;
+            uploaded = batches.next().map(|x| upload(backend, x));
             let y = self.output(backend, last, acc, &staged, observe)?;
             out.extend(
                 y.chunks_exact(self.layers[last].weights.rows)

@@ -82,6 +82,11 @@ Wall cycles per image, from item 23 on: every simulated clock cycle from the fir
 | 22, LOAD_BEATS 2, QUANT_PARTS 1 | 64 | 137.2 | 31.3 |
 | 23 wide host write path, HOST_WORDS 4 | 32 | 130.0 | 104.7 |
 | 23 wide host write path, HOST_WORDS 8 | 64 | 44.6 | 31.3 |
+| 24 write the next input while the GEMMs run | 8 | 1626.5 | 1624.4 |
+| 24 | 16 | 408.4 | 406.3 |
+| 24 | 12 | 840.5 | 837.7 |
+| 24, HOST_WORDS 4 | 32 | 105.3 | 104.7 |
+| 24, HOST_WORDS 8 | 64 | 31.7 | 31.3 |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -536,6 +541,26 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10, with the brain feature, at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16) and 4 (N = 32, 64), and at HOST_WORDS 1, 2 and 4 where they divide the beat; the full check (fmt, clippy with and without brain, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2, and HOST_WORDS 1, 2, 8) is clean.
 - Load: `uptime` 3.4 (MNIST, synthesis, mutations and tests in parallel).
 - Commit: `2b8598f`. N = 16, batch 64, at this commit: 406.3 busy and 505.1 wall cycles per image.
+
+## Item 24: write the next input while the GEMMs run. Done, 2026-10-15
+- Item 23 left the wall cycles above the busy cycles by about one cycle per host write: `predict_batches` wrote the input of batch b + 1 after it had read batch b, while the RPU was idle.
+- Fix, driver only: the host starts the last GEMM of batch b, then the first GEMM of batch b + 1, and then writes the input of batch b + 2 while both run; then it reads batch b. The input of batch b + 2 goes to the slot of batch b, on top of the input of batch b, which no running GEMM reads once the network has two or more layers. With one layer the last GEMM reads the input itself; there `write_words` already waits for the GEMM that reads those beats (`sync_if_pending`), so the result stays right and only the overlap is lost. A third slot was tried first and measured the same at N = 8 and 16, so it was dropped: it would only cost memory and the largest batch.
+- MNIST, RPU equal to host int8 for every image, 97.25%, busy cycles unchanged. Wall cycles per image, item 23 to item 24:
+
+  | N | LOAD_BEATS | HOST_WORDS | Batch 64 | Batch 256 |
+  |---|---|---|---:|---:|
+  | 8 | 1 | 1 | 1723.2 to 1626.5 (-5.6%) | 1709.8 to 1616.8 (-5.4%) |
+  | 12 | 1 | 1 | 987.2 to 840.5 (-14.9%) | 900.2 to 771.0 (-14.4%) |
+  | 16 | 1 | 1 | 505.1 to 408.4 (-19.1%) | 500.2 to 407.2 (-18.6%) |
+  | 32 | 2 | 4 | 130.0 to 105.3 (-19.0%) | 127.8 to 104.1 (-18.5%) |
+  | 64 | 2 | 8 | 44.6 to 31.7 (-28.9%) | 43.0 to 30.6 (-28.8%) |
+
+  The wall cycles now sit within 1% of the busy cycles at batch 64 on every N (N = 64: 31.7 against 31.3): what is left is the first batch's input and the register writes. So on this model the host link no longer sets the speed; the array does.
+- No RTL change, so no synthesis run: the counts are those of item 23.
+- Tests: `predict_batches_matches_the_host_batch_by_batch` (four batches, so the slot of batch 0 is reused for batch 2 while the GEMMs of batches 0 and 1 run, with hidden layers on the host and fused, and a short last batch) stays bit-exact. The order itself changes no result, only the overlap, so the MNIST wall cycles above are its check: with the write moved back after the read, the tests still pass. Mutation: one slot for every batch fails that test.
+- All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10, with the brain feature, at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check is clean.
+- Load: `uptime` 2.1.
+- Commit: `COMMIT`.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
