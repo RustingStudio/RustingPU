@@ -571,7 +571,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Not modeled: host reads share the read port with the loads on the board. They are 5 to 8 words per image and are combinational in the model; an arbiter for them goes with the milestone 2 host bridge.
 - All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10, with the brain feature, at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check is clean.
 - Load: `uptime` 2.1 (synthesis and tests in parallel).
-- Commit: `COMMIT`.
+- Commit: `74c5f48`. N = 16, batch 64, at this commit: 406.3 busy and 408.4 wall cycles per image.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
