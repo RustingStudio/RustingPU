@@ -76,7 +76,7 @@ Build-time parameters are environment variables read by `build.rs`:
 RPU_N=16 cargo test --release            # array size (default 8)
 RPU_READ_LATENCY=10 cargo test --release # memory read latency in cycles (default 1)
 RPU_LOAD_BEATS=2 cargo test --release    # beats per load request (default 1, must divide N)
-RPU_QUANT_PARTS=1 cargo test --release   # store cycles per requantized C row (1 to 4, default 4)
+RPU_QUANT_PARTS=1 cargo test --release   # store cycles per requantized C row (1 to 4, default 1 above N = 16, else 4)
 ```
 
 They become `-GN` / `-GREAD_LATENCY` / `-GLOAD_BEATS` / `-GQUANT_PARTS` for Verilator and are re-exported to Rust, so `TILE` always equals the RTL `N`. `build.rs` clears the Verilator `obj_dir` before each run; stale generated files from another N do not compile.

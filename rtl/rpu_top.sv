@@ -30,9 +30,9 @@ module rpu_top #(
     // Beats per load request: 1 for the board, 2 or more for a wider read port. Must
     // divide N.
     parameter int LOAD_BEATS = 1,
-    // Store cycles per requantized C row, 1 to 4: 4 for the board; fewer cycles take
-    // more requantization lanes, ceil(N / QUANT_PARTS).
-    parameter int QUANT_PARTS = 4,
+    // Store cycles per requantized C row, 1 to 4: 4 for the board, 1 above N = 16; fewer
+    // cycles take more requantization lanes, ceil(N / QUANT_PARTS).
+    parameter int QUANT_PARTS = (N > 16) ? 1 : 4,
     // 64K beats from N = 16 on, so a bigger array gets a bigger memory.
     parameter int MEM_BYTES = (1 << 20) * ((N > 16) ? N / 16 : 1)
 ) (

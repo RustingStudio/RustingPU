@@ -16,7 +16,15 @@ fn main() {
     let n = std::env::var("RPU_N").unwrap_or_else(|_| "8".into());
     let read_latency = std::env::var("RPU_READ_LATENCY").unwrap_or_else(|_| "1".into());
     let load_beats = std::env::var("RPU_LOAD_BEATS").unwrap_or_else(|_| "1".into());
-    let quant_parts = std::env::var("RPU_QUANT_PARTS").unwrap_or_else(|_| "4".into());
+    // QUANT_PARTS defaults to 1 above N = 16 (owner, 2026-10-15) and to 4 on the board sizes.
+    let quant_parts = std::env::var("RPU_QUANT_PARTS").unwrap_or_else(|_| {
+        if n.parse::<usize>().expect("RPU_N must be a number") > 16 {
+            "1"
+        } else {
+            "4"
+        }
+        .into()
+    });
 
     // A rebuild with other parameters can emit fewer files; never compile stale ones.
     let _ = std::fs::remove_dir_all(&obj_dir);
