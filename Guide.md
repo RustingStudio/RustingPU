@@ -1,201 +1,207 @@
-# RustingPU: a plain guide for the owner
+# RustingPU: простое руководство для владельца
 
-This guide explains the project without assuming you know chip design. Read it top to bottom once. Then use it as a dictionary when something in `docs/perf-log.md` or in a chat makes no sense. Last updated 2026-10-15.
+Это руководство объясняет проект без знаний о проектировании чипов. Прочитай его один раз от начала до конца. Потом пользуйся им как словарём, когда что-то в `docs/perf-log.md` или в чате непонятно. Обновлено 2026-10-15.
 
-## 1. What this project is, in one paragraph
+## 1. Что это за проект, в одном абзаце
 
-RustingPU (the "RPU") is a small AI chip that you are designing yourself. It does one job: it multiplies big tables of numbers (matrices), because that is almost all the work of a neural network. Google's TPU is the same idea at a much larger size. Today the RPU exists only as a design file and runs inside a simulator on your PC. The next step is to put it on your FPGA board, the Sipeed Tang Mega 60K. Later, a bigger FPGA can run a bigger RPU. If the design is good, it could one day become a real chip.
+RustingPU («RPU») — маленький ИИ-чип, который ты проектируешь сам. Он делает одну работу: перемножает большие таблицы чисел (матрицы), потому что почти вся работа нейросети — это именно это. Google TPU — та же идея, только намного больше. Сейчас RPU существует только как файл проекта и работает в симуляторе на твоём ПК. Следующий шаг — запустить его на твоей FPGA-плате Sipeed Tang Mega 60K. Позже на большой FPGA можно запустить большой RPU. Если проект хороший, когда-нибудь из него может получиться настоящий чип.
 
-## 2. The parts, from small to big
+## 2. Части, от маленьких к большим
 
 ```text
- your PC (Rust program)                     the RPU
+ твой ПК (программа на Rust)                RPU
  ┌─────────────────────┐   host link   ┌──────────────────────────────────────┐
- │ loads the network   │ ────────────> │ memory: holds weights and images     │
- │ sends images        │               │         │                            │
- │ reads the answers   │ <──────────── │         v                            │
- └─────────────────────┘               │ loader: copies a piece into the array│
+ │ загружает сеть      │ ────────────> │ память: веса и картинки              │
+ │ шлёт картинки       │               │         │                            │
+ │ читает ответы       │ <──────────── │         v                            │
+ └─────────────────────┘               │ загрузчик: кладёт кусок в массив     │
                                        │         │                            │
                                        │         v                            │
-                                       │ N x N array of tiny multipliers      │
+                                       │ массив N x N маленьких умножителей   │
                                        │         │                            │
                                        │         v                            │
-                                       │ store: writes results back to memory │
+                                       │ store: пишет результаты в память     │
                                        └──────────────────────────────────────┘
 ```
 
-- **PE (processing element):** one tiny calculator. It multiplies two small numbers and adds the result to a running sum. That is one **MAC** (multiply and accumulate).
-- **Array:** N × N PEs in a square grid. N = 8 means 64 PEs, N = 64 means 4,096 PEs. Bigger N means more work per clock tick.
-- **Systolic:** numbers flow through the grid like water through pipes. Each PE hands its numbers to its neighbour on every tick. Data is read from memory once and then reused by a whole row or column of PEs. That reuse is why this kind of chip uses little energy.
-- **Memory:** where the network's weights and the input images wait.
-- **Sequencer:** a small controller inside the RPU. It cuts a big matrix into N × N pieces (**tiles**) and feeds them through the array one after another, so the PC only has to say "multiply these two matrices".
-- **Host:** your PC. **Host link:** the cable or bus between PC and RPU. The PC sends the images and reads back the answers over it.
+- **PE (processing element):** один крошечный вычислитель. Он умножает два маленьких числа и прибавляет результат к текущей сумме. Это одна операция **MAC** (умножить и накопить).
+- **Массив:** N × N PE в квадратной сетке. N = 8 — это 64 PE, N = 64 — это 4 096 PE. Больше N — больше работы за один такт.
+- **Систолический:** числа текут через сетку, как вода по трубам. Каждый PE на каждом такте передаёт свои числа соседу. Данные читаются из памяти один раз, а потом их использует целая строка или столбец PE. Из-за этого такой чип тратит мало энергии.
+- **Память:** там ждут веса сети и входные картинки.
+- **Секвенсор:** маленький контроллер внутри RPU. Он режет большую матрицу на куски N × N (**тайлы**) и прогоняет их через массив один за другим. ПК нужно только сказать «перемножь эти две матрицы».
+- **Host:** твой ПК. **Host link:** кабель или шина между ПК и RPU. По нему ПК шлёт картинки и читает ответы.
 
-## 3. The test problem: MNIST
+## 3. Тестовая задача: MNIST
 
-MNIST is 10,000 small pictures of handwritten digits, 0 to 9. The network looks at each picture and guesses the digit. It is the "hello world" of AI chips.
+MNIST — это 10 000 маленьких картинок рукописных цифр от 0 до 9. Сеть смотрит на каждую картинку и угадывает цифру. Это «hello world» для ИИ-чипов.
 
-- Our network is a 784-128-10 MLP: 784 pixels in, 128 hidden values, 10 scores out.
-- One picture needs about 100,000 multiplications.
-- Accuracy is **97.25%**: 9,725 of 10,000 guesses are right.
-- The RPU gives exactly the same answers as the same math done on the PC with the same small numbers. Every change is checked for this, picture by picture. If one answer differs, the change is wrong.
+- Наша сеть — MLP 784-128-10: 784 пикселя на входе, 128 скрытых значений, 10 оценок на выходе.
+- Одной картинке нужно около 100 000 умножений.
+- Точность **97.25%**: 9 725 из 10 000 ответов верны.
+- RPU даёт ровно те же ответы, что та же математика на ПК с теми же маленькими числами. Каждое изменение проверяется на это, картинка за картинкой. Если хоть один ответ отличается, изменение неверно.
 
-## 4. How to read the numbers
+## 4. Как читать числа
 
-**Clock, cycle, MHz.** A chip works in ticks. One tick is one **cycle**. 100 MHz means 100 million ticks per second.
+**Тактовая частота, такт, МГц.** Чип работает тактами. Один такт — это один **cycle**. 100 МГц — это 100 миллионов тактов в секунду.
 
-**Cycles per image.** How many ticks the RPU needs for one picture.
+**Cycles per image (тактов на картинку).** Сколько тактов RPU нужно на одну картинку.
 
-> time per picture = cycles per image ÷ clock speed
+> время на картинку = тактов на картинку ÷ частота
 >
-> Example: 1,624 cycles at 100 MHz = 16 microseconds = about 62,000 pictures per second.
+> Пример: 1 624 такта при 100 МГц = 16 микросекунд = около 62 000 картинок в секунду.
 
-We count cycles and not seconds because the clock speed of the real board is not known yet. The design runs in a simulator, not on the board.
+Мы считаем такты, а не секунды, потому что частота на настоящей плате ещё не известна. Проект работает в симуляторе, а не на плате.
 
-**Utilization.** The share of time the array is really multiplying. 98% means the PEs almost never wait. Waiting PEs still use power, so a high value also means less wasted energy.
+**Utilization (загрузка).** Доля времени, когда массив действительно умножает. 98% значит, что PE почти никогда не ждут. Ждущие PE всё равно тратят энергию, поэтому высокая загрузка — это ещё и меньше потерь энергии.
 
-**Host words written / read per image.** How much data must go over the cable per picture. One word is 8 bytes. Fewer words means a slower cable is enough, and less energy is spent moving data.
+**Host words written / read per image.** Сколько данных идёт по кабелю на одну картинку. Одно слово — 8 байт. Меньше слов — хватит более медленного кабеля, и меньше энергии уходит на передачу данных.
 
-**TOPS.** Trillions of operations per second. This is the usual speed rating of AI chips. One MAC counts as 2 operations.
+**TOPS.** Триллионы операций в секунду. Обычная оценка скорости ИИ-чипов. Один MAC считается за 2 операции.
 
-> TOPS = N × N × clock × 2 ÷ 1,000,000,000,000
+> TOPS = N × N × частота × 2 ÷ 1 000 000 000 000
 
-**TOPS per watt.** How much work you get from one watt of electricity. For a small, low-power chip like a TPU this is the most important number.
+**TOPS на ватт.** Сколько работы получается из одного ватта электричества. Для маленького экономного чипа вроде TPU это главное число.
 
-**Batch.** How many pictures are sent together. We use 64 by default and also log 256.
+**Batch (пакет).** Сколько картинок посылается вместе. По умолчанию 64, ещё записываем 256.
 
-## 5. Where we are now
+**Wall cycles (такты по часам).** Все такты, включая время, когда ПК пишет данные или ждёт. Busy cycles — только такты, когда RPU работает.
 
-| Array | Where it can run | Cycles per image | Pictures per second (clock is a guess) |
+## 5. Где мы сейчас
+
+| Массив | Где может работать | Тактов на картинку | Картинок в секунду (частота — догадка) |
 |---|---|---:|---:|
-| 8 × 8 | Tang Mega 60K (your board) | 1,624 | ~62,000 at 100 MHz |
-| 16 × 16 | maybe Tang Mega 60K (not chosen) | 405 | ~250,000 at 100 MHz |
-| 32 × 32 | mid FPGA, e.g. Kria K26 | 103 | ~2.4 million at 250 MHz |
-| 64 × 64 | big FPGA, e.g. Xilinx VU9P | 27 | ~9 million at 250 MHz |
+| 8 × 8 | Tang Mega 60K (твоя плата) | 1 624 | ~62 000 при 100 МГц |
+| 16 × 16 | возможно Tang Mega 60K (не выбрано) | 405 | ~250 000 при 100 МГц |
+| 32 × 32 | средняя FPGA, например Kria K26 | 103 | ~2.4 миллиона при 250 МГц |
+| 64 × 64 | большая FPGA, например Xilinx VU9P | 27 | ~9 миллионов при 250 МГц |
 
-At the start of this work, 8 × 8 needed 1,891 cycles per image (now 14% fewer) and 16 × 16 needed 545 (now 26% fewer). The data sent per image dropped from 324 words to 101.5, and the data read back from 72 words to 5.
+В начале этой работы 8 × 8 нужно было 1 891 такт на картинку (сейчас на 14% меньше), а 16 × 16 — 545 (сейчас на 26% меньше). Данные на картинку к RPU упали с 324 слов до 101.5, а обратно — с 72 слов до 5.
 
-Rough comparison with real chips, as a speed rating (TOPS) and energy rating (TOPS per watt). These are estimates, not measurements:
+Грубое сравнение с настоящими чипами по скорости (TOPS) и по энергии (TOPS на ватт). Это оценки, а не измерения:
 
-| Chip | TOPS | TOPS per watt |
+| Чип | TOPS | TOPS на ватт |
 |---|---:|---:|
-| RPU 8 × 8 on Tang Mega 60K | ~0.013 | ~0.005 |
-| RPU 64 × 64 on a big FPGA | ~2 | ~0.05 |
-| RTX 3060 graphics card | ~100 | ~0.6 |
+| RPU 8 × 8 на Tang Mega 60K | ~0.013 | ~0.005 |
+| RPU 64 × 64 на большой FPGA | ~2 | ~0.05 |
+| Видеокарта RTX 3060 | ~100 | ~0.6 |
 | Google TPU v1 (2015) | 92 | ~2.3 |
-| RPU as a real chip on a modern process (estimate) | depends on N | ~3 to 8 |
+| RPU как настоящий чип на современном техпроцессе (оценка) | зависит от N | ~3–8 |
 
-An FPGA is a test bench. The same design uses about 14 times more energy on an FPGA than on a real chip. The FPGA proves that the design is correct. The energy numbers that matter only come with a real chip.
+FPGA — это испытательный стенд. Тот же проект на FPGA тратит примерно в 14 раз больше энергии, чем на настоящем чипе. FPGA доказывает, что проект правильный. Важные цифры по энергии появятся только с настоящим чипом.
 
-## 6. Words you will see
+## 6. Слова, которые ты встретишь
 
-| Word | Meaning |
+| Слово | Значение |
 |---|---|
-| ASIC | A real, custom chip made in a factory. Fast and efficient, very expensive to make. |
-| FPGA | A chip that can be rewired by a file. Slower than an ASIC, but you can try a design for the price of a board. |
-| Bitstream | The file that rewires the FPGA into the RPU. |
-| RTL, SystemVerilog | The language the chip is written in (files in `rtl/`). |
-| Verilator | The simulator. It turns the RTL into a program that runs on your PC. |
-| Synthesis, yosys | Turning RTL into a list of FPGA parts. It tells us how big the design is. |
-| LUT | The basic logic block of an FPGA. How "big" a design is is mostly counted in LUTs. |
-| FF, DFF | Flip-flop: one bit of storage. |
-| DSP | A ready-made multiplier block on the FPGA. One PE needs about one DSP. |
-| BSRAM, BRAM | Block memory on the FPGA. |
-| LUT RAM | Memory built out of LUTs when block memory runs out. It uses up logic space. |
-| DDR3 | The large memory chip next to the FPGA. Your core board already has one. |
-| Fmax | The highest clock speed at which the design still works on a given chip. |
-| INT8 | Whole numbers from -127 to 127. The RPU computes with these to save energy and space. |
-| Quantization | Turning the network's precise numbers into INT8. Requantization does the same between layers, inside the RPU. |
-| GEMM | A matrix multiplication. One network layer is one GEMM. |
-| Tile, panel | A piece of a matrix that fits the array (tile) and the strip of data it needs (panel). |
-| Bias, ReLU | Two small steps after each layer: add a number, then turn negatives into zero. |
-| Bit-exact | The RPU's answer equals the PC's answer in every bit. |
-| Mutation test | We break the design on purpose and check that a test notices. If no test notices, the tests are too weak. |
-| Item | One improvement, logged in `docs/perf-log.md` with numbers before and after. |
-| N | The array size: N × N PEs. |
-| LOAD_BEATS | How many memory rows the loader reads per tick. 1 on your board, 2 for big FPGAs. |
-| QUANT_PARTS | How many ticks the requantization of one row takes. 4 on your board, 1 for big arrays. |
-| Host link, wall cycles | The cable to the PC, and the total ticks including the time spent waiting for that cable. |
+| ASIC | Настоящий заказной чип с завода. Быстрый и экономный, но очень дорогой в производстве. |
+| FPGA | Чип, который можно «перепаять» файлом. Медленнее ASIC, но проект можно попробовать за цену платы. |
+| Bitstream | Файл, который превращает FPGA в RPU. |
+| RTL, SystemVerilog | Язык, на котором написан чип (файлы в `rtl/`). |
+| Verilator | Симулятор. Превращает RTL в программу, которая работает на ПК. |
+| Синтез, yosys | Перевод RTL в список деталей FPGA. Показывает, какой проект большой. |
+| LUT | Базовый логический блок FPGA. «Размер» проекта обычно считают в LUT. |
+| FF, DFF | Триггер: один бит памяти. |
+| DSP | Готовый блок-умножитель на FPGA. Одному PE нужен примерно один DSP. |
+| BSRAM, BRAM | Блочная память на FPGA. |
+| LUT RAM | Память из LUT, когда блочная память кончилась. Она занимает место под логику. |
+| DDR3 | Большой чип памяти рядом с FPGA. На твоей плате он уже есть. |
+| Fmax | Самая высокая частота, на которой проект ещё работает на данном чипе. |
+| INT8 | Целые числа от -127 до 127. RPU считает в них, чтобы экономить энергию и место. |
+| Квантование | Перевод точных чисел сети в INT8. Реквантование делает то же между слоями, внутри RPU. |
+| GEMM | Умножение матриц. Один слой сети — это один GEMM. |
+| Тайл, панель | Кусок матрицы под размер массива (тайл) и полоса данных, которая ему нужна (панель). |
+| Bias, ReLU | Два маленьких шага после каждого слоя: прибавить число, потом заменить отрицательные на ноль. |
+| Bit-exact | Ответ RPU совпадает с ответом ПК в каждом бите. |
+| Мутационный тест | Мы специально ломаем проект и проверяем, что какой-то тест это заметит. Если никто не заметил, тесты слабые. |
+| Item | Одно улучшение, записанное в `docs/perf-log.md` с числами до и после. |
+| N | Размер массива: N × N PE. |
+| LOAD_BEATS | Сколько строк памяти загрузчик читает за такт. 1 на твоей плате, 2 на больших FPGA. |
+| QUANT_PARTS | Сколько тактов занимает реквантование одной строки. 4 на твоей плате, 1 для больших массивов. |
+| HOST_WORDS | Сколько 8-байтовых слов ПК пишет в память RPU за такт. 1 на твоей плате, 4 при N = 32, 8 при N = 64. |
 
-## 7. What happened so far
+## 7. Что уже сделано
 
-- **Milestone 1 (done):** the MNIST network runs on the simulated RPU with bit-exact answers. The frozen numbers are in `docs/m1-results.md`.
-- **Performance work (items 1 to 28, done):** 25 improvements kept, 2 rejected because they did not help, and 1 bug fix. The main ideas:
-  - Keep the weights in RPU memory instead of sending them again with every batch (item 2).
-  - Load the next piece of data while the array works on the current one (items 3, 5, 9, 12).
-  - Do bias, ReLU and requantization inside the RPU, so the hidden layer never goes back to the PC (item 7).
-  - Read and write only the useful parts of the results (items 16, 17).
-  - Let big arrays load faster and store results faster (items 14, 18, 19, 20).
-  - Do not reload weights that are still in place (item 22).
-  - A wider path from the PC into RPU memory, and wall cycles as a second number (item 23).
-  - Write the next pictures while the array still works on the current ones; the PC's writes wait while the RPU stores results (items 24, 25).
-  - Start the next matrix multiplication as early as the results of the one before allow (items 27, 28). Now the 64 × 64 array is busy 99.5% of the time with useful work.
-- The full log is `docs/perf-log.md`. The report page sums it up: https://claude.ai/artifact/GdpyGzsceWja15q26JuGrY
+- **Milestone 1 (готово):** сеть MNIST работает на симулированном RPU с bit-exact ответами. Замороженные числа — в `docs/m1-results.md`.
+- **Работа над скоростью (items 1–28, готово):** 25 улучшений оставлено, 2 отклонены, потому что не помогли, и 1 исправление ошибки. Главные идеи:
+  - Держать веса в памяти RPU, а не слать их заново с каждым пакетом (item 2).
+  - Грузить следующий кусок данных, пока массив работает над текущим (items 3, 5, 9, 12).
+  - Делать bias, ReLU и реквантование внутри RPU, чтобы скрытый слой не возвращался на ПК (item 7).
+  - Читать и писать только полезные части результатов (items 16, 17).
+  - Дать большим массивам быстрее грузить и быстрее сохранять результаты (items 14, 18, 19, 20).
+  - Не перезагружать веса, которые уже на месте (item 22).
+  - Более широкий путь от ПК в память RPU и wall cycles как второе число (item 23).
+  - Писать следующие картинки, пока массив работает над текущими; запись ПК ждёт, пока RPU сохраняет результаты (items 24, 25).
+  - Начинать следующее умножение матриц так рано, как позволяют результаты предыдущего (items 27, 28). Теперь массив 64 × 64 занят полезной работой 99.5% времени.
+- Полный журнал — `docs/perf-log.md`. Страница-отчёт с итогами: https://claude.ai/artifact/GdpyGzsceWja15q26JuGrY
 
-## 8. Your decisions so far
+## 8. Решения
 
-| Question | Your answer | What it means |
+| Вопрос | Ответ | Что это значит |
 |---|---|---|
-| Hardware bias, ReLU, requantization (P1) | Yes | Done in item 7. |
-| Bigger designs than your board | Yes, on FPGAs you can buy, no ASIC for now | Every feature must also work for N = 32 and 64. |
-| Batch 256 | Configurable, log both | Batch 64 stays the main number. |
-| Q2: first array size on the board | 8 × 8 | Safe fit. 16 × 16 can be tried later. |
-| Q3: real DSP count on the board | Left to the agent | Gowin's own tool (Gowin EDA) is installed at the start of milestone 2. It is needed there anyway to make the bitstream. |
-| Q4: DDR3 | Yes, plan it for milestone 3 | The DDR3 chip is already on your core board. Nothing to buy for it. |
-| Q6: faster requantization for big arrays | Yes | QUANT_PARTS = 1 is the default above N = 16 (commit `a8b5e28`). |
-| Q7: PC writes while the RPU reads | Arbiter | The PC's writes wait while the RPU stores results into memory (done in item 25). Simple, and it prepares for DDR3. |
-| Q8: the cable is the limit for big arrays | Wider write path first, count wall cycles | Done in item 23. DDR3 input storage comes in milestone 3. |
+| Bias, ReLU, реквантование в железе (P1) | Да | Сделано в item 7. |
+| Проекты больше твоей платы | Да, на FPGA, которые можно купить, пока без ASIC | Каждая функция должна работать и при N = 32 и 64. |
+| Batch 256 | Настраиваемый, записывать оба | Главное число остаётся при batch 64. |
+| Q2: первый размер массива на плате | 8 × 8 | Точно влезет. 16 × 16 можно попробовать позже. |
+| Q3: настоящее число DSP на плате | Оставлено агенту | Gowin EDA ставится в начале milestone 2. Он там всё равно нужен для bitstream. |
+| Q4: DDR3 | Да, в milestone 3 | Чип DDR3 уже есть на плате. Покупать ничего не надо. |
+| Q6: быстрое реквантование для больших массивов | Да | QUANT_PARTS = 1 по умолчанию выше N = 16 (коммит `a8b5e28`). |
+| Q7: запись ПК, пока RPU работает с памятью | Арбитр | Запись ПК ждёт, пока RPU сохраняет результаты (сделано в item 25). Просто и готовит к DDR3. |
+| Q8: кабель ограничивает большие массивы | Сначала широкий путь записи, считать wall cycles | Сделано в item 23. Хранение входов в DDR3 — в milestone 3. |
+| Q9: второй набор параметров реквантования на маленьких платах | Оставлено агенту: оставить при всех N | Он занимает 24 из 118 блоков памяти при N = 8, места хватает. Отдельный переключатель — лишний код без выигрыша. |
+| Q10: делить работу слоя 2 по группам столбцов при N = 64 | Оставлено агенту: пока нет | Помогает только узким слоям (у MNIST 10 выходов) и требует нового железа. Вернуться, когда будет настоящая целевая сеть. |
+| Q11: искать причину простоя при N = 64, batch 256 | Оставлено агенту: нет | Весь простой — 1.8% при неосновном batch, меньше порога 2%. |
+| Q12: чтение ПК из памяти RPU на плате | Оставлено агенту: арбитр, в milestone 2 | Как в Q7: без второго порта, чтение ПК ждёт, пока загрузчик читает память. |
 
-## 9. What comes next
+## 9. Что дальше
 
-1. **Simulation work is done for now.** On every array size the array is busy with useful work at least 98% of the time, so no change is expected to gain 2% or more. The open questions are at the end of `docs/perf-log.md`.
-2. **Milestone 2, the board.**
-   1. Install Gowin EDA (free Education edition).
-   2. Build the 8 × 8 RPU bitstream.
-   3. Measure the real Fmax and the real DSP count.
-   4. Make an LED blink.
-   5. Talk to the PC over UART.
-   6. Run all 10,000 MNIST pictures and check that the board's answers equal the simulator's, bit for bit.
-   7. Make a photo or video for the launch.
-3. **Milestone 3, DDR3:** bigger networks that do not fit in the FPGA's own memory.
-4. **Later, big FPGAs:** N = 32 or 64 on a rented or bought big FPGA (for example an AWS F1 instance with a VU9P).
+1. **Работа в симуляторе пока закончена.** При любом размере массив занят полезной работой минимум 98% времени, поэтому ни одно изменение не обещает выигрыш 2% или больше.
+2. **Milestone 2, плата.**
+   1. Установить Gowin EDA (бесплатная Education edition).
+   2. Собрать bitstream RPU 8 × 8.
+   3. Измерить настоящую Fmax и настоящее число DSP.
+   4. Помигать светодиодом.
+   5. Связаться с ПК по UART.
+   6. Прогнать все 10 000 картинок MNIST и проверить, что ответы платы совпадают с симулятором бит в бит.
+   7. Сделать фото или видео для запуска.
+3. **Milestone 3, DDR3:** большие сети, которые не влезают в собственную память FPGA.
+4. **Потом, большие FPGA:** N = 32 или 64 на арендованной или купленной большой FPGA (например, AWS F1 с VU9P).
 
-## 10. What you need to do or buy
+## 10. Что тебе нужно сделать или купить
 
-- **For milestone 2:** a USB JTAG/UART debugger that Gowin Programmer supports for the GW5A chip, or the Tang Mega 60K Dock board, which has one built in. Your core board has only an 8-pin JST SH1.0 connector, and the cables in the box are not a debugger. Check Sipeed's compatibility list before buying.
-- **Power for the core board without the Dock:** the Sipeed wiki does not say how. Check the schematic before you connect power, or buy the Dock.
-- **Before Gowin EDA:** read the marking on the FPGA chip (GW5AT-LV60PG484A or similar). The tool needs the exact part name.
-- **Nothing for DDR3.** It is already on the board.
+- **Для milestone 2:** USB JTAG/UART-отладчик, который Gowin Programmer поддерживает для чипа GW5A, или плату Tang Mega 60K Dock, где он уже встроен. На твоей core-плате есть только 8-контактный разъём JST SH1.0, а кабели из коробки — не отладчик. Перед покупкой проверь список совместимости Sipeed.
+- **Питание core-платы без Dock:** в вики Sipeed это не написано. Посмотри схему перед подключением питания или купи Dock.
+- **Перед Gowin EDA:** прочитай маркировку на чипе FPGA (GW5AT-LV60PG484A или похожую). Программе нужно точное название чипа.
+- **Для DDR3 ничего.** Он уже на плате.
 
-## 11. How to run it yourself
+## 11. Как запустить самому
 
-From the repository folder:
+Из папки репозитория:
 
 ```bash
-cargo test --release                                   # all correctness checks, 8 × 8 (a minute or less)
-cargo run --release --features brain --example mnist   # 10,000 MNIST pictures on the simulated RPU
-RPU_N=16 cargo run --release --features brain --example mnist   # same with 16 × 16
-RPU_N=64 RPU_LOAD_BEATS=2 cargo run --release --features brain --example mnist   # a big array
+cargo test --release                                   # все проверки правильности, 8 × 8 (минута или меньше)
+cargo run --release --features brain --example mnist   # 10 000 картинок MNIST на симулированном RPU
+RPU_N=16 cargo run --release --features brain --example mnist   # то же для 16 × 16
+RPU_N=64 RPU_LOAD_BEATS=2 cargo run --release --features brain --example mnist   # большой массив
 ```
 
-The MNIST run prints the accuracy, the cycles per image, the utilization and the host words. The first run trains the network (about 20 seconds). The MNIST files must be in `data/mnist/`.
+Запуск MNIST печатает точность, такты на картинку, загрузку и слова по кабелю. Первый запуск обучает сеть (около 20 секунд). Файлы MNIST должны лежать в `data/mnist/`.
 
-## 12. Where things are
+## 12. Где что лежит
 
-| Path | What it is |
+| Путь | Что это |
 |---|---|
-| `rtl/` | The chip itself (SystemVerilog). `rpu_top.sv` is the main file. |
-| `src/lib.rs` | The Rust driver that talks to the RPU, and most tests. |
-| `src/brain.rs` | Runs a RustingBrain network on the RPU. |
-| `examples/mnist.rs` | The MNIST benchmark. |
-| `docs/perf-log.md` | Every improvement with numbers, and the open questions. |
-| `docs/engineering.md` | The detailed design, for engineers. |
-| `docs/plan-milestone-1.md` | The plan, including milestone 2 on the board. |
-| `docs/m1-results.md` | The frozen milestone 1 numbers. |
-| `README.md` | The public summary. |
+| `rtl/` | Сам чип (SystemVerilog). Главный файл — `rpu_top.sv`. |
+| `src/lib.rs` | Драйвер на Rust, который говорит с RPU, и большая часть тестов. |
+| `src/brain.rs` | Запускает сеть RustingBrain на RPU. |
+| `examples/mnist.rs` | Бенчмарк MNIST. |
+| `docs/perf-log.md` | Каждое улучшение с числами и вопросы. |
+| `docs/engineering.md` | Подробное устройство, для инженеров. |
+| `docs/plan-milestone-1.md` | План, включая milestone 2 на плате. |
+| `docs/m1-results.md` | Замороженные числа milestone 1. |
+| `README.md` | Публичное описание. |
 
-## 13. How to work with Claude on this
+## 13. Как работать с Claude над этим
 
-- If an answer is too technical, say "explain simpler" or "what does X mean". Nothing here assumes you already know it.
-- When you get a question, it is enough to say "do what you recommend". Each question comes with a recommendation.
-- Nothing is pushed, merged into `main` or released without your word. All work stays on the local `rpu-perf` branch.
+- Если ответ слишком технический, скажи «объясни проще» или «что значит X». Здесь ничего не предполагает, что ты это уже знаешь.
+- На любой вопрос достаточно ответить «делай, как советуешь». К каждому вопросу есть рекомендация.
+- Ничего не пушится, не сливается в `main` и не выпускается без твоего слова. Вся работа остаётся в локальной ветке `rpu-perf`.
