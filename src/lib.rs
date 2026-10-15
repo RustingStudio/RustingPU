@@ -1224,6 +1224,56 @@ mod tests {
         }
     }
 
+    /// A long tile with a full int32 store, a K = 1 tile that settles while that store
+    /// runs, and a third tile whose K is about the store bound: the third stream may start
+    /// before the second tile leaves the settle only when it cannot end before. The first
+    /// and third tiles share B, so the third skips the B load and can start that early.
+    #[test]
+    fn third_tile_waits_for_the_store_before_it() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x0e4e_0000_0000_0028);
+        let mat = |rng: &mut quant::XorShift, rows: usize, k: usize| -> Vec<i8> {
+            (0..rows * k).map(|_| rng.i8_sym()).collect()
+        };
+        for k in 2 * TILE..=4 * TILE + 6 {
+            let (a0, b, a2) = (
+                mat(&mut rng, TILE, k),
+                mat(&mut rng, TILE, k),
+                mat(&mut rng, TILE, k),
+            );
+            let (a1, b1) = (mat(&mut rng, TILE, 1), mat(&mut rng, TILE, 1));
+            let p: Vec<Requant> = (0..TILE).map(|_| random_requant(&mut rng)).collect();
+            let want0 = quant::matmul_nt_i8(&a0, &b, TILE, TILE, k);
+            let want1 = quant::matmul_nt_i8(&a1, &b1, TILE, TILE, 1);
+            let want2 = quant::matmul_nt_i8(&a2, &b, TILE, TILE, k);
+            for quant in [false, true] {
+                rpu.sync().unwrap();
+                let bh = rpu.upload_b(0, &b, TILE, k);
+                let ah0 = rpu.upload_a(bh.end(), &a0, TILE, k);
+                let ah2 = rpu.upload_a(ah0.end(), &a2, TILE, k);
+                let bh1 = rpu.upload_b(ah2.end(), &b1, TILE, 1);
+                let ah1 = rpu.upload_a(bh1.end(), &a1, TILE, 1);
+                let c0 = rpu.start_gemm_i32(&ah0, &bh, ah1.end()).unwrap();
+                let (end, second) = if quant {
+                    let out = rpu.gemm_requant(&ah1, &bh1, &p, c0.end()).unwrap();
+                    (out.end(), Ok(out))
+                } else {
+                    let c = rpu.start_gemm_i32(&ah1, &bh1, c0.end()).unwrap();
+                    (c.end(), Err(c))
+                };
+                let c2 = rpu.start_gemm_i32(&ah2, &bh, end).unwrap();
+                assert_eq!(rpu.read_i32(&c0).unwrap(), want0, "k {k} quant {quant}");
+                match second {
+                    Ok(out) => {
+                        assert_eq!(rpu.read_a(&out), requant_host(&want1, TILE, &p), "k {k}")
+                    }
+                    Err(c) => assert_eq!(rpu.read_i32(&c).unwrap(), want1, "k {k}"),
+                }
+                assert_eq!(rpu.read_i32(&c2).unwrap(), want2, "k {k} quant {quant}");
+            }
+        }
+    }
+
     /// TILES_DONE counts the C tiles of every GEMM, int32 or requantized, in START order.
     #[test]
     fn tiles_done_counts_the_c_tiles() {

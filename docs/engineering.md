@@ -186,18 +186,20 @@ launch (one START waiting for the compute):
   panel), or at the end of the load (see below)
 
 compute:
-  IDLE -> CLEAR   set up the stream; wait while the drain of the tile before
-                  could still overwrite this tile's sums (see below)
+  IDLE -> CLEAR   set up the stream; wait while it could end before the tile
+                  before it leaves the settle (see below)
        -> STREAM  K cycles, one k per cycle from the local panels; the last k
                   carries the last flag
        -> FINISH  (a held START streams from here)
 
-drain (separate, starts when a STREAM ends):
-  IDLE -> SETTLE  OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1 cycles (2N) until the
-                  last sum lands in the shadow registers, then wait for the C
-                  store of the tile before
-       -> SHIFT   N cycles, the shadows shift one row down per cycle into mem_c,
-                  row N-1 first
+settle (separate, starts when a STREAM ends; runs while the tile before shifts):
+  OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1 cycles (2N) until the last sum lands in
+  the shadow registers, then wait until the drain is idle and the C store of the
+  tile before is done, and hand the tile to the drain
+
+drain:
+  IDLE -> SHIFT   N cycles, the shadows shift one row down per cycle into mem_c,
+                  row N-1 first; row q shifts in the first q cycles only
        -> IDLE
 
 store (separate, starts with SHIFT and follows it from row N-1 down to row 0, at
@@ -226,9 +228,9 @@ a_out <= a_in;  b_out <= b_in;  last_out <= last_in
 
 The last flag enters with the last k of a tile and goes through the same skew as row i of A, so it reaches each PE with that PE's last product. The PE then moves the finished sum into the shadow register and restarts its running sum at zero, and the next tile's first product can arrive the cycle after. Outside STREAM the array gets zeros, so the running sums stay zero between tiles; the array is reset only with the RPU.
 
-The settle time `OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1` is exact: the last k reaches PE (N-1, N-1) after the operand register and 2N - 2 skew cycles, and its shadow takes the sum with the last product, one cycle later. One cycle shorter loses the last sum of PE (N-1, N-1); the tests include a case where only the last k is nonzero to catch that. During SHIFT each shadow loads the shadow of the PE above, so the bottom row `c_row` delivers C row N-1, then N-2, ..., one per cycle.
+The settle time `OPERAND_STAGES + 2N - 2 + PE_LATENCY - 1` is exact: the last k reaches PE (N-1, N-1) after the operand register and 2N - 2 skew cycles, and its shadow takes the sum with the last product, one cycle later. One cycle shorter loses the last sum of PE (N-1, N-1); the tests include a case where only the last k is nonzero to catch that. During SHIFT each shadow loads the shadow of the PE above, so the bottom row `c_row` delivers C row N-1, then N-2, ..., one per cycle. Row q shifts only in the first q cycles of SHIFT (`drain_rows`): after that it holds row 0 of the tile and no row above it is left to move down, so its shadow is free for the next tile.
 
-The drain shifts must end before PE (0, 0) takes the new tile's sum, `K - 1 + OPERAND_STAGES + PE_LATENCY - 1` cycles after its STREAM starts. So CLEAR starts the STREAM once that many cycles reach the end of the drain (`drain_left`: the settle cycles left plus N, or the shift cycles left), while no C store runs and no requantized row is in its first three stages (either could delay the drain); otherwise it waits until the drain is done (`docs/perf-log.md`, item 27). The rule is exact: one cycle earlier fails `start_right_after_stream_end`, `next_gemm_of_any_k_overlaps_the_drain` and others. Before item 27 the STREAM started early only with K >= 3N.
+The settle has its own registers (`settle_valid`, `settle_count`), so one tile can settle while the tile before it shifts and stores; it hands over to SHIFT once its last sum has landed, the drain is idle and the store with its first three requantization stages is done. The next STREAM must not end before that hand-over, or its sums would overwrite shadows the settling tile still holds. So CLEAR starts the STREAM once its end, `K` cycles away, is no earlier than the hand-over: `SETTLE_LAST - settle_count` cycles away while no shift or store runs, else at most `STORE_BOUND = 1 + 4N + 3` cycles (one cycle to start the store, at most 4N beats one per cycle, then q1 to q3), which is more than the settle. The rule is exact while nothing runs: one cycle earlier trips the simulation check `a stream ends while the tile before it still settles`. The new sums are then safe with one cycle to spare: the last k leaves PE (0, 0) two cycles after the stream ends, and PE (q, j) q + j cycles later, after shift q. `STORE_BOUND` is an upper bound, not exact: the tests pass with it down to 26 of 36 at N = 8 (`docs/perf-log.md`, item 28). Before item 27 the STREAM started early only with K >= 3N; item 27 let it start once the whole drain ended in time.
 
 ## 5. File overview
 

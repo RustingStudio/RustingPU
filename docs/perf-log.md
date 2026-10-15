@@ -92,6 +92,7 @@ Wall cycles per image, from item 23 on: every simulated clock cycle from the fir
 | 27 | 12 | 839.3 | 836.5 |
 | 27, HOST_WORDS 4 | 32 | 103.0 | 102.5 |
 | 27, HOST_WORDS 8 | 64 | 28.0 | 27.8 |
+| 28 settle while the tile before shifts (other N equal to 27), HOST_WORDS 8 | 64 | 27.0 | 26.8 |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -625,6 +626,32 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10 (8, 16, 64), with the brain feature, at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check is clean.
 - Load: `uptime` 3.9 to 4.0 (synthesis, tests and MNIST in parallel).
 - Commit: `af4bcd3`. N = 16, batch 64, at this commit: 404.6 busy and 406.6 wall cycles per image.
+
+## Item 28: settle the next tile while the tile before it shifts out. Done, 2026-10-15
+- Profile at item 27, N = 64, batch 64: 11,439 cycles over 157 batches with the array idle. Most of it (about 9,300 cycles) was layer 1 (K = 784) of the next batch waiting in CLEAR: the rule of item 27 let a stream start only once the whole drain of the tile before, and the store before that, ended in time, and the requantized store of the layer 1 tile before kept the store pipeline busy.
+- RTL, two parts:
+  - Per-row shift. `rpu_array` takes a drain enable per row, and row q shifts only in the first q cycles of SHIFT: by then it holds row 0 of the tile, and no row above it is left to move down. So a row's shadow does not need the whole shift to end before it can take a new sum.
+  - Separate settle. The settle of a tile has its own registers (`settle_valid`, `settle_count` and the tile's C base, QUANT, QSET, skip and row block) and runs while the tile before shifts and stores; the drain FSM keeps only IDLE and SHIFT. The settle hands over to SHIFT once its last sum is in the shadows, the drain is idle and the store pipeline is idle. CLEAR starts the next stream once it cannot end before that hand-over: `stream_last + 1 >= SETTLE_LAST - settle_count` while no shift or store runs, else `stream_last + 1 >= STORE_BOUND`, with `STORE_BOUND = 1 + C_BEATS + 3` (one cycle to start the store, at most 4N beats one per cycle, then q1 to q3), which bounds the hand-over from any cycle of a shift or store. A simulation check fails if a stream ends while the tile before it still settles.
+- The two parts alone (without the `STORE_BOUND` branch) measured equal to item 27 to the cycle at every N and batch: the binding case was the long layer 1 behind a store, which only the bound lets through.
+- MNIST, RPU equal to host int8 for every image, 97.25%. Busy / wall cycles per image, item 27 to item 28:
+
+  | N | LOAD_BEATS | HOST_WORDS | Batch 64 busy | Batch 64 wall | Batch 256 wall |
+  |---|---|---|---:|---:|---:|
+  | 8 | 1 | 1 | 1623.5 to 1623.5 | 1625.5 to 1625.5 | 1616.5 to 1616.5 |
+  | 12 | 1 | 1 | 836.5 to 836.5 | 839.3 to 839.3 | 771.0 to 771.0 |
+  | 16 | 1 | 1 | 404.6 to 404.6 | 406.6 to 406.6 | 406.8 to 406.8 |
+  | 32 | 2 | 4 | 102.5 to 102.5 | 103.0 to 103.0 | 103.5 to 103.5 |
+  | 64 | 2 | 8 | 27.8 to 26.8 (-3.6%) | 28.0 to 27.0 (-3.6%) | 28.2 to 27.8 (-1.4%) |
+
+  Utilization at N = 64: 95.88% to 99.49% at batch 64, 96.05% to 97.73% at batch 256. The other N had no gap of this kind left: their layer 1 waited for nothing. Host words per image are unchanged.
+- Synthesis, `rpu_top` (the memory is a black box), item 27 to item 28: gw5a N = 8 31,426 to 31,530 LUT, 4,247 to 4,271 ALU, 8,118 to 8,151 DFF; gw5a N = 16 87,986 to 88,200 LUT, 13,918 to 13,989 ALU, 28,614 to 28,646 DFF; gw2a N = 8 12,615 to 12,593 LUT, 3,201 to 3,225 ALU, 8,118 to 8,151 DFF; xcup N = 8 7,454 to 7,558 LUT, 8,193 to 8,226 FF. About 33 flip-flops for the settle registers; DSP, MULT and block RAM equal.
+- Tests:
+  - `third_tile_waits_for_the_store_before_it`: for every K from 2N to 4N + 6, three GEMMs back-to-back (A: K, B: K = 1, int32 or requantized; C: K, with the B of A, so its B tag hits and it reaches CLEAR early); all three C bit-exact.
+  - Mutations, at N = 8: every row shifting for the whole SHIFT (4 tests fail); the start rule one cycle earlier (the check fires); no `!store_pipe_busy` in the hand-over (the check fires); `STORE_BOUND` = `SETTLE_STEPS`, 22 or 18 (caught).
+  - Slack not covered by a test, kept by the argument above: row q shifting for q + 1 cycles passes (the captures have one cycle to spare); `STORE_BOUND` passes down to 26 of 36 at N = 8, because no test reaches CLEAR at the first cycle of a full requantized store (in the new test C's CLEAR comes at about row 3 of A's store); the `drain_state == DRAIN_IDLE` term in the hand-over never decides: a settle reaches its last step SETTLE_STEPS > N cycles after its stream ends, which is no earlier than the hand-over before it, so that shift is over by then. It stays as the safe form.
+- All 38 tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 16, 32 and 64), READ_LATENCY 1 and 10 (8, 16, 64), with the brain feature (41), at the QUANT_PARTS defaults and at QUANT_PARTS 1 (N = 8, 16, 64) and 4 (N = 32, 64), and at HOST_WORDS 1 at N = 32; the full check (fmt, clippy, Icarus, Verilator lint at N = 8 to 64) is clean.
+- Load: `uptime` 1.4 to 3.3 (synthesis, tests and MNIST in parallel).
+- Commit: HASH.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.

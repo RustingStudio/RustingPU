@@ -10,8 +10,8 @@ module rpu_array #(
     input  logic [N-1:0][7:0] b_flat,
     // last: the a_flat and b_flat values are the last k of the tile.
     input  logic last,
-    // drain: every shadow accumulator loads the one above it; row N-1 appears on c_row.
-    input  logic drain,
+    // drain[i]: the shadow accumulators of row i load the ones above; row N-1 appears on c_row.
+    input  logic [N-1:0] drain,
     output logic [N-1:0][31:0] c_row
 );
 
@@ -59,7 +59,7 @@ module rpu_array #(
                     .a_out(wire_a[i][j+1]),
                     .last_out(wire_last[i][j+1]),
                     .b_out(wire_b[i+1][j]),
-                    .drain(drain),
+                    .drain(drain[i]),
                     .acc_in(wire_acc[i][j]),
                     .accumulator(wire_acc[i+1][j])
                 );

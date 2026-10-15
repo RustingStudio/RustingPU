@@ -80,6 +80,10 @@ module rpu_top #(
     localparam int RA_W = $clog2(2 * ROW_BEATS);    // both A banks in one row memory
     localparam logic [RA_W-1:0] A_BANK1_BEAT = RA_W'(ROW_BEATS);
     localparam int DRAIN_W = $clog2(SETTLE_STEPS + 1);
+    // From any cycle of a shift or store, the cycles until the store and the first three
+    // requantization stages are idle, at most: one until the store starts, one beat per
+    // cycle (QUANT_PARTS <= C_ROW_BEATS per row), then the stages q1 to q3.
+    localparam int STORE_BOUND = 1 + C_BEATS + 3;
     localparam logic [COL_W-1:0] COL_LAST = COL_W'(N - 1);
     localparam logic [COL_W-1:0] LOAD_LAST = COL_W'(N - LOAD_BEATS);  // last request of a column
     localparam logic [DRAIN_W-1:0] SETTLE_LAST = DRAIN_W'(SETTLE_STEPS - 1);
@@ -160,10 +164,10 @@ module rpu_top #(
         COMPUTE_FINISH
     } compute_state_t;
 
-    // Settle and drain of the tile that last streamed, from the shadow registers.
-    typedef enum logic [1:0] {
+    // Drain of a tile from the shadow registers. Its settle runs apart (settle_valid), so
+    // one tile can settle while the tile before it shifts out.
+    typedef enum logic {
         DRAIN_IDLE,
-        DRAIN_SETTLE,
         DRAIN_SHIFT
     } drain_state_t;
 
@@ -224,6 +228,13 @@ module rpu_top #(
     logic [COL_W-1:0] stream_lane;
     logic [DRAIN_W-1:0] drain_count;
     logic [BEAT_ADDR_W-1:0] drain_c_base;
+    logic settle_valid;
+    logic [DRAIN_W-1:0] settle_count;
+    logic [BEAT_ADDR_W-1:0] settle_c_base;
+    logic settle_quant;
+    logic [1:0] settle_skip;
+    logic settle_qset;
+    logic [RB_W-1:0] settle_j;
     logic drain_busy;
     logic stream_last_k;
     logic store_busy;
@@ -250,8 +261,9 @@ module rpu_top #(
     logic q3_last;
     logic q4_last;
     logic q_wr_last;
-    // Cycles until the drain is idle, counted while it cannot stall.
-    int drain_left;
+    // Row q of the shadows shifts in the first q cycles of SHIFT only: by then it holds
+    // row 0 of the tile, and no row above it is left to move down.
+    logic [N-1:0] drain_rows;
     logic [RB_W-1:0] compute_j;
     logic [RB_W-1:0] drain_j;
     logic [RB_W-1:0] store_j;
@@ -312,13 +324,16 @@ module rpu_top #(
 
     assign compute_busy = (compute_state == COMPUTE_CLEAR) ||
                           (compute_state == COMPUTE_STREAM);
-    assign drain_busy = drain_state != DRAIN_IDLE;
+    assign drain_busy = settle_valid || drain_state != DRAIN_IDLE;
     // A drain enters DRAIN_SHIFT one cycle after its wait and stores from the cycle after
     // that: a row still in q1 to q3 would reach the write port with that store.
     assign store_pipe_busy = store_busy || q1_valid || q2_valid || q3_valid;
     assign store_tile_end = store_busy && store_row == '0 && store_part == store_part_last;
-    assign drain_left = (drain_state == DRAIN_SETTLE) ? SETTLE_STEPS - int'(drain_count) + N
-                      : (drain_state == DRAIN_SHIFT) ? N - int'(drain_count) : 0;
+    always_comb begin
+        for (int q = 0; q < N; q++) begin
+            drain_rows[q] = drain_state == DRAIN_SHIFT && int'(drain_count) < q;
+        end
+    end
     assign busy = load_busy || launch_valid || compute_busy || drain_busy || store_busy ||
                   q1_valid || q2_valid || q3_valid || q4_valid || q_wr_valid || seq_state != SEQ_IDLE;
     assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy &&
@@ -384,7 +399,7 @@ module rpu_top #(
         .a_flat(a_operand),
         .b_flat(b_operand),
         .last(last_operand),
-        .drain(drain_state == DRAIN_SHIFT),
+        .drain(drain_rows),
         .c_row(c_row)
     );
 
@@ -397,6 +412,10 @@ module rpu_top #(
     always_ff @(posedge clk) begin
         if (!reset && store_busy && !store_quant && q_wr_valid) begin
             $fatal(1, "raw and requantized C store in one cycle: one write port");
+        end
+        if (!reset && compute_state == COMPUTE_STREAM && stream_k == stream_last && settle_valid
+                && !(settle_count == SETTLE_LAST && drain_state == DRAIN_IDLE && !store_pipe_busy)) begin
+            $fatal(1, "a stream ends while the tile before it still settles");
         end
     end
 `endif
@@ -579,6 +598,13 @@ module rpu_top #(
             compute_state <= COMPUTE_IDLE;
             drain_state <= DRAIN_IDLE;
             drain_c_base <= '0;
+            settle_valid <= 1'b0;
+            settle_count <= '0;
+            settle_c_base <= '0;
+            settle_quant <= 1'b0;
+            settle_skip <= '0;
+            settle_qset <= 1'b0;
+            settle_j <= '0;
             cycles <= 32'd0;
             active_cycles <= 32'd0;
             busy_cycles <= 32'd0;
@@ -828,23 +854,30 @@ module rpu_top #(
                 end
             end
 
-            // Before the compute FSM: a stream that ends while the last drain step runs
-            // starts the next settle.
+            // Before the compute FSM: a stream that ends in the last settle step starts the
+            // next settle.
+            if (settle_valid) begin
+                // Wait for the shift and the store of the previous tile: the drain
+                // overwrites mem_c, and the next store must not share the write port with
+                // its last rows.
+                if (settle_count == SETTLE_LAST && drain_state == DRAIN_IDLE && !store_pipe_busy) begin
+                    settle_valid <= 1'b0;
+                    drain_state <= DRAIN_SHIFT;
+                    drain_count <= '0;
+                    drain_c_base <= settle_c_base;
+                    drain_quant <= settle_quant;
+                    drain_qset <= settle_qset;
+                    drain_skip <= settle_skip;
+                    drain_j <= settle_j;
+                end else if (settle_count != SETTLE_LAST) begin
+                    settle_count <= settle_count + 1'b1;
+                end
+            end
             case (drain_state)
                 DRAIN_IDLE: begin
                 end
-                DRAIN_SETTLE: begin
-                    // Wait for the store of the previous tile: the drain overwrites mem_c, and
-                    // the next store must not share the write port with its last rows.
-                    if (drain_count == SETTLE_LAST && !store_pipe_busy) begin
-                        drain_count <= '0;
-                        drain_state <= DRAIN_SHIFT;
-                    end else if (drain_count != SETTLE_LAST) begin
-                        drain_count <= drain_count + 1'b1;
-                    end
-                end
                 DRAIN_SHIFT: begin
-                    // The shadows shift down each cycle; c_row is row N-1-drain_count.
+                    // The shadows shift down (rows below drain_count); c_row is row N-1-drain_count.
                     mem_c[COL_LAST - drain_count[COL_W-1:0]] <= c_row;
                     // The store follows the drain from row N-1 down, at most one row per
                     // cycle, so it reads each row after the drain wrote it.
@@ -877,25 +910,31 @@ module rpu_top #(
                     stream_beat <= '0;
                     stream_a_addr <= compute_a_bank ? A_BANK1_BEAT : '0;
                     stream_lane <= '0;
-                    // The stream may start once the drain ends before PE (0, 0) takes the new
-                    // sum: the last k leaves the PE OPERAND_STAGES + PE_LATENCY - 1 cycles
-                    // after it enters, K - 1 cycles after the start; one cycle earlier loses
-                    // sums. A store still busy could delay the drain.
-                    if (!drain_busy || (!store_pipe_busy
-                            && int'(stream_last) + OPERAND_STAGES + PE_LATENCY - 1 >= drain_left)) begin
+                    // The stream may start once it cannot end before the tile before it
+                    // leaves the settle: it ends stream_last + 1 cycles from now, and the
+                    // settle hands over to SHIFT SETTLE_LAST - settle_count cycles from now,
+                    // so the end may meet the hand-over; one cycle earlier fails. A shift
+                    // or a store still running delays the hand-over, by STORE_BOUND cycles
+                    // at most (STORE_BOUND > SETTLE_LAST). The new sums are then safe with
+                    // one cycle to spare: the last k leaves PE (0, 0) OPERAND_STAGES +
+                    // PE_LATENCY - 1 = 2 cycles after the stream ends and PE (q, j) q + j
+                    // cycles later, after shift q, where row q stops shifting.
+                    if (!settle_valid || int'(stream_last) + 1 >=
+                            ((drain_state == DRAIN_IDLE && !store_pipe_busy)
+                                ? int'(SETTLE_LAST) - int'(settle_count) : STORE_BOUND)) begin
                         compute_state <= COMPUTE_STREAM;
                     end
                 end
                 COMPUTE_STREAM: begin
                     if (stream_k == stream_last) begin
                         compute_state <= COMPUTE_FINISH;
-                        drain_state <= DRAIN_SETTLE;
-                        drain_count <= '0;
-                        drain_c_base <= compute_c_base;
-                        drain_quant <= compute_quant;
-                        drain_qset <= compute_qset;
-                        drain_skip <= compute_skip;
-                        drain_j <= compute_j;
+                        settle_valid <= 1'b1;
+                        settle_count <= '0;
+                        settle_c_base <= compute_c_base;
+                        settle_quant <= compute_quant;
+                        settle_qset <= compute_qset;
+                        settle_skip <= compute_skip;
+                        settle_j <= compute_j;
                     end else begin
                         stream_k <= stream_k + 1'b1;
                         if (stream_lane == COL_LAST) begin

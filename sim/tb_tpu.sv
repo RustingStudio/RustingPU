@@ -9,7 +9,7 @@ module tb_tpu;
     logic [N-1:0][7:0] a_flat;
     logic [N-1:0][7:0] b_flat;
     logic last;
-    logic drain;
+    logic [N-1:0] drain;
     logic [N-1:0][31:0] c_row;
 
     logic signed [7:0] a [0:N-1][0:N-1];
@@ -38,7 +38,7 @@ module tb_tpu;
         a[0][0] = -127;
         b[0][0] = -127;
 
-        drain = 0;
+        drain = '0;
         last = 0;
         reset = 1;
         @(negedge clk);
@@ -59,13 +59,14 @@ module tb_tpu;
         end
         repeat (2 * N) @(negedge clk);
 
-        // Row N-1 is on c_row; each drain cycle shifts the next row in.
-        drain = 1;
+        // Row N-1 is on c_row; each drain cycle shifts the next row in. Row q shifts in
+        // the first q cycles only, as in rpu_top.
         for (int t = 0; t < N; t++) begin
+            for (int q = 0; q < N; q++) drain[q] = t < q;
             for (int j = 0; j < N; j++) c[N-1-t][j] = c_bits[j * 32 +: 32];
             @(negedge clk);
         end
-        drain = 0;
+        drain = '0;
 
         errors = 0;
         for (int i = 0; i < N; i++) begin
