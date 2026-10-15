@@ -500,7 +500,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Mutations at N = 8, each caught: no host-write clear, no C-write clear, no K compare, no B_BASE compare, a tag after a manual load, a tag extent of one beat, no hit at all. Not caught and removed: no tag update on a hit (the tag is rewritten with the same values), and `seq_state != SEQ_IDLE` in the hit check (a manual load can only hit while its bank holds exactly those beats, which is correct).
 - All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, QUANT_PARTS 4, and at QUANT_PARTS 1 at N = 8, 16, 32 and 64, with the brain feature; the full check (fmt, clippy with and without brain, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) is clean.
 - Load: `uptime` 3.6 (MNIST, synthesis and mutations in parallel).
-- Commit: pending.
+- Commit: `756b957`.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
