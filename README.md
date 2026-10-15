@@ -6,7 +6,7 @@ This will not beat a GPU or your CPU on speed, and the simulation is far slower 
 
 ## Numbers
 
-MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-15 at commit `756b957`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
+MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBrain 4.0.0 on the CPU. Measured 2026-10-15 at commit `2b8598f`; details in [`docs/perf-log.md`](docs/perf-log.md) (milestone 1 numbers in [`docs/m1-results.md`](docs/m1-results.md)).
 
 | | N = 8 | N = 16 |
 |---|---:|---:|
@@ -15,6 +15,7 @@ MNIST, 10,000 test images, 784-128-10 MLP (ReLU, softmax) trained with RustingBr
 | RPU accuracy | 97.25% | 97.25% |
 | Cycles per image | 1624.4 | 406.3 |
 | Array utilization | 98.50% | 98.44% |
+| Wall cycles per image (host writes and waits included) | 1723.2 | 505.1 |
 | Host words per image, written / read | 101.5 / 5.0 | 101.5 / 6.0 |
 
 ```bash
@@ -47,7 +48,7 @@ Needs Rust, Verilator (5.052 tested) and a C++ compiler. Icarus and yosys are op
 cargo test --release                   # bit-exact tests against the host int8 reference
 cargo test --release --features brain  # plus the RustingBrain MLP test
 RPU_N=16 cargo test --release          # another array size
-RPU_N=64 RPU_LOAD_BEATS=2 cargo test --release  # a big array: 2-beat read port (1-cycle requantized rows by default above N = 16)
+RPU_N=64 RPU_LOAD_BEATS=2 cargo test --release  # a big array: 2-beat read port (1-cycle requantized rows and one-beat host writes by default above N = 16)
 ```
 
 The MNIST example reads the four unpacked IDX files from `data/mnist/` (not in the repository; download them from any MNIST mirror). The first run trains the network (about 20 s) and saves it there.
