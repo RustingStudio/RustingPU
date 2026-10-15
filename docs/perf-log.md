@@ -465,7 +465,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Mutations at N = 8 with the brain feature, each caught: B bank of tile 0 fixed at 0, A bank of tile 0 fixed at 0, B bank not flipped at the next B tile, row block change back to row parity, no GEMM_READY wait, no hazard check in `run_gemm`, no write-after-read check, no QPARAM wait, the C of a hidden layer at the next free slot instead of after its A, one activation slot instead of two (the unread C of batch b is overwritten: the driver tracks only GEMMs that have not finished). The bank mutations first passed every test at N = 8 and failed only at N = 16 and above, which is why the K = 2 test was added. Not caught, kept: GEMM_READY without `!load_busy` or without `!launch_valid` (the sequencer only idles with both clear; they guard a manual START, which no test mixes with a GEMM); the hazard check in `read_i32` (`read_words` checks the same range, but would panic instead of returning the timeout error).
 - All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, QUANT_PARTS 4, and at QUANT_PARTS 1 at N = 8, 16, 32 and 64, with the brain feature; the full check (fmt, clippy with and without brain, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) is clean.
 - Load: `uptime` 3.2 to 2.1 (MNIST and synthesis in parallel).
-- Commit: pending.
+- Commit: `df0f74a`.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
