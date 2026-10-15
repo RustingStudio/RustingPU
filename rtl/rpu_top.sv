@@ -223,6 +223,9 @@ module rpu_top #(
     logic drain_busy;
     logic stream_last_k;
     logic store_busy;
+    // The store or the requantization stages whose row could still meet the first write of
+    // a store that the drain would start now.
+    logic store_pipe_busy;
     logic [BEAT_ADDR_W-1:0] store_c_base;
     logic [1:0] store_part_last;
     logic [COL_W-1:0] store_row;
@@ -293,6 +296,9 @@ module rpu_top #(
     assign compute_busy = (compute_state == COMPUTE_CLEAR) ||
                           (compute_state == COMPUTE_STREAM);
     assign drain_busy = drain_state != DRAIN_IDLE;
+    // A drain enters DRAIN_SHIFT one cycle after its wait and stores from the cycle after
+    // that: a row still in q1 to q3 would reach the write port with that store.
+    assign store_pipe_busy = store_busy || q1_valid || q2_valid || q3_valid;
     assign busy = load_busy || launch_valid || compute_busy || drain_busy || store_busy ||
                   q1_valid || q2_valid || q3_valid || q4_valid || q_wr_valid || seq_state != SEQ_IDLE;
     assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy &&
@@ -367,6 +373,13 @@ module rpu_top #(
     assign dma_wr_valid = (store_busy && !store_quant) || q_wr_valid;
     assign dma_wr_addr = q_wr_valid ? q_wr_addr : store_c_base + BEAT_ADDR_W'({store_row, store_part});
     assign dma_wr_data = q_wr_valid ? q_wr_data : c_store_row[int'(store_part)*BEAT_W +: BEAT_W];
+`ifndef SYNTHESIS
+    always_ff @(posedge clk) begin
+        if (!reset && store_busy && !store_quant && q_wr_valid) begin
+            $fatal(1, "raw and requantized C store in one cycle: one write port");
+        end
+    end
+`endif
 
     // Requantization parameters: one memory per lane, one read port each.
     assign qp_read_addr = QP_AW'(int'(store_j) * QUANT_PARTS + int'(store_part));
@@ -784,8 +797,9 @@ module rpu_top #(
                 DRAIN_IDLE: begin
                 end
                 DRAIN_SETTLE: begin
-                    // Wait for the store of the previous tile: the drain overwrites mem_c.
-                    if (drain_count == SETTLE_LAST && !store_busy) begin
+                    // Wait for the store of the previous tile: the drain overwrites mem_c, and
+                    // the next store must not share the write port with its last rows.
+                    if (drain_count == SETTLE_LAST && !store_pipe_busy) begin
                         drain_count <= '0;
                         drain_state <= DRAIN_SHIFT;
                     end else if (drain_count != SETTLE_LAST) begin
@@ -827,7 +841,7 @@ module rpu_top #(
                     stream_lane <= '0;
                     // While a drain is pending, a store still busy could delay it.
                     if (!drain_busy ||
-                        (!store_busy && stream_last >= K_W'(OVERLAP_K_MIN - 1))) begin
+                        (!store_pipe_busy && stream_last >= K_W'(OVERLAP_K_MIN - 1))) begin
                         compute_state <= COMPUTE_STREAM;
                     end
                 end

@@ -1096,6 +1096,29 @@ mod tests {
         assert_eq!(rpu.read_i32(&c).unwrap(), want2);
     }
 
+    /// A short int32 GEMM right after a requantized one: its store starts as soon as the
+    /// requantized store has read its last row, while the requantization stages still
+    /// write. Neither may lose a beat.
+    #[test]
+    fn int32_store_follows_a_requantized_store() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x0e4e_0000_0000_0026);
+        for k in [1, 2, TILE] {
+            let mut mat =
+                |rows: usize| -> Vec<i8> { (0..rows * k).map(|_| rng.i8_sym()).collect() };
+            let (a, b) = (mat(TILE), mat(TILE));
+            let params: Vec<Requant> = (0..TILE).map(|_| random_requant(&mut rng)).collect();
+            let want_q = requant_host(&quant::matmul_nt_i8(&a, &b, TILE, TILE, k), TILE, &params);
+            let want = quant::matmul_nt_i8(&a, &b, TILE, TILE, k);
+            let bh = rpu.upload_b(0, &b, TILE, k);
+            let ah = rpu.upload_a(bh.end(), &a, TILE, k);
+            let out = rpu.gemm_requant(&ah, &bh, &params, ah.end()).unwrap();
+            let c = rpu.start_gemm_i32(&ah, &bh, out.end()).unwrap();
+            assert_eq!(rpu.read_i32(&c).unwrap(), want, "k {k}");
+            assert_eq!(rpu.read_a(&out), want_q, "k {k}");
+        }
+    }
+
     /// With a short K, the last tile of a GEMM can wait to stream behind the drain and
     /// store of the tile before it, long after GEMM_READY. The next GEMM must not load
     /// into its banks meanwhile, for either parity of B tiles and row blocks.

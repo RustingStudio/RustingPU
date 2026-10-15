@@ -573,6 +573,14 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Load: `uptime` 2.1 (synthesis and tests in parallel).
 - Commit: `74c5f48`. N = 16, batch 64, at this commit: 406.3 busy and 408.4 wall cycles per image.
 
+## Item 26: the C store waits for the requantization stages. Done (bug fix), 2026-10-15
+- Found while building item 27: a new test, `int32_store_follows_a_requantized_store`, runs a short int32 GEMM (K = 1, 2 and N) right after a requantized one. At N = 8 and 16 the last rows of the int32 C read 0. The drain of the second GEMM started its raw store as soon as the requantized store had read its last row, while rows of that store were still in the requantization stages q1 to q3; their writes and the raw store's first writes met on the one write port, and the raw beats were lost. At N = 64 the settle time hid it. MNIST never hit it: its int32 GEMM (layer 2) has K = 128 or more and always started after the requantized store had drained.
+- Fix, RTL: `store_pipe_busy` (the store, or a row in q1 to q3) replaces `store_busy` where a drain waits to enter SHIFT and where the next stream checks the drain can end. A row in q4 or at the write stage has left the port by the time the next store writes. A simulation check (`$fatal`, left out of synthesis) stops the run if the raw and the requantized store write in one cycle.
+- Tests: the new test passes at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 16, 32 and 64), READ_LATENCY 1 and 10. Mutation: leaving q3 out of `store_pipe_busy` trips the one-write-port check.
+- MNIST, RPU equal to host int8 for every image, 97.25%: busy and wall cycles equal to item 25 (N = 8: 1624.4 and 1626.5, N = 16: 406.3 and 408.4, N = 64, LOAD_BEATS 2: 31.3 and 31.7 per image, batch 64).
+- No synthesis run: the change is one OR of three flags; item 27 synthesizes on top of it.
+- Commit: see the next docs commit.
+
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
 2. Milestone 2 at N = 16: the two B banks use 4,224 RAM16SDP4 (LUT RAM). Moving them to BSRAM would need 128 SDPX9B with the A banks, more than the 118 that the GW5AT-LV60 has. Keep N = 8 for the first bitstream, or keep B in LUT RAM at N = 16? Answered 2026-10-15: N = 8 for the first bitstream.
