@@ -69,11 +69,11 @@ We count cycles and not seconds because the clock speed of the real board is not
 | Array | Where it can run | Cycles per image | Pictures per second (clock is a guess) |
 |---|---|---:|---:|
 | 8 × 8 | Tang Mega 60K (your board) | 1,624 | ~62,000 at 100 MHz |
-| 16 × 16 | maybe Tang Mega 60K (not chosen) | 406 | ~250,000 at 100 MHz |
-| 32 × 32 | mid FPGA, e.g. Kria K26 | 105 | ~2.4 million at 250 MHz |
-| 64 × 64 | big FPGA, e.g. Xilinx VU9P | 31 | ~8 million at 250 MHz |
+| 16 × 16 | maybe Tang Mega 60K (not chosen) | 405 | ~250,000 at 100 MHz |
+| 32 × 32 | mid FPGA, e.g. Kria K26 | 103 | ~2.4 million at 250 MHz |
+| 64 × 64 | big FPGA, e.g. Xilinx VU9P | 27 | ~9 million at 250 MHz |
 
-At the start of this work, 8 × 8 needed 1,891 cycles per image (now 14% fewer) and 16 × 16 needed 545 (now 25% fewer). The data sent per image dropped from 324 words to 101.5, and the data read back from 72 words to 5.
+At the start of this work, 8 × 8 needed 1,891 cycles per image (now 14% fewer) and 16 × 16 needed 545 (now 26% fewer). The data sent per image dropped from 324 words to 101.5, and the data read back from 72 words to 5.
 
 Rough comparison with real chips, as a speed rating (TOPS) and energy rating (TOPS per watt). These are estimates, not measurements:
 
@@ -120,13 +120,16 @@ An FPGA is a test bench. The same design uses about 14 times more energy on an F
 ## 7. What happened so far
 
 - **Milestone 1 (done):** the MNIST network runs on the simulated RPU with bit-exact answers. The frozen numbers are in `docs/m1-results.md`.
-- **Performance work (items 1 to 22, done):** 20 improvements kept and 2 rejected because they did not help. The main ideas:
+- **Performance work (items 1 to 28, done):** 25 improvements kept, 2 rejected because they did not help, and 1 bug fix. The main ideas:
   - Keep the weights in RPU memory instead of sending them again with every batch (item 2).
   - Load the next piece of data while the array works on the current one (items 3, 5, 9, 12).
   - Do bias, ReLU and requantization inside the RPU, so the hidden layer never goes back to the PC (item 7).
   - Read and write only the useful parts of the results (items 16, 17).
   - Let big arrays load faster and store results faster (items 14, 18, 19, 20).
   - Do not reload weights that are still in place (item 22).
+  - A wider path from the PC into RPU memory, and wall cycles as a second number (item 23).
+  - Write the next pictures while the array still works on the current ones; the PC's writes wait while the RPU stores results (items 24, 25).
+  - Start the next matrix multiplication as early as the results of the one before allow (items 27, 28). Now the 64 × 64 array is busy 99.5% of the time with useful work.
 - The full log is `docs/perf-log.md`. The report page sums it up: https://claude.ai/artifact/GdpyGzsceWja15q26JuGrY
 
 ## 8. Your decisions so far
@@ -140,12 +143,12 @@ An FPGA is a test bench. The same design uses about 14 times more energy on an F
 | Q3: real DSP count on the board | Left to the agent | Gowin's own tool (Gowin EDA) is installed at the start of milestone 2. It is needed there anyway to make the bitstream. |
 | Q4: DDR3 | Yes, plan it for milestone 3 | The DDR3 chip is already on your core board. Nothing to buy for it. |
 | Q6: faster requantization for big arrays | Yes | QUANT_PARTS = 1 is the default above N = 16 (commit `a8b5e28`). |
-| Q7: PC writes while the RPU reads | Arbiter | The PC's writes wait a tick when the RPU is reading memory. Simple, and it prepares for DDR3. |
-| Q8: the cable is the limit for big arrays | Wider write path first, count wall cycles | Next item (item 23). DDR3 input storage comes in milestone 3. |
+| Q7: PC writes while the RPU reads | Arbiter | The PC's writes wait while the RPU stores results into memory (done in item 25). Simple, and it prepares for DDR3. |
+| Q8: the cable is the limit for big arrays | Wider write path first, count wall cycles | Done in item 23. DDR3 input storage comes in milestone 3. |
 
 ## 9. What comes next
 
-1. **Item 23 (simulation):** a wider path from the PC into RPU memory, and a second metric, wall cycles, that also counts the time spent waiting for the cable.
+1. **Simulation work is done for now.** On every array size the array is busy with useful work at least 98% of the time, so no change is expected to gain 2% or more. The open questions are at the end of `docs/perf-log.md`.
 2. **Milestone 2, the board.**
    1. Install Gowin EDA (free Education edition).
    2. Build the 8 × 8 RPU bitstream.
