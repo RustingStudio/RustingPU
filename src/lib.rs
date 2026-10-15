@@ -99,7 +99,7 @@ mod sys {
         pub fn rpu_tick(r: *mut Rpu);
         pub fn rpu_cycles(r: *mut Rpu) -> u32;
         pub fn rpu_write(r: *mut Rpu, addr: u32, value: u64);
-        pub fn rpu_write_words(r: *mut Rpu, addr: u32, words: *const u64, count: u32);
+        pub fn rpu_write_words(r: *mut Rpu, addr: u32, words: *const u64, count: u32) -> u32;
         pub fn rpu_read(r: *mut Rpu, addr: u32) -> u64;
         pub fn rpu_busy(r: *mut Rpu) -> u8;
         pub fn rpu_done(r: *mut Rpu) -> u8;
@@ -595,11 +595,11 @@ impl Rpu {
         let base = MEM_BASE + beat * BEAT_WORDS;
         for (i, chunk) in words.chunks(HOST_WORDS).enumerate() {
             self.words_written += HOST_WORDS as u64;
-            self.wall_cycles += 1;
             let addr = base + (i * HOST_WORDS) as u32;
-            unsafe {
+            let ticks = unsafe {
                 sys::rpu_write_words(self.inner.as_ptr(), addr, chunk.as_ptr(), HOST_WORDS as u32)
             };
+            self.wall_cycles += u64::from(ticks);
         }
     }
 
@@ -1378,6 +1378,26 @@ mod tests {
         let wall = rpu.wall_cycles() - wall;
         assert!(wall >= u64::from(rpu.busy_cycles() - busy));
         assert!(wall > (rpu.host_words_written() - written) / HOST_WORDS as u64);
+    }
+
+    /// A C store holds the memory's one write port: host memory writes meanwhile wait one
+    /// cycle per stored beat, and still land.
+    #[test]
+    fn host_writes_wait_for_the_c_store() {
+        let mut rpu = Rpu::new().unwrap();
+        let a: Vec<i8> = (0..N2).map(|i| (i % 7) as i8 - 3).collect();
+        let ah = rpu.upload_a(0, &a, TILE, TILE);
+        let bh = rpu.upload_b(ah.end(), &a, TILE, TILE);
+        let c = rpu.start_gemm_i32(&ah, &bh, bh.end()).unwrap();
+        // Enough writes to outlast the GEMM, away from its beats.
+        let words: Vec<u64> = (0..(16 * TILE * HOST_WORDS) as u64).collect();
+        let wall = rpu.wall_cycles();
+        rpu.write_words(c.end(), &words);
+        let stalls = rpu.wall_cycles() - wall - (words.len() / HOST_WORDS) as u64;
+        assert_eq!(stalls, u64::from(C_BEATS), "one stall per stored C beat");
+        assert_eq!(rpu.read_words(c.end(), words.len()), words);
+        let want = quant::matmul_nt_i8(&a, &a, TILE, TILE, TILE);
+        assert_eq!(rpu.read_i32(&c).unwrap(), want);
     }
 
     #[test]

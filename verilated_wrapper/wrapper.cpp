@@ -65,13 +65,19 @@ void rpu_reset(rpu_t* r) {
     rpu_eval(r);
 }
 
-void rpu_write_words(rpu_t* r, uint32_t addr, const uint64_t* words, uint32_t count) {
+uint32_t rpu_write_words(rpu_t* r, uint32_t addr, const uint64_t* words, uint32_t count) {
     r->core.mem_addr = addr;
     set_wdata(r->core.mem_wdata, words, count);
     r->core.mem_we = 1;
+    rpu_eval(r);
+    uint32_t ticks = 1;
+    for (; !r->core.mem_ready; ticks++) {
+        rpu_tick(r);
+    }
     rpu_tick(r);
     r->core.mem_we = 0;
     rpu_eval(r);
+    return ticks;
 }
 
 void rpu_write(rpu_t *r, uint32_t addr, uint64_t value) {

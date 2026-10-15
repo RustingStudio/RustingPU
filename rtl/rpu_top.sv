@@ -48,6 +48,9 @@ module rpu_top #(
     input  logic [31:0] mem_addr,
     input  logic [64*HOST_WORDS-1:0] mem_wdata,
     output logic [63:0] mem_rdata,
+    // Low while a C store holds the memory's one write port: a host memory write waits,
+    // holding mem_we and its address and data, until a cycle with mem_ready high.
+    output logic mem_ready,
 
     output logic [31:0] cycles,
     output logic busy,
@@ -895,8 +898,10 @@ module rpu_top #(
     always_comb begin
         host_mem_we = 1'b0;
         host_mem_addr = HOST_ADDR_W'(mem_addr - MEM_BASE_ADDR);
+        mem_ready = 1'b1;
         if (mem_addr >= MEM_BASE_ADDR && mem_addr < MEM_BASE_ADDR + MEM_WORDS) begin
-            host_mem_we = mem_we;
+            host_mem_we = mem_we && !dma_wr_valid;
+            mem_ready = !dma_wr_valid;
         end
     end
 

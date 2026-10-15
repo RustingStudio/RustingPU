@@ -100,7 +100,7 @@ Simulated cycles are RTL cycles, not wall-clock time. The Verilator run time say
 
 ## 3. Register and memory protocol
 
-The top-level host port is a synchronous memory-mapped bus with 32-bit word addresses and 64-bit data: `mem_we`, `mem_addr`, `mem_wdata`, `mem_rdata`. A write happens on the clock edge with `mem_we` high (so each host write costs one cycle in simulation). Reads are combinational.
+The top-level host port is a synchronous memory-mapped bus with 32-bit word addresses and 64-bit data: `mem_we`, `mem_addr`, `mem_wdata`, `mem_rdata`, `mem_ready`. A write happens on the clock edge with `mem_we` and `mem_ready` high (so each host write costs one cycle in simulation unless it waits). The memory has one write port, as a BSRAM in simple dual-port mode has, and the C store goes first: `mem_ready` is low while a store writes a beat, and a host memory write holds its inputs until it is high again. Register writes never wait. The simulated memory stops the simulation if the host and the store ever write in one cycle. Reads are combinational.
 
 ### Register map
 
@@ -200,7 +200,7 @@ drain (separate, starts when a STREAM ends):
 
 store (separate, starts with SHIFT and follows it from row N-1 down to row 0, at
 most one row per cycle, so it reads each row of mem_c after the drain wrote it):
-  4N beats, one per cycle; the memory never stalls a write. The last B tile of
+  4N beats, one per cycle; the memory never stalls a store write (host writes wait for it). The last B tile of
   a GEMM stores 4 - TILES[33:32] beats per row, so (4 - skip)N cycles. With QUANT,
   QUANT_PARTS cycles per row: each cycle reads the parameters of L columns and requantizes
   them in five register stages (read; bias add and multiply; rounding add;

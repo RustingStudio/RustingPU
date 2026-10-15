@@ -1,7 +1,9 @@
 // Simulation model of the milestone-2 BSRAM store: BYTES of memory in 8*N-bit beats.
 // Reads are pipelined: one request per cycle, data READ_LATENCY cycles later with
 // rd_resp_valid. A read returns LOAD_BEATS beats from rd_addr rounded down to a multiple
-// of LOAD_BEATS, the lowest beat first. Writes take one beat per cycle and never stall.
+// of LOAD_BEATS, the lowest beat first. Writes take one beat per cycle and never stall;
+// rpu_top keeps host and DMA writes out of the same cycle, as the board's one write port
+// needs; a cycle with both stops the simulation.
 // The host port reads 64-bit words and writes HOST_WORDS of them from host_addr, a
 // multiple of HOST_WORDS. A beat is N/8 words rounded up, lowest word first. When N is
 // not a multiple of 8, the top bytes of a beat's last word are padding: reads drop them
@@ -66,6 +68,11 @@ module rpu_sim_memory #(
         data_pipe[0] <= rd_beats;
         for (int s = 1; s < READ_LATENCY; s++) data_pipe[s] <= data_pipe[s-1];
 
+`ifndef SYNTHESIS
+        if (host_we && wr_valid) begin
+            $fatal(1, "host and DMA write in one cycle: the board's memory has one write port");
+        end
+`endif
         if (host_we) begin
             for (int w = 0; w < HOST_WORDS; w++) begin
                 mem[int'(host_addr) + w] <= host_wdata[w*64 +: 64];
