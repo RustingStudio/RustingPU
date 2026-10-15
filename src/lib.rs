@@ -79,6 +79,7 @@ const QP_LANE_W: u32 = if QP_LANES > 1 {
 };
 const STATUS_LOAD_BUSY: u64 = 0b0100;
 const STATUS_COMPUTE_BUSY: u64 = 0b1000;
+const STATUS_GEMM_READY: u64 = 1 << 7;
 
 mod sys {
     #[repr(C)]
@@ -122,6 +123,11 @@ pub struct Rpu {
     words_read: Cell<u64>,
     /// Unique per model, so a [`ResidentB`] cannot be used with another RPU.
     id: u64,
+    /// Memory beats `start..end` that the GEMMs started since the last observed DONE may
+    /// still read or write, and whether one of them requantizes.
+    pending_reads: Vec<(u32, u32)>,
+    pending_writes: Vec<(u32, u32)>,
+    pending_quant: bool,
 }
 
 /// B (`n x k`) in RPU memory, written by [`Rpu::upload_b`].
@@ -157,6 +163,22 @@ impl ResidentA {
     }
 }
 
+/// An int32 C (`m x n`) in RPU memory, the tile layout of [`Rpu::start_gemm_i32`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentC {
+    id: u64,
+    base: u32,
+    m: usize,
+    n: usize,
+}
+
+impl ResidentC {
+    /// First memory beat after this C.
+    pub fn end(&self) -> u32 {
+        self.base + (self.m.div_ceil(TILE) * self.n.div_ceil(TILE)) as u32 * C_BEATS
+    }
+}
+
 impl Rpu {
     const MAX_WAIT_CYCLES: usize = 1 << 20;
 
@@ -167,6 +189,9 @@ impl Rpu {
             words_written: 0,
             words_read: Cell::new(0),
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            pending_reads: Vec::new(),
+            pending_writes: Vec::new(),
+            pending_quant: false,
         };
         rpu.reset();
         Ok(rpu)
@@ -174,6 +199,45 @@ impl Rpu {
 
     pub fn reset(&mut self) {
         unsafe { sys::rpu_reset(self.inner.as_ptr()) };
+        self.retire();
+    }
+
+    /// Waits until every started GEMM is done. Reads of their output wait by themselves.
+    pub fn sync(&mut self) -> Result<(), RpuError> {
+        if !self.pending_writes.is_empty() {
+            self.wait_until(Self::done)?;
+        }
+        self.retire();
+        Ok(())
+    }
+
+    fn retire(&mut self) {
+        self.pending_reads.clear();
+        self.pending_writes.clear();
+        self.pending_quant = false;
+    }
+
+    /// Syncs if `reads` or `writes` touch memory that a started GEMM may still write, or
+    /// `writes` touch memory it may still read.
+    fn sync_if_pending(
+        &mut self,
+        reads: &[(u32, u32)],
+        writes: &[(u32, u32)],
+    ) -> Result<(), RpuError> {
+        if self.done() {
+            self.retire();
+        }
+        let hit =
+            |pending: &[(u32, u32)], r: &(u32, u32)| pending.iter().any(|p| p.0 < r.1 && r.0 < p.1);
+        if reads
+            .iter()
+            .chain(writes)
+            .any(|r| hit(&self.pending_writes, r))
+            || writes.iter().any(|r| hit(&self.pending_reads, r))
+        {
+            self.sync()?;
+        }
+        Ok(())
     }
 
     /// Cycles the RPU was busy since the last START (or reset).
@@ -210,7 +274,7 @@ impl Rpu {
     /// One int8 NT panel job: A and B are `TILE x k` row-major, C is `TILE x TILE`.
     pub fn run_panel_i8(&mut self, a: &[i8], b: &[i8], k: usize) -> Result<Vec<i32>, RpuError> {
         self.preload_panel_i8(0, a, b, k)?;
-        self.start(0);
+        self.start(0)?;
         self.wait_until_done(Self::MAX_WAIT_CYCLES)?;
         Ok(self.read_c(0))
     }
@@ -287,7 +351,7 @@ impl Rpu {
     }
 
     /// Reads A back from RPU memory, `m x k` row-major.
-    pub fn read_a(&self, a: &ResidentA) -> Vec<i8> {
+    pub fn read_a(&mut self, a: &ResidentA) -> Vec<i8> {
         assert_eq!(a.id, self.id, "A is in another RPU");
         let words = self.read_words(a.base, ((a.end() - a.base) * BEAT_WORDS) as usize);
         unpack_panels(&words, a.m, a.k)
@@ -300,10 +364,35 @@ impl Rpu {
         b: &ResidentB,
         c_base: u32,
     ) -> Result<Vec<i32>, RpuError> {
-        let (mt, nt) = (a.m.div_ceil(TILE), b.n.div_ceil(TILE));
+        let c = self.start_gemm_i32(a, b, c_base)?;
+        self.read_i32(&c)
+    }
+
+    /// Starts the GEMM of [`Rpu::gemm_i32`] and returns once its registers are written:
+    /// the host may prepare the next GEMM while this one runs.
+    pub fn start_gemm_i32(
+        &mut self,
+        a: &ResidentA,
+        b: &ResidentB,
+        c_base: u32,
+    ) -> Result<ResidentC, RpuError> {
+        let c = ResidentC {
+            id: self.id,
+            base: c_base,
+            m: a.m,
+            n: b.n,
+        };
+        self.run_gemm(a, b, c_base, c.end(), CONTROL_GEMM)?;
+        Ok(c)
+    }
+
+    /// Reads an int32 C, `m x n` row-major, once its GEMM is done.
+    pub fn read_i32(&mut self, c: &ResidentC) -> Result<Vec<i32>, RpuError> {
+        assert_eq!(c.id, self.id, "C is in another RPU");
+        self.sync_if_pending(&[(c.base, c.end())], &[])?;
+        let (m, n, c_base) = (c.m, c.n, c.base);
+        let (mt, nt) = (m.div_ceil(TILE), n.div_ceil(TILE));
         let c_tile = |r: usize, j: usize| c_base + (r * nt + j) as u32 * C_BEATS;
-        self.run_gemm(a, b, c_base, c_tile(mt, 0), CONTROL_GEMM)?;
-        let (m, n) = (a.m, b.n);
         let mut c = vec![0i32; m * n];
         // Only the rows below m and the beats that hold columns below n cross the link.
         for r in 0..mt {
@@ -338,6 +427,10 @@ impl Rpu {
             k: b.n,
         };
         assert!(out.k <= KMAX, "the output must fit a panel row");
+        // A started GEMM may still requantize with the parameters.
+        if self.pending_quant {
+            self.sync()?;
+        }
         // Padding columns keep stale parameters: the next GEMM streams only k < n.
         for (col, q) in params.iter().enumerate() {
             assert!(q.shift <= 48, "shift must be at most 48");
@@ -381,6 +474,10 @@ impl Rpu {
                 && (b.base as usize).is_multiple_of(LOAD_BEATS),
             "A and B must start at a multiple of {LOAD_BEATS} beats"
         );
+        let (reads, writes) = ([(a.base, a.end()), (b.base, b.end())], [(c_base, c_end)]);
+        self.sync_if_pending(&reads, &writes)?;
+        // The registers are free once the last GEMM has loaded every tile.
+        self.wait_until(|rpu| rpu.status() & STATUS_GEMM_READY != 0)?;
         self.write_reg(REG_K_LEN, a.k as u64);
         self.write_reg(REG_A_BASE, a.base.into());
         self.write_reg(REG_B_BASE, b.base.into());
@@ -400,8 +497,10 @@ impl Rpu {
             (mt as u64) | (nt as u64) << 16 | (skip as u64) << 32,
         );
         self.write_reg(REG_CONTROL, control);
-        self.tick();
-        self.wait_until(Self::done)
+        self.pending_reads.extend(reads);
+        self.pending_writes.extend(writes);
+        self.pending_quant |= control & CONTROL_QUANT != 0;
+        Ok(())
     }
 
     /// Writes A and B (`TILE x k`) into external `bank` and loads them into the local A and B
@@ -414,6 +513,7 @@ impl Rpu {
         b: &[i8],
         k: usize,
     ) -> Result<(), RpuError> {
+        self.sync()?;
         self.write_panel_i8(bank, a, b, k);
         self.configure_bases(bank);
         self.write_control(bank, bank, CONTROL_PRELOAD);
@@ -422,14 +522,16 @@ impl Rpu {
     }
 
     /// Starts the compute on local `bank`. Without a preloaded bank, the RPU loads first.
-    pub fn start(&mut self, bank: usize) {
+    pub fn start(&mut self, bank: usize) -> Result<(), RpuError> {
+        self.sync()?;
         self.configure_bases(bank);
         self.write_control(bank, bank, CONTROL_START);
         self.tick();
+        Ok(())
     }
 
     /// Reads the C tile that the last compute on `bank` stored.
-    pub fn read_c(&self, bank: usize) -> Vec<i32> {
+    pub fn read_c(&mut self, bank: usize) -> Vec<i32> {
         unpack_i32(&self.read_words(Self::c_base(bank), (C_BEATS * BEAT_WORDS) as usize))
     }
 
@@ -463,13 +565,19 @@ impl Rpu {
 
     /// Writes host words starting at memory beat `beat`.
     fn write_words(&mut self, beat: u32, words: &[u64]) {
+        let end = beat + (words.len() as u32).div_ceil(BEAT_WORDS);
+        self.sync_if_pending(&[], &[(beat, end)])
+            .expect("a started GEMM never finished");
         let base = MEM_BASE + beat * BEAT_WORDS;
         for (i, &w) in words.iter().enumerate() {
             self.write_reg(base + i as u32, w);
         }
     }
 
-    fn read_words(&self, beat: u32, count: usize) -> Vec<u64> {
+    fn read_words(&mut self, beat: u32, count: usize) -> Vec<u64> {
+        let end = beat + (count as u32).div_ceil(BEAT_WORDS);
+        self.sync_if_pending(&[(beat, end)], &[])
+            .expect("a started GEMM never finished");
         let base = MEM_BASE + beat * BEAT_WORDS;
         self.words_read.set(self.words_read.get() + count as u64);
         (0..count).map(|i| self.read_reg(base + i as u32)).collect()
@@ -662,7 +770,7 @@ mod tests {
             .unwrap();
         // Host writes take a cycle each, so write bank 1 before the compute starts.
         rpu.write_panel_i8(1, &[3; TILE * K], &[-4; TILE * K], K);
-        rpu.start(0);
+        rpu.start(0).unwrap();
         assert!(rpu.compute_busy());
 
         // A and B: the new A goes to A bank 1 and must not touch the A of the running
@@ -677,7 +785,7 @@ mod tests {
         assert_eq!(rpu.read_c(0), vec![2 * K as i32; N2]);
 
         rpu.wait_until_load_idle(Rpu::MAX_WAIT_CYCLES).unwrap();
-        rpu.start(1);
+        rpu.start(1).unwrap();
         rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
         assert_eq!(rpu.read_c(1), vec![-12 * K as i32; N2]);
     }
@@ -689,7 +797,7 @@ mod tests {
         rpu.preload_panel_i8(0, &[1; TILE * K], &[2; TILE * K], K)
             .unwrap();
         rpu.write_panel_i8(1, &[3; TILE * K], &[-4; TILE * K], K);
-        rpu.start(0);
+        rpu.start(0).unwrap();
 
         // While B bank 0 computes, load only A into A bank 1. B_BASE points at a B the load
         // must not fetch.
@@ -826,6 +934,7 @@ mod tests {
         let int32 = rpu.busy_cycles() - busy;
         let busy = rpu.busy_cycles();
         rpu.gemm_requant(&ah, &bh, &params, ah.end()).unwrap();
+        rpu.sync().unwrap();
         let quant = rpu.busy_cycles() - busy;
         // The same tile, then QUANT_PARTS N store cycles and the 5 requantization stages
         // instead of 4N.
@@ -897,6 +1006,95 @@ mod tests {
             .sum();
         let c_words = m * row_beats * BEAT_WORDS as usize;
         assert_eq!(rpu.host_words_read() - read, c_words as u64);
+    }
+
+    /// A GEMM starts while the one before it still drains: both stay bit-exact, a write
+    /// to the A of a running GEMM waits for it, and the pair takes fewer busy cycles than
+    /// one after the other.
+    #[test]
+    fn next_gemm_starts_while_the_last_one_drains() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x0e4e_0000_0000_0020);
+        let (m1, n1, k1) = (TILE + 3, 2 * TILE - 1, 30);
+        let (m2, n2, k2) = (2 * TILE, TILE + 2, 50);
+        let params: Vec<Requant> = (0..n1).map(|_| random_requant(&mut rng)).collect();
+        let mut mat =
+            |rows: usize, k: usize| -> Vec<i8> { (0..rows * k).map(|_| rng.i8_sym()).collect() };
+        let (a1, b1, a2, b2) = (mat(m1, k1), mat(n1, k1), mat(m2, k2), mat(n2, k2));
+        let other = mat(m2, k2);
+        let want1 = requant_host(&quant::matmul_nt_i8(&a1, &b1, m1, n1, k1), n1, &params);
+        let want2 = quant::matmul_nt_i8(&a2, &b2, m2, n2, k2);
+        let bh1 = rpu.upload_b(0, &b1, n1, k1);
+        let bh2 = rpu.upload_b(bh1.end(), &b2, n2, k2);
+        let ah1 = rpu.upload_a(bh2.end(), &a1, m1, k1);
+        let ah2 = rpu.upload_a(ah1.end(), &a2, m2, k2);
+        let mut busy = [0; 2];
+        for (overlap, busy) in [false, true].into_iter().zip(&mut busy) {
+            for quant_first in [false, true] {
+                let start = rpu.busy_cycles();
+                let (out, c) = if quant_first {
+                    let out = rpu.gemm_requant(&ah1, &bh1, &params, ah2.end()).unwrap();
+                    if !overlap {
+                        rpu.sync().unwrap();
+                    }
+                    (out, rpu.start_gemm_i32(&ah2, &bh2, out.end()).unwrap())
+                } else {
+                    let c = rpu.start_gemm_i32(&ah2, &bh2, ah2.end()).unwrap();
+                    if !overlap {
+                        rpu.sync().unwrap();
+                    }
+                    (rpu.gemm_requant(&ah1, &bh1, &params, c.end()).unwrap(), c)
+                };
+                rpu.sync().unwrap();
+                *busy += rpu.busy_cycles() - start;
+                assert_eq!(rpu.read_a(&out), want1, "quant_first {quant_first}");
+                assert_eq!(
+                    rpu.read_i32(&c).unwrap(),
+                    want2,
+                    "quant_first {quant_first}"
+                );
+            }
+        }
+        println!(
+            "busy cycles one after the other {}, overlapped {}",
+            busy[0], busy[1]
+        );
+        assert!(busy[1] < busy[0], "{busy:?}");
+        // Overwrite A2 while the GEMM that reads it still runs.
+        let c = rpu.start_gemm_i32(&ah2, &bh2, ah2.end()).unwrap();
+        rpu.upload_a(ah2.base, &other, m2, k2);
+        assert_eq!(rpu.read_i32(&c).unwrap(), want2);
+    }
+
+    /// With a short K, the last tile of a GEMM can wait to stream behind the drain and
+    /// store of the tile before it, long after GEMM_READY. The next GEMM must not load
+    /// into its banks meanwhile, for either parity of B tiles and row blocks.
+    #[test]
+    fn next_gemm_leaves_the_banks_of_a_waiting_tile_alone() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x0e4e_0000_0000_0021);
+        let k = 2;
+        for (m1, n1) in (1..=2).flat_map(|m| (1..=4).map(move |n| (m * TILE, n * TILE))) {
+            let mut mat =
+                |rows: usize| -> Vec<i8> { (0..rows * k).map(|_| rng.i8_sym()).collect() };
+            let (a1, b1, a2, b2) = (mat(m1), mat(n1), mat(TILE), mat(TILE));
+            let bh1 = rpu.upload_b(0, &b1, n1, k);
+            let bh2 = rpu.upload_b(bh1.end(), &b2, TILE, k);
+            let ah1 = rpu.upload_a(bh2.end(), &a1, m1, k);
+            let ah2 = rpu.upload_a(ah1.end(), &a2, TILE, k);
+            let c1 = rpu.start_gemm_i32(&ah1, &bh1, ah2.end()).unwrap();
+            let c2 = rpu.start_gemm_i32(&ah2, &bh2, c1.end()).unwrap();
+            assert_eq!(
+                rpu.read_i32(&c1).unwrap(),
+                quant::matmul_nt_i8(&a1, &b1, m1, n1, k),
+                "m1 {m1} n1 {n1}"
+            );
+            assert_eq!(
+                rpu.read_i32(&c2).unwrap(),
+                quant::matmul_nt_i8(&a2, &b2, TILE, TILE, k),
+                "m1 {m1} n1 {n1}"
+            );
+        }
     }
 
     fn assert_gemm_exact(rpu: &mut Rpu, m: usize, n: usize, k: usize, rng: &mut quant::XorShift) {

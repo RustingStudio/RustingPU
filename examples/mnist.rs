@@ -93,16 +93,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => BATCH,
     };
     let mut rpu = Rpu::new()?;
-    let (mut host, mut on_rpu) = (Vec::with_capacity(count), Vec::with_capacity(count));
     let (active, busy) = (rpu.active_cycles(), rpu.busy_cycles());
     let (written, read) = (rpu.host_words_written(), rpu.host_words_read());
     let start = Instant::now();
-    for batch in test.inputs.chunks(batch_size) {
-        let h = mlp.predict_batch_host(batch);
-        let r = mlp.predict_batch(&mut rpu, batch)?;
-        assert_eq!(r, h, "RPU and host int8 outputs must be bit-identical");
-        host.extend(h);
-        on_rpu.extend(r);
+    let host: Vec<_> = test
+        .inputs
+        .chunks(batch_size)
+        .flat_map(|batch| mlp.predict_batch_host(batch))
+        .collect();
+    let on_rpu = mlp.predict_batches(&mut rpu, &test.inputs, batch_size)?;
+    assert_eq!(on_rpu.len(), host.len());
+    for (i, (r, h)) in on_rpu.iter().zip(&host).enumerate() {
+        assert_eq!(
+            r, h,
+            "image {i}: RPU and host int8 outputs must be bit-identical"
+        );
     }
     let wall = start.elapsed().as_secs_f64();
     let (active, busy) = (rpu.active_cycles() - active, rpu.busy_cycles() - busy);

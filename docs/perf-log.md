@@ -59,6 +59,11 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 19 store each C tile while it drains | 12 | 97.25% | 851.2 | 96.44% | 152.6 / 8.0 | 5.6 s |
 | 19 store each C tile while it drains, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 107.3 | 95.24% | 103.7 / 8.0 | 8.0 s |
 | 19 store each C tile while it drains, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 35.3 | 75.48% | 108.2 / 8.0 | 22.9 s |
+| 20 start the next GEMM while the last one drains | 8 | 97.25% | 1624.4 | 98.50% | 101.5 / 5.0 | 4.7 s |
+| 20 start the next GEMM while the last one drains | 16 | 97.25% | 418.6 | 95.56% | 101.5 / 6.0 | 5.0 s |
+| 20 start the next GEMM while the last one drains | 12 | 97.25% | 850.0 | 96.58% | 152.6 / 8.0 | 5.8 s |
+| 20 start the next GEMM while the last one drains, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 104.7 | 97.61% | 103.7 / 8.0 | 7.7 s |
+| 20 start the next GEMM while the last one drains, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 31.3 | 84.94% | 108.2 / 8.0 | 21.7 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -438,6 +443,30 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Load: `uptime` 2.3 to 3.2 (MNIST and synthesis in parallel).
 - Commit: `1aa24c4`.
 
+## Item 20: start the next GEMM while the last one drains. Done, 2026-10-15
+- Before: every GEMM call waited for DONE, so the settle, drain and store of its last tile and the first load of the next GEMM never overlapped, and the host wrote the next batch only after the last batch was read. After item 19 this tail was 288 / 263 idle cycles per call at N = 64, QUANT_PARTS 1.
+- Fix, RTL: STATUS bit 7 GEMM_READY (sequencer idle, no load pending, the compute has taken the last tile). A GEMM may write its registers then; launch, compute, drain and store already latch their parameters per tile. Tile 0 of a GEMM loads into the A and B banks the last tile did not use, and a row block change flips the A bank instead of using row parity. The sequencer's own copy of the B bank (`seq_bank`) was redundant with CONTROL's bank bit and is gone.
+- Fix, driver: `gemm_requant` and `start_gemm_i32` return once the registers are written; `read_i32` reads the C later. The driver keeps the beat ranges that pending GEMMs read and write and waits for DONE before a host read or write that overlaps one (read after write, write after read or write), before QPARAM changes under a pending requantized GEMM, and before the manual paths. `RpuMlp::predict_batches` overlaps batches: write the input of batch b + 1, start the last layer of batch b, run the hidden layers of batch b + 1, then read batch b. Even and odd batches use two activation slots.
+- MNIST, cycles per image, RPU equal to host int8 for every image, 97.25%, host words unchanged:
+
+  | N | LOAD_BEATS | QUANT_PARTS | Batch 64 | Batch 256 |
+  |---|---|---|---:|---:|
+  | 8 | 1 | 4 | 1625.2 to 1624.4 | 1613.1 to 1612.9 |
+  | 16 | 1 | 4 | 420.1 to 418.6 (-0.4%) | 406.8 to 406.4 (-0.1%) |
+  | 12 | 1 | 4 | 851.2 to 850.0 (-0.1%) | 769.1 to 768.8 |
+  | 32 | 2 | 4 | 108.8 to 106.2 (-2.4%) | 104.1 to 103.4 (-0.7%) |
+  | 32 | 2 | 1 | 107.3 to 104.7 (-2.4%) | 103.7 to 103.0 (-0.7%) |
+  | 64 | 2 | 4 | 38.3 to 34.4 (-10.2%) | 31.9 to 30.8 (-3.4%) |
+  | 64 | 2 | 1 | 35.3 to 31.3 (-11.3%) | 31.1 to 30.0 (-3.5%) |
+
+  At N = 64, batch 64, about 4N = 256 cycles per batch (4.0 per image) leave the busy time. At N = 8 and 16 the first load of layer 1 (K + 2N beats with LOAD_BEATS 1) still waits for the banks, so little overlaps.
+- Synthesis, `rpu_top`, against item 19: gw5a N = 8 31,255 LUT (31,223), 4,031 ALU (4,080); gw5a N = 16 87,766 LUT (87,755), 13,704 ALU (13,758); gw2a N = 8 12,233 LUT (12,519); gw2a N = 16 29,039 LUT (29,250), 9,538 ALU (9,487); xcup N = 8 7,489 LUT (7,350, +1.9%); xcup N = 32, LOAD_BEATS 2, QUANT_PARTS 1 88,036 LUT (87,199, +1.0%); xcup N = 64, LOAD_BEATS 2, QUANT_PARTS 1 324,131 LUT (321,543, +0.8%). DFF and FF one fewer everywhere (`seq_bank`); DSP, MULT and RAM equal.
+- Tests: `next_gemm_starts_while_the_last_one_drains` (a requantized and an int32 GEMM in both orders, bit-exact, fewer busy cycles overlapped than one after the other: N = 8 1,196 to 1,084, N = 64 LOAD_BEATS 2 QUANT_PARTS 1 READ_LATENCY 10 4,464 to 4,146; then a write to the A of a running GEMM). `next_gemm_leaves_the_banks_of_a_waiting_tile_alone` (K = 2, 1 or 2 row blocks, 1 to 4 B tiles, then a second GEMM: the last tile waits in COMPUTE_CLEAR behind the store of the tile before it while the next GEMM loads). `predict_batches_matches_the_host_batch_by_batch` (3 batches of TILE + 1 plus a partial one, uncalibrated and calibrated, 3 layers).
+- Mutations at N = 8 with the brain feature, each caught: B bank of tile 0 fixed at 0, A bank of tile 0 fixed at 0, B bank not flipped at the next B tile, row block change back to row parity, no GEMM_READY wait, no hazard check in `run_gemm`, no write-after-read check, no QPARAM wait, the C of a hidden layer at the next free slot instead of after its A, one activation slot instead of two (the unread C of batch b is overwritten: the driver tracks only GEMMs that have not finished). The bank mutations first passed every test at N = 8 and failed only at N = 16 and above, which is why the K = 2 test was added. Not caught, kept: GEMM_READY without `!load_busy` or without `!launch_valid` (the sequencer only idles with both clear; they guard a manual START, which no test mixes with a GEMM); the hazard check in `read_i32` (`read_words` checks the same range, but would panic instead of returning the timeout error).
+- All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, QUANT_PARTS 4, and at QUANT_PARTS 1 at N = 8, 16, 32 and 64, with the brain feature; the full check (fmt, clippy with and without brain, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) is clean.
+- Load: `uptime` 3.2 to 2.1 (MNIST and synthesis in parallel).
+- Commit: pending.
+
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
 2. Milestone 2 at N = 16: the two B banks use 4,224 RAM16SDP4 (LUT RAM). Moving them to BSRAM would need 128 SDPX9B with the A banks, more than the 118 that the GW5AT-LV60 has. Keep N = 8 for the first bitstream, or keep B in LUT RAM at N = 16?
@@ -445,3 +474,4 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 4. Milestone 3 (DDR3): the early launch of item 12 assumes a memory that never stalls a read. A DDR controller needs a stall-aware launch check. Plan it for milestone 3?
 5. A larger batch (for example 256) would amortize the first load of each GEMM (about -2.7% cycles at N = 16), but it changes the activation scale per batch, so the predictions can change. Allowed? Answered 2026-10-14: configurable, batch 64 stays the baseline, log both (item 15).
 6. Big configs (item 18): QUANT_PARTS 1 gives -7.4% cycles at N = 64, batch 64, for +96 DSP and +5.9% LUT. Keep 4 as the default for every N, or make 1 the default above N = 16?
+7. Milestone 2 (item 20): `predict_batches` writes the next batch into RPU memory while a GEMM reads other beats of it. The simulated memory serves both in the same cycle. On the board the memory needs a second port for the host, or an arbiter that stalls host writes while the load reads, which also touches the no-stall assumption of question 4. Which one?

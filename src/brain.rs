@@ -8,9 +8,12 @@
 //! and the int8 output stays in RPU memory as the next layer's A. The host int8 path runs
 //! the same steps with `quant::matmul_nt_i8` and [`Requant::apply`], so both paths give
 //! bit-identical outputs. The weights go into RPU memory once, on the first
-//! `predict_batch`.
+//! `predict_batch`. [`RpuMlp::predict_batches`] starts the next batch while the last GEMM
+//! of a batch runs.
 use crate::quant::{self, QuantRows, Requant};
-use crate::{ResidentA, ResidentB, Rpu, RpuError};
+use crate::{
+    panel_beats, ResidentA, ResidentB, ResidentC, Rpu, RpuError, C_BEATS, LOAD_BEATS, TILE,
+};
 use rusting_brain::{Activation, Network};
 
 struct Layer {
@@ -28,11 +31,16 @@ pub struct RpuMlp {
     resident: Vec<ResidentB>,
 }
 
-/// Where the int8 GEMMs of [`RpuMlp::forward`] run. `Act` is an `m x k` int8 activation.
+/// Where the int8 GEMMs of [`RpuMlp::forward`] run. `Act` is an `m x k` int8 activation,
+/// `Acc` an int32 matmul that may still run.
 trait Backend {
     type Act;
+    type Acc;
+    /// Batch `b` begins: its activations may go elsewhere than those of batch `b - 1`.
+    fn batch(&mut self, _b: usize) {}
     fn upload(&mut self, x: Vec<i8>, m: usize, k: usize) -> Self::Act;
-    fn matmul(&mut self, l: usize, x: &Self::Act) -> Result<Vec<i32>, RpuError>;
+    fn matmul(&mut self, l: usize, x: &Self::Act) -> Result<Self::Acc, RpuError>;
+    fn finish(&mut self, acc: Self::Acc) -> Result<Vec<i32>, RpuError>;
     fn requant(
         &mut self,
         l: usize,
@@ -45,6 +53,7 @@ struct Host<'a>(&'a [Layer]);
 
 impl Backend for Host<'_> {
     type Act = (Vec<i8>, usize);
+    type Acc = Vec<i32>;
 
     fn upload(&mut self, x: Vec<i8>, m: usize, _k: usize) -> Self::Act {
         (x, m)
@@ -53,6 +62,10 @@ impl Backend for Host<'_> {
     fn matmul(&mut self, l: usize, (x, m): &Self::Act) -> Result<Vec<i32>, RpuError> {
         let w = &self.0[l].weights;
         Ok(quant::matmul_nt_i8(x, &w.data, *m, w.rows, w.cols))
+    }
+
+    fn finish(&mut self, acc: Vec<i32>) -> Result<Vec<i32>, RpuError> {
+        Ok(acc)
     }
 
     fn requant(
@@ -70,15 +83,23 @@ impl Backend for Host<'_> {
     }
 }
 
-/// Activations go to RPU memory from beat `next` on, one after another.
+/// The activations of batch `b` go to RPU memory from beat `slots[b % 2]` on, each GEMM
+/// output right after its input, so one batch may start while the last GEMM of the batch
+/// before runs.
 struct OnRpu<'a> {
     rpu: &'a mut Rpu,
     weights: &'a [ResidentB],
+    slots: [u32; 2],
     next: u32,
 }
 
 impl Backend for OnRpu<'_> {
     type Act = ResidentA;
+    type Acc = ResidentC;
+
+    fn batch(&mut self, b: usize) {
+        self.next = self.slots[b % 2];
+    }
 
     fn upload(&mut self, x: Vec<i8>, m: usize, k: usize) -> ResidentA {
         let a = self.rpu.upload_a(self.next, &x, m, k);
@@ -86,8 +107,12 @@ impl Backend for OnRpu<'_> {
         a
     }
 
-    fn matmul(&mut self, l: usize, x: &ResidentA) -> Result<Vec<i32>, RpuError> {
-        self.rpu.gemm_i32(x, &self.weights[l], self.next)
+    fn matmul(&mut self, l: usize, x: &ResidentA) -> Result<ResidentC, RpuError> {
+        self.rpu.start_gemm_i32(x, &self.weights[l], x.end())
+    }
+
+    fn finish(&mut self, acc: ResidentC) -> Result<Vec<i32>, RpuError> {
+        self.rpu.read_i32(&acc)
     }
 
     fn requant(
@@ -98,7 +123,7 @@ impl Backend for OnRpu<'_> {
     ) -> Result<ResidentA, RpuError> {
         let y = self
             .rpu
-            .gemm_requant(x, &self.weights[l], params, self.next)?;
+            .gemm_requant(x, &self.weights[l], params, x.end())?;
         self.next = y.end();
         Ok(y)
     }
@@ -134,9 +159,14 @@ impl RpuMlp {
             layer.out_scale = None;
         }
         let mut absmax = vec![0.0f32; self.layers.len()];
-        self.forward(&mut Host(&self.layers), inputs, &mut |l, y| {
-            absmax[l] = y.iter().fold(absmax[l], |a, v| a.max(v.abs()));
-        })
+        self.forward(
+            &mut Host(&self.layers),
+            inputs,
+            inputs.len(),
+            &mut |l, y| {
+                absmax[l] = y.iter().fold(absmax[l], |a, v| a.max(v.abs()));
+            },
+        )
         .expect("the host matmul cannot fail");
         let last = self.layers.len().saturating_sub(1);
         for (l, layer) in self.layers.iter_mut().enumerate().take(last) {
@@ -148,8 +178,13 @@ impl RpuMlp {
 
     /// Outputs of the host int8 reference, one `Vec` per input.
     pub fn predict_batch_host(&self, inputs: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        self.forward(&mut Host(&self.layers), inputs, &mut |_, _| {})
-            .expect("the host matmul cannot fail")
+        self.forward(
+            &mut Host(&self.layers),
+            inputs,
+            inputs.len(),
+            &mut |_, _| {},
+        )
+        .expect("the host matmul cannot fail")
     }
 
     /// Outputs with every matmul on the RPU, one `Vec` per input.
@@ -158,6 +193,17 @@ impl RpuMlp {
         &mut self,
         rpu: &mut Rpu,
         inputs: &[Vec<f32>],
+    ) -> Result<Vec<Vec<f32>>, RpuError> {
+        self.predict_batches(rpu, inputs, inputs.len())
+    }
+
+    /// [`RpuMlp::predict_batch`] on each `batch` inputs in turn, each quantized with its
+    /// own scale. A batch starts while the last GEMM of the batch before runs.
+    pub fn predict_batches(
+        &mut self,
+        rpu: &mut Rpu,
+        inputs: &[Vec<f32>],
+        batch: usize,
     ) -> Result<Vec<Vec<f32>>, RpuError> {
         if self.resident.first().is_none_or(|b| b.id != rpu.id) {
             let mut base = 0;
@@ -172,59 +218,150 @@ impl RpuMlp {
                 })
                 .collect();
         }
-        let next = self.resident.last().map_or(0, ResidentB::end);
+        let batch = batch.max(1);
+        let slot0 = self.resident.last().map_or(0, ResidentB::end);
+        let slot1 =
+            (slot0 + self.batch_beats(batch.min(inputs.len()))).next_multiple_of(LOAD_BEATS as u32);
         let mut backend = OnRpu {
             rpu,
             weights: &self.resident,
-            next,
+            slots: [slot0, slot1],
+            next: slot0,
         };
-        self.forward(&mut backend, inputs, &mut |_, _| {})
+        self.forward(&mut backend, inputs, batch, &mut |_, _| {})
     }
 
-    /// `observe(l, y)` sees the float output of each unfused layer.
+    /// RPU memory beats that the activations and C of `m` inputs take at most.
+    fn batch_beats(&self, m: usize) -> u32 {
+        let mt = m.div_ceil(TILE) as u32;
+        let last = self.layers.len() - 1;
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(l, layer)| {
+                let w = &layer.weights;
+                let c = if l == last || layer.out_scale.is_none() {
+                    w.rows.div_ceil(TILE) as u32 * C_BEATS
+                } else {
+                    0
+                };
+                mt * (panel_beats(w.cols) + c)
+            })
+            .sum()
+    }
+
+    /// Runs `inputs` in batches of `batch`, each quantized with its own scale. The host
+    /// prepares batch b + 1 and starts its first GEMM before it reads the last layer of
+    /// batch b. `observe(l, y)` sees the float output of each unfused layer.
     fn forward<B: Backend>(
         &self,
         backend: &mut B,
         inputs: &[Vec<f32>],
+        batch: usize,
         observe: &mut impl FnMut(usize, &[f32]),
     ) -> Result<Vec<Vec<f32>>, RpuError> {
-        let m = inputs.len();
-        let mut x: Vec<f32> = inputs.concat();
-        let mut a = None;
-        let mut x_scale = 0.0;
-        for (l, layer) in self.layers.iter().enumerate() {
+        let last = self.layers.len() - 1;
+        assert!(
+            self.layers[last].out_scale.is_none(),
+            "the last layer must not be fused"
+        );
+        let mut batches = inputs.chunks(batch.max(1)).enumerate();
+        let cols = self.layers[0].weights.cols;
+        let upload = |backend: &mut B, (b, x): (usize, &[Vec<f32>])| {
+            assert!(
+                x.iter().all(|v| v.len() == cols),
+                "input width must match the layer"
+            );
+            backend.batch(b);
+            Staged::upload(backend, &x.concat(), x.len())
+        };
+        let Some(first) = batches.next() else {
+            return Ok(Vec::new());
+        };
+        let first = upload(backend, first);
+        let mut staged = self.hidden(backend, first, observe)?;
+        let mut out = Vec::with_capacity(inputs.len());
+        loop {
+            let next = batches.next().map(|x| upload(backend, x));
+            let acc = backend.matmul(last, &staged.a)?;
+            let next = next.map(|s| self.hidden(backend, s, observe)).transpose()?;
+            let y = self.output(backend, last, acc, &staged, observe)?;
+            out.extend(
+                y.chunks_exact(self.layers[last].weights.rows)
+                    .map(<[f32]>::to_vec),
+            );
+            match next {
+                Some(s) => staged = s,
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// Runs every layer but the last one.
+    fn hidden<B: Backend>(
+        &self,
+        backend: &mut B,
+        mut s: Staged<B::Act>,
+        observe: &mut impl FnMut(usize, &[f32]),
+    ) -> Result<Staged<B::Act>, RpuError> {
+        for (l, layer) in self.layers[..self.layers.len() - 1].iter().enumerate() {
             let w = &layer.weights;
-            let a_in = match a.take() {
-                Some(a_in) => a_in,
-                None => {
-                    assert_eq!(x.len(), m * w.cols, "input width must match the layer");
-                    let (xq, scale) = quant::quantize_tensor(&x);
-                    x_scale = scale;
-                    backend.upload(xq, m, w.cols)
-                }
-            };
             if let Some(y_scale) = layer.out_scale {
                 let relu = layer.activation == Activation::Relu;
                 let params: Vec<Requant> = (0..w.rows)
-                    .map(|j| Requant::new(x_scale * w.scales[j], layer.biases[j], y_scale, relu))
+                    .map(|j| Requant::new(s.scale * w.scales[j], layer.biases[j], y_scale, relu))
                     .collect();
-                a = Some(backend.requant(l, &a_in, &params)?);
-                x_scale = y_scale;
-                continue;
+                s.a = backend.requant(l, &s.a, &params)?;
+                s.scale = y_scale;
+            } else {
+                let acc = backend.matmul(l, &s.a)?;
+                let y = self.output(backend, l, acc, &s, observe)?;
+                s = Staged::upload(backend, &y, s.m);
             }
-            let acc = backend.matmul(l, &a_in)?;
-            x = quant::dequantize(&acc, m, w.rows, x_scale, &w.scales);
-            for row in x.chunks_exact_mut(w.rows) {
-                for (v, b) in row.iter_mut().zip(&layer.biases) {
-                    *v += b;
-                }
-                layer.activation.apply_to_slice(row);
-            }
-            observe(l, &x);
         }
-        assert!(a.is_none(), "the last layer must not be fused");
-        let width = x.len() / m.max(1);
-        Ok(x.chunks_exact(width.max(1)).map(<[f32]>::to_vec).collect())
+        Ok(s)
+    }
+
+    /// The float output of unfused layer `l`: dequantized, biased, activated.
+    fn output<B: Backend>(
+        &self,
+        backend: &mut B,
+        l: usize,
+        acc: B::Acc,
+        s: &Staged<B::Act>,
+        observe: &mut impl FnMut(usize, &[f32]),
+    ) -> Result<Vec<f32>, RpuError> {
+        let layer = &self.layers[l];
+        let w = &layer.weights;
+        let acc = backend.finish(acc)?;
+        let mut y = quant::dequantize(&acc, s.m, w.rows, s.scale, &w.scales);
+        for row in y.chunks_exact_mut(w.rows) {
+            for (v, b) in row.iter_mut().zip(&layer.biases) {
+                *v += b;
+            }
+            layer.activation.apply_to_slice(row);
+        }
+        observe(l, &y);
+        Ok(y)
+    }
+}
+
+/// The int8 input `a` (`m` rows) of the next layer and its scale.
+struct Staged<A> {
+    a: A,
+    m: usize,
+    scale: f32,
+}
+
+impl<A> Staged<A> {
+    fn upload<B: Backend<Act = A>>(backend: &mut B, x: &[f32], m: usize) -> Self {
+        let (xq, scale) = quant::quantize_tensor(x);
+        let k = x.len() / m;
+        Staged {
+            a: backend.upload(xq, m, k),
+            m,
+            scale,
+        }
     }
 }
 
@@ -292,6 +429,37 @@ mod tests {
             max_diff < 0.02,
             "int8 probabilities differ from f32 by {max_diff}"
         );
+    }
+
+    /// Batches pipelined on one RPU give what the host gives on each batch, with hidden
+    /// layers on the host or fused, and a short last batch.
+    #[test]
+    fn predict_batches_matches_the_host_batch_by_batch() {
+        let network = Network::builder()
+            .input_size(100)
+            .dense(40, Activation::Relu)
+            .dense(30, Activation::Linear)
+            .dense(10, Activation::Linear)
+            .seed(0xba7c)
+            .build();
+        let mut rng = quant::XorShift(0xba7c_0000_0000_0020);
+        let inputs: Vec<Vec<f32>> = (0..3 * crate::TILE + 5)
+            .map(|_| (0..100).map(|_| 4.0 * rng.f32_sym()).collect())
+            .collect();
+        let mut mlp = RpuMlp::from_network(&network);
+        let mut rpu = Rpu::new().expect("RPU model");
+        for calibrated in [false, true] {
+            if calibrated {
+                mlp.calibrate(&inputs);
+            }
+            let batch = crate::TILE + 1;
+            let host: Vec<Vec<f32>> = inputs
+                .chunks(batch)
+                .flat_map(|c| mlp.predict_batch_host(c))
+                .collect();
+            let rpu_out = mlp.predict_batches(&mut rpu, &inputs, batch).unwrap();
+            assert_eq!(rpu_out, host, "calibrated {calibrated}");
+        }
     }
 
     #[test]

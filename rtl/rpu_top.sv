@@ -137,8 +137,8 @@ module rpu_top #(
     logic [15:0] seq_r;
     logic [15:0] seq_j;
     logic seq_back;  // j runs backwards in this row block
-    logic seq_bank;
     logic seq_block_end;
+    logic gemm_ready;
     logic seq_last;
     logic [BEAT_ADDR_W-1:0] c_stride;  // beats between the C tiles of one row block
 
@@ -281,6 +281,9 @@ module rpu_top #(
                   q1_valid || q2_valid || q3_valid || q4_valid || q_wr_valid || seq_state != SEQ_IDLE;
     assign done = (compute_state == COMPUTE_FINISH) && !drain_busy && !store_busy &&
                   !q1_valid && !q2_valid && !q3_valid && !q4_valid && !q_wr_valid && !launch_valid && seq_state == SEQ_IDLE;
+    // A new GEMM may start: the last one has loaded every tile and the compute has its last.
+    // The sequencer only idles with both clear; they matter after a manual START.
+    assign gemm_ready = seq_state == SEQ_IDLE && !load_busy && !launch_valid;
     assign seq_block_end = seq_back ? (seq_j == 16'd0) : (seq_j == reg_n_tiles - 16'd1);
     assign seq_last = seq_block_end && (seq_r == reg_m_blocks - 16'd1);
     // An int32 store of the last B tile of a GEMM stores only the beats that hold columns
@@ -431,7 +434,6 @@ module rpu_top #(
             seq_r <= '0;
             seq_j <= '0;
             seq_back <= 1'b0;
-            seq_bank <= 1'b0;
         end else begin
             start_request <= 1'b0;
             preload_request <= 1'b0;
@@ -458,14 +460,13 @@ module rpu_top #(
                                 seq_back <= !seq_back;
                                 reg_a_base <= reg_a_base + reg_panel;
                                 reg_c_base <= reg_c_base + BEAT_ADDR_W'(reg_n_tiles) * c_stride;
-                                control_a_bank <= !seq_r[0];
+                                control_a_bank <= !control_a_bank;
                                 control_keep_a <= 1'b0;
                                 control_keep_b <= 1'b1;
                             end else begin
                                 // Next B tile into the other B bank: load only B.
                                 seq_j <= seq_back ? seq_j - 16'd1 : seq_j + 16'd1;
-                                seq_bank <= !seq_bank;
-                                control_bank <= !seq_bank;
+                                control_bank <= !control_bank;
                                 reg_b_base <= seq_back ? reg_b_base - reg_panel : reg_b_base + reg_panel;
                                 reg_c_base <= seq_back ? reg_c_base - c_stride : reg_c_base + c_stride;
                                 control_keep_a <= 1'b1;
@@ -488,16 +489,16 @@ module rpu_top #(
                         control_keep_b <= mem_wdata[5];
                         control_quant <= mem_wdata[7];
                         if (mem_wdata[6]) begin
-                            // Tile 0 loads A and B into bank 0.
-                            control_bank <= 1'b0;
-                            control_a_bank <= 1'b0;
+                            // Tile 0 loads A and B into the banks that the last tile
+                            // did not use: that tile may still wait to stream behind a drain.
+                            control_bank <= !control_bank;
+                            control_a_bank <= !control_a_bank;
                             control_keep_a <= 1'b0;
                             control_keep_b <= 1'b0;
                             seq_state <= SEQ_START;
                             seq_r <= '0;
                             seq_j <= '0;
                             seq_back <= 1'b0;
-                            seq_bank <= 1'b0;
                         end
                     end
                     REG_PANEL_ADDR: reg_panel <= BEAT_ADDR_W'(mem_wdata);
@@ -858,7 +859,7 @@ module rpu_top #(
 
     always_comb begin
         case (mem_addr)
-            REG_STATUS_ADDR: mem_rdata = 64'({store_busy, local_valid[1], local_valid[0],
+            REG_STATUS_ADDR: mem_rdata = 64'({gemm_ready, store_busy, local_valid[1], local_valid[0],
                                               compute_busy, load_busy, done, busy});
             REG_A_BASE_ADDR: mem_rdata = 64'(reg_a_base);
             REG_B_BASE_ADDR: mem_rdata = 64'(reg_b_base);

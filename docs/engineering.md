@@ -38,8 +38,11 @@ upload_b(base, b, n, k)           write B once; returns a ResidentB handle
 matmul_resident(a, m, &b, scratch) GEMM against a resident B; A and C go from `scratch`
 upload_a(base, a, m, k) / read_a  write int8 A as panels; returns a ResidentA handle
 gemm_i32(&a, &b, c_base)          C = A * B^T, read back as int32
+start_gemm_i32(..) / read_i32(&c) the same in two steps: start, then read
 gemm_requant(&a, &b, params, out) requantized int8 output stays in memory as the
-                                  next GEMM's ResidentA; nothing is read back
+                                  next GEMM's ResidentA; nothing is read back;
+                                  returns once started
+sync()                            wait until every started GEMM is done
 run_tile_i8(a, b)                 one N x N x N tile
 run_panel_i8(a, b, k)             one N x k x N panel job
 preload_panel_i8(bank, a, b, k)   load A and B into a local bank, return when loaded
@@ -49,6 +52,8 @@ active_cycles() / busy_cycles()   free-running counters since reset
 host_words_written() / _read()    host bus traffic since new (reads: memory only)
 busy() / done() / load_busy() / compute_busy() / status()
 ```
+
+`gemm_requant` and `start_gemm_i32` return once the GEMM registers are written, so the host may prepare the next GEMM while it runs (section 8). The driver keeps the memory ranges of the GEMMs started since the last DONE it saw, and waits for DONE before it touches one of them: a host read of a C that may still be written, a host write to an A, B or C that may still be read or written, a GEMM that reads such a C or writes such a range, and QPARAM writes while a requantized GEMM runs. `preload_panel_i8` and `start` wait for DONE first.
 
 `src/quant.rs` holds the host side of the int8 contract: symmetric per-row quantization, the reference `matmul_nt_i8`, dequantization and the requantization rule (`Requant`, section 6). Every RTL result is compared with `==` against it.
 
@@ -132,7 +137,7 @@ bit 7 QUANT    store each C row requantized to int8 (section 6) as one beat;
 
 QPARAM holds one 64-bit word per output column: bias in bits 31:0 (int32, in the accumulator domain), mult in bits 47:32 (u16), shift in bits 53:48 (at most 48), relu in bit 54. The words of B tile j are in L = ceil(N/P) lanes, P = QUANT_PARTS; column `j*N + part*L + lane` (part 0..P-1) is at `0x0800_0000 + ((j*P + part) << LANE_W) + lane`, LANE_W = clog2(L) (1 when L = 1). The parameters live in LUT RAM, P * ceil(KMAX/N) words per lane. The board keeps P = 4; P = 1 stores a requantized row in one cycle with N lanes (`docs/perf-log.md`, item 18). Columns past n keep stale parameters; that is harmless (see the memory layout).
 
-During a GEMM the sequencer drives START and PRELOAD itself and moves A_BASE, B_BASE and C_BASE as it goes. **Do not write registers until DONE**: BUSY stays high and DONE low until the last tile is stored.
+During a GEMM the sequencer drives START and PRELOAD itself and moves A_BASE, B_BASE and C_BASE as it goes. **Do not write registers until GEMM_READY**: the sequencer is idle and the last tile is loaded and taken by the compute, which latches its K, bases and flags. BUSY stays high and DONE low until the last tile is stored.
 
 There are two local A buffers and two local B buffers. A B bank is marked valid when its load ends; the A banks are not tracked. **Never load A into the A bank of a running compute** (a load without KEEP_A and with the same A_BANK): it overwrites the A the compute is reading. `preload_panel_i8` and `start` use the same number for both banks.
 
@@ -148,6 +153,8 @@ bit 3 COMPUTE_BUSY    CLEAR or STREAM; the settle and drain after it do not coun
 bit 4 LOCAL_VALID_0   bank 0 loaded and not yet computed
 bit 5 LOCAL_VALID_1
 bit 6 STORE_BUSY      C store running (overlaps the next compute)
+bit 7 GEMM_READY      no GEMM sequencer running and no load pending: the
+                      registers may take the next GEMM
 ```
 
 ### Memory layout
@@ -226,7 +233,7 @@ A STREAM may start while the drain before is pending only if its K is at least `
 - `build.rs`: runs Verilator on the five active RTL files with `rpu_top` as top, compiles the generated C++ and the wrapper. Update its file list when RTL files change.
 - `src/lib.rs`: FFI, `Rpu`, memory packing, the GEMM scheduler and the hardware tests.
 - `src/quant.rs`: quantization and the reference int8 GEMM.
-- `src/brain.rs` (feature `brain`): `RpuMlp`, a RustingBrain dense network with int8 weights; `predict_batch` runs the matmuls on the RPU, `predict_batch_host` on the host reference, and `calibrate` fixes static output scales so the hidden layers run fused on the RPU.
+- `src/brain.rs` (feature `brain`): `RpuMlp`, a RustingBrain dense network with int8 weights; `predict_batch` runs the matmuls on the RPU, `predict_batches` runs batches in turn with the next one started during the last GEMM of the one before, `predict_batch_host` on the host reference, and `calibrate` fixes static output scales so the hidden layers run fused on the RPU.
 - `src/main.rs`: one-tile demo. `examples/baseline.rs`: cycle counts. `examples/mnist.rs` (feature `brain`): MNIST end to end, see `docs/m1-results.md`.
 - `verilated_wrapper/`: the C ABI (`rpu_new/free/reset/tick/cycles/write/read/busy/done`). Keep Verilator types out of Rust. When top-level ports change, update the wrapper and the Rust FFI together.
 - `rtl/`: the five active files above. `sim/tb_tpu.sv`: Icarus smoke test. The old BF16 and integer experiments were deleted in phase 10; git history keeps them.
@@ -248,13 +255,14 @@ When Verilator reports width warnings after a change, size the counter and its t
 
 ## 8. Scheduling larger matrices
 
-`matmul_resident` writes the A blocks (B is already resident), then K_LEN, A_BASE, B_BASE, C_BASE (of tile 0), PANEL and TILES, sets CONTROL GEMM and waits for DONE: 7 register writes per GEMM. The A blocks lie PANEL beats apart from A_BASE, the B tiles PANEL beats apart from B_BASE, and C tile (r, j) is at C_BASE + (r * nt + j) * 4N, with nt the B tile count in TILES. The sequencer in `rpu_top.sv` runs the schedule that the Rust driver ran before, with the same cycle count; the driver then wrote about 4 registers per tile (`docs/perf-log.md`, item 11):
+`matmul_resident` writes the A blocks (B is already resident), waits for GEMM_READY, then writes K_LEN, A_BASE, B_BASE, C_BASE (of tile 0), PANEL and TILES and sets CONTROL GEMM: 7 register writes per GEMM. It then reads C, which waits for DONE. The A blocks lie PANEL beats apart from A_BASE, the B tiles PANEL beats apart from B_BASE, and C tile (r, j) is at C_BASE + (r * nt + j) * 4N, with nt the B tile count in TILES. The sequencer in `rpu_top.sv` runs the schedule that the Rust driver ran before, with the same cycle count; the driver then wrote about 4 registers per tile (`docs/perf-log.md`, item 11):
 
 ```text
-tile t = (row block r, B tile j), on A bank r % 2; j runs forwards in even
-  row blocks and backwards in odd ones, so the last B of a block is the first
-  of the next
-START tile 0                          (loads A0 + B0; streams once K + 2N beats are in)
+tile t = (row block r, B tile j); j runs forwards in even row blocks and
+  backwards in odd ones, so the last B of a block is the first of the next
+START tile 0 on the A and B banks that the last tile before (of this GEMM or the
+                                      one before) did not use (loads A0 + B0;
+                                      streams once K + 2N beats are in)
 for each tile t:
   wait until the load of t is done and the compute has taken t
   if tile t+1 is in the same row block: START it with KEEP_A on the other
@@ -269,6 +277,8 @@ DONE; the host reads all C tiles
 Layer 1 of the MLP for batch 8 (8x784 x 784x128) streams 93.21% of its busy cycles at N = 8. The overhead is the part of the first A + B load that the first stream does not overlap (K + 2N beats, about 800 cycles), a few cycles per tile (the read latency of each load and the START handshake) and the settle, drain and store of the last tile. With more than one row block, only the first block's A + B load is exposed: at a row block change only the next A loads (K beats, the same as a B preload), because the next block starts with the B tile the block before ended with. Before that order, the next block's A + B load (2K cycles) overlapped one tile (K cycles), and about K cycles per later block stayed exposed (`docs/perf-log.md`, item 9).
 
 The first stream of a GEMM starts before its load ends (`docs/perf-log.md`, item 12). A load brings one beat per cycle; beat b arrives at most one cycle after beat b - 1, because the issue side never stops and the memory never stalls a read. With A and B, column c is complete at beat 2N(c + 1), and the stream reads it from cycle Nc after it starts, so the stream may start once Kp + N - 2 beats are in, with Kp = N * ceil(K/N) <= K + N - 1. The launch waits for K + 2N beats: 3 more than the worst case. With one panel (KEEP_A or KEEP_B) the bound is N - 2 beats and the launch waits for N + 1. The tests pass with both thresholds 3 lower and fail with 4 lower. With LOAD_BEATS > 1 a response brings LOAD_BEATS rows of one column, so column c is complete at response R(c + 1), R = PN / LOAD_BEATS for P panels. Once R <= N the load is at least as fast as the stream and column 0 decides: the bound is R - 2 responses and the launch waits for R + 1 (N + 1 for A and B at LOAD_BEATS = 2). The exposed part of the first load drops from K + 2N to about N cycles; the tests pass with these thresholds 3 lower and fail with 4 lower too (`docs/perf-log.md`, item 14). **A memory that can stall a read (DDR) breaks this**: it needs a stall-aware check or a launch at the end of the load.
+
+A GEMM may start while the GEMM before it still streams, drains and stores its last tile (`docs/perf-log.md`, item 20). Its tile 0 loads into the banks that tile does not use, as a tile of the same GEMM would. This is needed even though the compute has taken that tile: with a short K it can wait in COMPUTE_CLEAR behind the drain and store of the tile before it, and a load into its banks would overwrite data it has not streamed yet (the test `next_gemm_leaves_the_banks_of_a_waiting_tile_alone`). `RpuMlp::predict_batches` uses this across batches: it writes the input of batch b + 1, starts the last layer of batch b, writes the parameters of batch b + 1 and starts its first layer, and only then reads the output of batch b. The activations of even and odd batches lie in two memory slots: the C of batch b stays unread while batch b + 1 runs, and the driver tracks only GEMMs that have not finished, so one slot would overwrite it.
 
 K must fit in one panel (K <= KMAX). Partial sums over K are not split across jobs.
 
