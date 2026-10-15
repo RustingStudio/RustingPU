@@ -64,6 +64,11 @@ Loop: `loop-prompts/rpu-perf.md`, branch `rpu-perf` (from `milestone-1` at `924f
 | 20 start the next GEMM while the last one drains | 12 | 97.25% | 850.0 | 96.58% | 152.6 / 8.0 | 5.8 s |
 | 20 start the next GEMM while the last one drains, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 104.7 | 97.61% | 103.7 / 8.0 | 7.7 s |
 | 20 start the next GEMM while the last one drains, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 31.3 | 84.94% | 108.2 / 8.0 | 21.7 s |
+| 22 reuse the first B panel of a GEMM | 8 | 97.25% | 1624.4 | 98.50% | 101.5 / 5.0 | 5.0 s |
+| 22 reuse the first B panel of a GEMM | 16 | 97.25% | 406.3 | 98.44% | 101.5 / 6.0 | 5.5 s |
+| 22 reuse the first B panel of a GEMM | 12 | 97.25% | 837.7 | 98.00% | 152.6 / 8.0 | 5.5 s |
+| 22 reuse the first B panel of a GEMM, QUANT_PARTS 1, LOAD_BEATS 2 | 32 | 97.25% | 104.7 | 97.61% | 103.7 / 8.0 | 7.6 s |
+| 22 reuse the first B panel of a GEMM, QUANT_PARTS 1, LOAD_BEATS 2 | 64 | 97.25% | 31.3 | 84.94% | 108.2 / 8.0 | 22.3 s |
 
 ## Item 1: host-link counter. Done, 2026-10-14
 - `Rpu::host_words_written()` and `Rpu::host_words_read()`; the MNIST example prints both per image. No behaviour change: cycles and accuracy are as in `docs/m1-results.md`.
@@ -467,6 +472,36 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Load: `uptime` 3.2 to 2.1 (MNIST and synthesis in parallel).
 - Commit: `df0f74a`.
 
+## Item 21: wait for one GEMM instead of DONE. Rejected after measurement, 2026-10-15
+- Idea: after item 20, layer 2 of batch b waits for DONE, so for layer 1 of batch b to finish, and the read of batch b waits for layer 1 of batch b + 1. A counter of finished GEMMs would let the driver wait for one GEMM, and `predict_batches` could run layer 1 of batch t, start layer 2 of batch t - 1, then read batch t - 2, with three activation slots, so no GEMM depends on the one started just before it. Expected: about -8% at N = 64.
+- Built: RTL register 10 GEMMS (a last-tile flag through launch, compute, drain, store and the requantization stages; the count rises with the last C write), driver waits tagged per GEMM, the reordered forward. Bit-exact, all 33 tests passed at N = 8.
+- MNIST, batch 64, cycles per image: N = 64, LOAD_BEATS 2, QUANT_PARTS 1 31.3 to 34.1 (+8.9%); N = 32 104.7 to 105.1; N = 8 1624.4 to 1624.3; N = 16 418.6 to 418.4; N = 12 850.0 to 850.0. The counter with the item 20 order: 31.3 and 104.7, unchanged.
+- Why: every host write takes one simulated cycle, and the next batch's input (98 words per image, 6,272 per batch at batch 64) takes longer to write than the RPU needs for a batch at N = 64 (about 2,000 cycles). The RPU therefore runs dry once per batch in any order, and only the cycles around that gap count. The item 20 order shows the head of layer 2 and the tail of layer 1 there. The new order shows the head of layer 1 and the tail of layer 2, plus layer 2's wait for the drain of layer 1 (K = 128 < OVERLAP_K_MIN), about 190 cycles more per batch. With the counter and the old order the gap is the same as with DONE.
+- Reverted. The patch is not kept in the repository.
+
+## Item 22: reuse the first B panel of a GEMM. Done, 2026-10-15
+- Before: tile 0 of every GEMM loaded A and B, and with LOAD_BEATS 1 its stream waited for K + 2N beats. At N = 16, batch 64, this load of layer 1 was most of the about 1,183 idle cycles per batch. Layer 1 has an even row block count there, so it ends on its B tile 0; layer 2 has one B tile and runs on the other bank; layer 1 of the next batch starts on the bank that still holds its B tile 0. Item 10 looked at a prefetch of the next GEMM's B, not at a B that is still in its bank.
+- Fix, RTL only: each local B bank keeps a tag (valid, B_BASE, B_BASE + PANEL, K) of the panel a GEMM tile loaded into it. A host write or a C write (int32 or requantized) into those beats clears it, in the same cycle as and after a tag update. A manual load leaves no tag, because PANEL then holds no B extent. Tile 0 of a GEMM whose B_BASE and K_LEN match the tag of its bank loads only A and launches after N / LOAD_BEATS + 1 beats. The driver is unchanged.
+- MNIST, cycles per image, RPU equal to host int8 for every image, 97.25%, host words unchanged:
+
+  | N | LOAD_BEATS | QUANT_PARTS | Batch 64 | Batch 256 |
+  |---|---|---|---:|---:|
+  | 8 | 1 | 4 | 1624.4 to 1624.4 | 1612.9 to 1612.9 |
+  | 16 | 1 | 4 | 418.6 to 406.3 (-2.9%) | 406.4 to 403.4 (-0.7%) |
+  | 12 | 1 | 4 | 850.0 to 837.7 (-1.4%) | 768.8 to 765.7 (-0.4%) |
+  | 32 | 2 | 4 | 106.2 to 106.2 | 103.4 to 103.4 |
+  | 32 | 2 | 1 | 104.7 to 104.7 | 103.0 to 103.0 |
+  | 64 | 2 | 4 | 34.4 to 34.4 | 30.8 to 30.8 |
+  | 64 | 2 | 1 | 31.3 to 31.3 | 30.0 to 30.0 |
+
+  Utilization at batch 64: N = 16 95.56% to 98.44%, N = 12 96.58% to 98.00%. N = 8: layer 2 has two B tiles and overwrites the bank. N = 32: busy cycles equal to the cycle; with LOAD_BEATS 2 the first load was already short (N + 1 beats), and whether the tag hits there was not traced. N = 64: layer 1 has one row block and ends on B tile 1, so nothing hits.
+- Synthesis, `rpu_top`, against item 20: gw5a N = 8 31,399 LUT (31,255), 4,225 ALU (4,031), 8,075 DFF (7,981); gw5a N = 16 87,962 LUT (87,766), 13,797 ALU (13,704), 28,571 DFF (28,481); gw2a N = 8 12,522 LUT (12,233), 8,075 DFF; gw2a N = 16 29,357 LUT (29,039), 9,680 ALU (9,538), 28,571 DFF; xcup N = 8 7,391 LUT (7,489), 8,151 FF (8,057); xcup N = 32, LOAD_BEATS 2, QUANT_PARTS 1 88,178 LUT (88,036), 117,454 FF (117,364); xcup N = 64, LOAD_BEATS 2, QUANT_PARTS 1 319,212 LUT (324,131), 450,235 FF (450,145). About 90 flip-flops for the tags; DSP, MULT and RAM equal. These runs had two redundant terms that were removed after the mutations (below).
+- Tests: `next_gemm_reuses_its_first_b_panel_only_while_memory_holds_it` (the MLP bank pattern with K = 4N, bit-exact, fewer busy cycles with the hit than after a host write into the second half of B tile 0; then the same beats with a longer K, and a requantized C written over B tile 0). `manual_loads_leave_no_b_panel_for_a_gemm` (manual loads on both banks, then GEMMs with B at the manual B panels).
+- Mutations at N = 8, each caught: no host-write clear, no C-write clear, no K compare, no B_BASE compare, a tag after a manual load, a tag extent of one beat, no hit at all. Not caught and removed: no tag update on a hit (the tag is rewritten with the same values), and `seq_state != SEQ_IDLE` in the hit check (a manual load can only hit while its bank holds exactly those beats, which is correct).
+- All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, QUANT_PARTS 4, and at QUANT_PARTS 1 at N = 8, 16, 32 and 64, with the brain feature; the full check (fmt, clippy with and without brain, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) is clean.
+- Load: `uptime` 3.6 (MNIST, synthesis and mutations in parallel).
+- Commit: pending.
+
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
 2. Milestone 2 at N = 16: the two B banks use 4,224 RAM16SDP4 (LUT RAM). Moving them to BSRAM would need 128 SDPX9B with the A banks, more than the 118 that the GW5AT-LV60 has. Keep N = 8 for the first bitstream, or keep B in LUT RAM at N = 16?
@@ -475,3 +510,4 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 5. A larger batch (for example 256) would amortize the first load of each GEMM (about -2.7% cycles at N = 16), but it changes the activation scale per batch, so the predictions can change. Allowed? Answered 2026-10-14: configurable, batch 64 stays the baseline, log both (item 15).
 6. Big configs (item 18): QUANT_PARTS 1 gives -7.4% cycles at N = 64, batch 64, for +96 DSP and +5.9% LUT. Keep 4 as the default for every N, or make 1 the default above N = 16?
 7. Milestone 2 (item 20): `predict_batches` writes the next batch into RPU memory while a GEMM reads other beats of it. The simulated memory serves both in the same cycle. On the board the memory needs a second port for the host, or an arbiter that stalls host writes while the load reads, which also touches the no-stall assumption of question 4. Which one?
+8. Big configs (item 21): at N = 64, batch 64, the host writes 108.2 words per image and the RPU is busy 31.3 cycles per image. With one host word per cycle the link, not the array, sets the speed from N = 32 on (103.7 words, 104.7 cycles). Cycles per image count only busy cycles, so they do not show this. A wider host write path (for example 8N bits per cycle into RPU memory) or inputs that stay on the board (DDR, question 4) would lift it. Count wall cycles as a second metric from now on, and which of the two is the plan for big configs?

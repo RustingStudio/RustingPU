@@ -66,6 +66,7 @@ module rpu_top #(
     localparam int OVERLAP_K_MIN = SETTLE_STEPS + N;
     localparam int BEAT_ADDR_W = $clog2(MEM_BYTES / N);
     localparam int HOST_ADDR_W = $clog2(MEM_BYTES / 8);
+    localparam int BEAT_WORDS = (N + 7) / 8;  // host words per beat
     localparam int COL_W = (N > 1) ? $clog2(N) : 1;
     localparam int K_W = $clog2(KMAX + N + 1);       // holds K_LEN and a beat's k + N
     localparam int RB_W = (ROW_BEATS > 1) ? $clog2(ROW_BEATS) : 1;
@@ -182,6 +183,14 @@ module rpu_top #(
     logic load_keep_a;
     logic load_both;  // A and B
     logic [K_W-1:0] load_k_len;
+    // The B panel that each local B bank holds, if a GEMM tile loaded it: K and beats
+    // base..end of RPU memory. A host or C write into those beats clears it. Tile 0 of a
+    // GEMM whose first B panel is in its bank loads only A.
+    logic b_tag_valid [0:1];
+    logic [BEAT_ADDR_W-1:0] b_tag_base [0:1];
+    logic [BEAT_ADDR_W:0] b_tag_end [0:1];
+    logic [K_W-1:0] b_tag_k [0:1];
+    logic b_hit;
     // A START waits here for the compute: it may stream once launch_ready is set, either
     // at the end of its load or once launch_wait beats are left to receive before it.
     logic launch_valid;
@@ -290,6 +299,9 @@ module rpu_top #(
     // below n; the rest of each C row is never written. With QUANT the host writes 0.
     assign tile_skip = (seq_state != SEQ_IDLE && seq_j == reg_n_tiles - 16'd1)
         ? reg_c_skip : 2'd0;
+    assign b_hit = !control_keep_a && !control_keep_b &&
+                   b_tag_valid[control_bank] && b_tag_base[control_bank] == reg_b_base &&
+                   b_tag_k[control_bank] == reg_k_len;
     assign c_stride = control_quant ? BEAT_ADDR_W'(N) : BEAT_ADDR_W'(C_BEATS);
     assign stream_last_k = (compute_state == COMPUTE_STREAM) && (stream_k == stream_last);
     assign issue_row_end = int'(issue_k) + N >= int'(load_k_len);
@@ -543,6 +555,12 @@ module rpu_top #(
             load_keep_a <= 1'b0;
             load_both <= 1'b0;
             load_k_len <= '0;
+            for (int b = 0; b < 2; b++) begin
+                b_tag_valid[b] <= 1'b0;
+                b_tag_base[b] <= '0;
+                b_tag_end[b] <= '0;
+                b_tag_k[b] <= '0;
+            end
             launch_valid <= 1'b0;
             launch_ready <= 1'b0;
             launch_wait <= '0;
@@ -622,9 +640,17 @@ module rpu_top #(
                 load_a_bank <= control_a_bank;
                 load_then_compute <= !preload_request;
                 load_keep_a <= control_keep_a;
-                load_both <= !control_keep_a && !control_keep_b;
+                load_both <= !control_keep_a && !control_keep_b && !b_hit;
                 load_k_len <= reg_k_len;
                 local_valid[control_bank] <= 1'b0;
+                if (!control_keep_b) begin
+                    // Manual loads leave no tag: REG_PANEL holds the B extent only for a GEMM.
+                    b_tag_valid[control_bank] <= seq_state != SEQ_IDLE;
+                    b_tag_base[control_bank] <= reg_b_base;
+                    b_tag_end[control_bank] <=
+                        (BEAT_ADDR_W + 1)'(reg_b_base) + (BEAT_ADDR_W + 1)'(reg_panel);
+                    b_tag_k[control_bank] <= reg_k_len;
+                end
                 if (!preload_request) begin
                     cycles <= 32'd0;
                     launch_valid <= 1'b1;
@@ -636,7 +662,7 @@ module rpu_top #(
                     // are in, for every column c. With R > N (LOAD_BEATS = 1, A and B)
                     // the last column c = ceil(K/N) - 1 decides: K + 2N - 3. Otherwise
                     // column 0 does: R - 2. The thresholds below leave 3 responses more.
-                    launch_wait <= (!control_keep_a && !control_keep_b)
+                    launch_wait <= (!control_keep_a && !control_keep_b && !b_hit)
                         ? ((LOAD_BEATS == 1) ? (K_W + 1)'(reg_k_len) + (K_W + 1)'(2 * N)
                                              : (K_W + 1)'(2 * N / LOAD_BEATS + 1))
                         : (K_W + 1)'(N / LOAD_BEATS + 1);
@@ -670,6 +696,18 @@ module rpu_top #(
                     launch_quant <= control_quant;
                     launch_skip <= tile_skip;
                     launch_j <= RB_W'(seq_j);
+                end
+            end
+
+            // After the tag update above: a write into the panel always clears it.
+            for (int b = 0; b < 2; b++) begin
+                if ((host_mem_we && (HOST_ADDR_W + 1)'(host_mem_addr) >=
+                         (HOST_ADDR_W + 1)'(b_tag_base[b]) * (HOST_ADDR_W + 1)'(BEAT_WORDS) &&
+                     (HOST_ADDR_W + 1)'(host_mem_addr) <
+                         (HOST_ADDR_W + 1)'(b_tag_end[b]) * (HOST_ADDR_W + 1)'(BEAT_WORDS)) ||
+                    (dma_wr_valid && dma_wr_addr >= b_tag_base[b] &&
+                     (BEAT_ADDR_W + 1)'(dma_wr_addr) < b_tag_end[b])) begin
+                    b_tag_valid[b] <= 1'b0;
                 end
             end
 

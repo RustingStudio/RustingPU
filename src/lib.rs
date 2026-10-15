@@ -1097,6 +1097,134 @@ mod tests {
         }
     }
 
+    fn random_i8(rng: &mut quant::XorShift, rows: usize, k: usize) -> Vec<i8> {
+        (0..rows * k).map(|_| rng.i8_sym()).collect()
+    }
+
+    #[test]
+    fn next_gemm_reuses_its_first_b_panel_only_while_memory_holds_it() {
+        let mut rpu = Rpu::new().unwrap();
+        let mut rng = quant::XorShift(0x0b7a_9000_0000_0022);
+        let rng = &mut rng;
+        let b_at = |rpu: &mut Rpu, n: usize, k: usize| {
+            rpu.read_a(&ResidentA {
+                id: rpu.id,
+                base: 0,
+                m: n,
+                k,
+            })
+        };
+        // Two row blocks end on B tile 0, in the bank that tile 0 of the GEMM after the
+        // next one loads into; the one-tile GEMM in between uses the other bank.
+        let k = 4 * TILE;
+        let (b, b2) = (random_i8(rng, 2 * TILE, k), random_i8(rng, TILE, k));
+        let (a1, a2, a3) = (
+            random_i8(rng, 2 * TILE, k),
+            random_i8(rng, TILE, k),
+            random_i8(rng, TILE, k),
+        );
+        let bh = rpu.upload_b(0, &b, 2 * TILE, k);
+        let bh2 = rpu.upload_b(bh.end(), &b2, TILE, k);
+        let ah1 = rpu.upload_a(bh2.end(), &a1, 2 * TILE, k);
+        let ah2 = rpu.upload_a(ah1.end(), &a2, TILE, k);
+        let ah3 = rpu.upload_a(ah2.end(), &a3, TILE, k);
+        let c = ah3.end();
+        let mut cycles = Vec::new();
+        for pass in 0..2 {
+            let b_now = b_at(&mut rpu, 2 * TILE, k);
+            assert_eq!(
+                rpu.gemm_i32(&ah1, &bh, c).unwrap(),
+                quant::matmul_nt_i8(&a1, &b_now, 2 * TILE, 2 * TILE, k)
+            );
+            assert_eq!(
+                rpu.gemm_i32(&ah2, &bh2, c).unwrap(),
+                quant::matmul_nt_i8(&a2, &b2, TILE, TILE, k),
+                "another B panel with the same k"
+            );
+            if pass == 1 {
+                // Only the last half of B tile 0.
+                rpu.upload_b(k as u32 / 2, &random_i8(rng, TILE, k / 2), TILE, k / 2);
+            }
+            let b_now = b_at(&mut rpu, 2 * TILE, k);
+            assert_eq!(b_now != b, pass == 1);
+            let busy = rpu.busy_cycles();
+            assert_eq!(
+                rpu.gemm_i32(&ah3, &bh, c).unwrap(),
+                quant::matmul_nt_i8(&a3, &b_now, TILE, 2 * TILE, k),
+                "pass {pass}"
+            );
+            cycles.push(rpu.busy_cycles() - busy);
+        }
+        // The rewrite made the second pass load B tile 0 again.
+        assert!(cycles[0] < cycles[1], "{cycles:?}");
+
+        // The same beats with a longer K, then a requantized C written over B tile 0.
+        let k = TILE;
+        let b = random_i8(rng, 2 * TILE, k);
+        let (a2, b2) = (random_i8(rng, TILE, 3), random_i8(rng, TILE, 3));
+        let (a1, a3) = (random_i8(rng, 2 * TILE, k), random_i8(rng, TILE, 2 * k));
+        let params: Vec<Requant> = (0..TILE).map(|_| random_requant(rng)).collect();
+        let bh = rpu.upload_b(0, &b, 2 * TILE, k);
+        let bh2 = rpu.upload_b(bh.end(), &b2, TILE, 3);
+        let ah1 = rpu.upload_a(bh2.end(), &a1, 2 * TILE, k);
+        let ah2 = rpu.upload_a(ah1.end(), &a2, TILE, 3);
+        let ah3 = rpu.upload_a(ah2.end(), &a3, TILE, 2 * k);
+        let c = ah3.end();
+        let bh_long = ResidentB {
+            id: rpu.id,
+            base: 0,
+            n: TILE,
+            k: 2 * k,
+        };
+        rpu.gemm_i32(&ah1, &bh, c).unwrap();
+        rpu.gemm_i32(&ah2, &bh2, c).unwrap();
+        let b_long = b_at(&mut rpu, TILE, 2 * k);
+        assert_eq!(
+            rpu.gemm_i32(&ah3, &bh_long, c).unwrap(),
+            quant::matmul_nt_i8(&a3, &b_long, TILE, TILE, 2 * k),
+            "a longer K"
+        );
+        rpu.gemm_requant(&ah2, &bh2, &params, 0).unwrap();
+        rpu.sync().unwrap();
+        let b_now = b_at(&mut rpu, TILE, 2 * k);
+        assert_ne!(b_now, b_long, "the requantized C overwrote B tile 0");
+        assert_eq!(
+            rpu.gemm_i32(&ah3, &bh_long, c).unwrap(),
+            quant::matmul_nt_i8(&a3, &b_now, TILE, TILE, 2 * k),
+            "after the requantized C"
+        );
+    }
+
+    #[test]
+    fn manual_loads_leave_no_b_panel_for_a_gemm() {
+        let mut rng = quant::XorShift(0x0b7a_9000_0000_0122);
+        let rng = &mut rng;
+        // A GEMM's tile 0 lands in one bank or the other: try its B at both manual B panels.
+        for first in 0..2 {
+            let mut rpu = Rpu::new().unwrap();
+            for bank in 0..2 {
+                let (a, b) = (random_i8(rng, TILE, TILE), random_i8(rng, TILE, TILE));
+                rpu.preload_panel_i8(bank, &a, &b, TILE).unwrap();
+                rpu.start(bank).unwrap();
+                rpu.wait_until_done(Rpu::MAX_WAIT_CYCLES).unwrap();
+                assert_eq!(
+                    rpu.read_c(bank),
+                    quant::matmul_nt_i8(&a, &b, TILE, TILE, TILE)
+                );
+            }
+            for bank in [first, 1 - first] {
+                let (a, b) = (random_i8(rng, TILE, TILE), random_i8(rng, TILE, TILE));
+                let bh = rpu.upload_b(Rpu::a_base(bank) + PANEL_BEATS, &b, TILE, TILE);
+                let ah = rpu.upload_a(2 * BANK_BEATS, &a, TILE, TILE);
+                assert_eq!(
+                    rpu.gemm_i32(&ah, &bh, ah.end()).unwrap(),
+                    quant::matmul_nt_i8(&a, &b, TILE, TILE, TILE),
+                    "B at manual bank {bank}"
+                );
+            }
+        }
+    }
+
     fn assert_gemm_exact(rpu: &mut Rpu, m: usize, n: usize, k: usize, rng: &mut quant::XorShift) {
         let a: Vec<i8> = (0..m * k).map(|_| rng.i8_sym()).collect();
         let b: Vec<i8> = (0..n * k).map(|_| rng.i8_sym()).collect();
