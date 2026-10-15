@@ -436,7 +436,7 @@ At batch 256, N = 64: layer 1 6,709.1 / 6,154.4 / 554.7, layer 2 1,584.9 / 502.4
 - Synthesis, `rpu_top`, against item 18: gw5a N = 8 31,223 LUT (31,237), 4,080 ALU (3,982); gw5a N = 16 87,755 LUT (87,772); gw2a N = 8 12,519 LUT (12,635); gw2a N = 16 29,250 LUT (29,092), 9,487 ALU (9,586); xcup N = 8 7,350 LUT (7,392); xcup N = 32, LOAD_BEATS 2, QUANT_PARTS 1 87,199 LUT (87,132); xcup N = 64, LOAD_BEATS 2, QUANT_PARTS 1 321,543 LUT (320,466, +0.3%). DFF, FF, DSP, MULT and RAM equal everywhere. Within abc noise.
 - Tests: `next_tile_streams_during_drain` now bounds the busy time with 6N for the last settle and store instead of 7N. Mutations, each caught: the store walking up from row N-1 (14 tests), the store starting at row N-2 (14), the store ending at row 1 (14), at N = 8; the store starting after the last SHIFT cycle (the old timing), at N = 64, by `next_tile_streams_during_drain`. Not caught: the same late start at N = 8, where the 4N int32 store of the last tile hides it inside the 6N bound; the store starting one SHIFT cycle later (1 cycle per GEMM, function unchanged). All tests pass at N = 4, 8, 12, 16, 32 and 64 (LOAD_BEATS 2 at 8, 32 and 64), READ_LATENCY 1 and 10, QUANT_PARTS 4, and at QUANT_PARTS 1 at N = 8, 16, 32 and 64, with the brain feature; the full check (fmt, tests, Icarus smoke test, Verilator lint N = 8, 12, 16, 32, 64, LOAD_BEATS 1 and 2) is clean.
 - Load: `uptime` 2.3 to 3.2 (MNIST and synthesis in parallel).
-- Commit: pending.
+- Commit: `1aa24c4`.
 
 ## Questions for owner
 1. P1 (bias, ReLU and requantization in hardware, item 7): approve it? It would cut the C reads from 72 to about 18 words per image (int8 instead of int32) and let layer 2 start without the host. Answered 2026-10-14: approved, done in item 7.
